@@ -106,6 +106,13 @@ struct SimParams {
     /// Food coupling floor in light mode: increment ∝ (lightBase + nutrient).
     /// > 0 so fully shaded regions keep growing slowly (no frozen flaps).
     var lightBase: Float = 0.15
+    /// Illumination-march interval in steps. The march is the expensive light
+    /// pass (empty-interior traversal dominates at scale — see benchlog M5);
+    /// the shadow pattern evolves on ~100-step scales (structure moves
+    /// ~0.5%/step, nutrient time constant ~1/lightDecay = 50 steps), so
+    /// marching every 8th step with 8x pulsed production leaves the nutrient
+    /// steady state unchanged. 1 = every step (original semantics).
+    var lightInterval: UInt32 = 8
     /// Gray-Scott feed rate (default 0.037: "coral/mitosis" spot regime).
     var rdeF: Float = 0.037
     /// Gray-Scott kill rate (default 0.06).
@@ -181,12 +188,19 @@ final class CellSim {
     private let boundBuffer: MTLBuffer      // UInt32: atomic max |P|² accumulator
     /// M5 per-cell render colour (cellTint kernel; neutral albedo unless rde).
     let tintBuffer: MTLBuffer
+    /// M5 per-cell illumination verdict (illuminate kernel; 1 = lit). The ray
+    /// tracer's directional solid style shades with it — the render shows
+    /// exactly the cells the growth illuminated.
+    let litFlagsBuffer: MTLBuffer
     private var usingNutA = true
     private var usingChemA = true
 
     var params = SimParams()
     private(set) var cellCount = 0          // host mirror of counterBuffer[0]
     private var usingA = true
+    /// Step counter for the light-march scheduler (lightInterval); reset with
+    /// the state.
+    private var stepIndex: UInt64 = 0
 
     /// Current positions (post-step).
     var positionsBuffer: MTLBuffer { usingA ? positionsA : positionsB }
@@ -274,8 +288,8 @@ final class CellSim {
 
         // Layout drift guard: the MSL SimParams mirror is appended-only; a
         // mismatch here corrupts every kernel silently.
-        precondition(MemoryLayout<SimParams>.size == 124,
-                     "SimParams layout drift: \(MemoryLayout<SimParams>.size) != 124 (see Shaders.swift)")
+        precondition(MemoryLayout<SimParams>.size == 128,
+                     "SimParams layout drift: \(MemoryLayout<SimParams>.size) != 128 (see Shaders.swift)")
 
         let f3 = MemoryLayout<SIMD3<Float>>.stride
         positionsA = device.makeBuffer(length: maxCells * f3, options: .storageModeShared)!
@@ -361,11 +375,15 @@ final class CellSim {
         tintBuffer = device.makeBuffer(length: maxCells * f3,
                                        options: .storageModeShared)!
         tintBuffer.label = "cellTint"
+        litFlagsBuffer = device.makeBuffer(length: maxCells * MemoryLayout<UInt32>.stride,
+                                           options: .storageModeShared)!
+        litFlagsBuffer.label = "litFlags"
         memset(binCountsBuffer.contents(), 0, binCountsBuffer.length)
         memset(collisionOffsetBuffer.contents(), 0, collisionOffsetBuffer.length)
         memset(nutrientA.contents(), 0, nutrientA.length)
         memset(nutrientB.contents(), 0, nutrientB.length)
         memset(boundBuffer.contents(), 0, boundBuffer.length)
+        memset(litFlagsBuffer.contents(), 0, litFlagsBuffer.length)
     }
 
     // MARK: - Setup
@@ -445,9 +463,11 @@ final class CellSim {
         // the seedChemicals kernel in the reset CB below.
         usingNutA = true
         usingChemA = true
+        stepIndex = 0
         memset(nutrientA.contents(), 0, nutrientA.length)
         memset(nutrientB.contents(), 0, nutrientB.length)
         memset(boundBuffer.contents(), 0, boundBuffer.length)
+        memset(litFlagsBuffer.contents(), 0, litFlagsBuffer.length)
 
         guard let cb = queue.makeCommandBuffer() else { fatalError("no command buffer") }
         encodeNormals(cb, width: cellCount)
@@ -547,9 +567,16 @@ final class CellSim {
             encodeRepulsionAccumulate(cb, width: width)
         }
         if params.growthMode == 1 {
-            encodeBoundMax(cb, width: width)
-            encodeIlluminate(cb, width: width)
-            encodeClearBound(cb)
+            // The illumination march is the expensive pass (empty-interior
+            // traversal — benchlog M5); the shadow pattern evolves on
+            // ~100-step scales, so it runs every lightInterval steps with
+            // lightInterval× pulsed production (steady state unchanged).
+            // Decay + diffusion run every step below.
+            if stepIndex % UInt64(max(params.lightInterval, 1)) == 0 {
+                encodeBoundMax(cb, width: width)
+                encodeIlluminate(cb, width: width)
+                encodeClearBound(cb)
+            }
             encodeNutrientDiffuse(cb, width: width)
             usingNutA.toggle()
         } else if params.growthMode == 2 {
@@ -569,6 +596,7 @@ final class CellSim {
         }
         encodeRadii(into: cb, positions: nextPositionsBuffer, width: width)
         usingA.toggle()
+        stepIndex &+= 1
     }
 
     /// Over-estimated dispatch width (class docs: under-coverage is benign).
@@ -913,6 +941,7 @@ final class CellSim {
         enc.setBuffer(boundBuffer, offset: 0, index: 5)
         enc.setBuffer(counterBuffer, offset: 0, index: 6)
         enc.setBuffer(paramsBuffer, offset: 0, index: 7)
+        enc.setBuffer(litFlagsBuffer, offset: 0, index: 8)
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         enc.endEncoding()
@@ -984,6 +1013,19 @@ final class CellSim {
         encodeSeedChemicals(cb, width: cellCount)
         cb.commit()
         cb.waitUntilCompleted()
+    }
+
+    /// Recompute the per-cell illumination verdicts (litFlags) for the CURRENT
+    /// state — render-time use for loaded states (a state snapshot stores
+    /// geometry, not litFlags; the directional solid style needs the verdict
+    /// the growth's last step produced). Runs boundMax + illuminate + clearBound
+    /// at the exact cell count; host must be in sync (GPU idle). The nutrient
+    /// side effect (one decay+production pass) is harmless at render time.
+    func encodeIlluminationRefresh(_ cb: MTLCommandBuffer) {
+        guard cellCount > 0 else { return }
+        encodeBoundMax(cb, width: cellCount)
+        encodeIlluminate(cb, width: cellCount)
+        encodeClearBound(cb)
     }
 
     private func encodeRadii(into cb: MTLCommandBuffer, positions: MTLBuffer, width: Int) {

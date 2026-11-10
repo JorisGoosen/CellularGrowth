@@ -13,7 +13,7 @@ enum Shaders {
     #include <metal_stdlib>
     using namespace metal;
 
-    // NOTE: layout must mirror Swift struct SimParams exactly (31 x 4 bytes = 124).
+    // NOTE: layout must mirror Swift struct SimParams exactly (32 x 4 bytes = 128).
     // New fields are APPENDED at the end on both sides (AGENTS.md SimParams rule).
     struct SimParams {
         float linkRestLength;
@@ -44,6 +44,10 @@ enum Shaders {
         float lightNutrient;     // nutrient produced per step in lit cells
         float lightDecay;        // first-order nutrient decay per step, [0,1)
         float lightBase;         // food coupling floor: increment ∝ (lightBase + nutrient)
+        uint  lightInterval;     // illumination-march interval in steps (march is
+                                 // the expensive pass; the shadow pattern evolves
+                                 // on ~100-step scales — production is pulsed
+                                 // lightInterval× so the average rate is unchanged)
         float rdeF;              // Gray-Scott feed rate
         float rdeK;              // Gray-Scott kill rate
         float rdeDu;             // u diffusion (graph-normalized, see rdeStep)
@@ -675,16 +679,23 @@ enum Shaders {
         return false;
     }
 
-    // One thread per cell: decay, illumination march, nutrient production.
-    // Runs on the FROZEN pre-step state (positions + radii + the grid built
-    // from them this step), before integrateForces — the march must match the
-    // grid exactly, and the nutrient is consumed later in the same step by
-    // foodStep (post-diffuse buffer).
+    // One thread per cell: illumination march + nutrient production. Runs on
+    // the FROZEN pre-step state (positions + radii + the grid built from them
+    // this step), before integrateForces — the march must match the grid
+    // exactly, and the nutrient is consumed later in the same step by
+    // foodStep (post-diffuse buffer). SCHEDULED every lightInterval steps
+    // (host-side; production is pulsed lightInterval× so the average
+    // production rate — and hence the nutrient steady state — is unchanged);
+    // decay + diffusion run EVERY step in nutrientDiffuse.
+    // M5 unified light: the per-cell lit/unlit verdict is also STORED
+    // (litFlags) — the ray tracer's directional solid style shades with the
+    // SAME per-cell illumination the growth used (CellSim.
+    // encodeIlluminationRefresh recomputes it for a loaded state).
     //
     // Buffer table:
     //   0 positions (const)       1 radii (const)        2 binStarts (const)
     //   3 particleIndices (const) 4 nutrient (read+write) 5 bound2 (const)
-    //   6 cellCounter             7 params
+    //   6 cellCounter             7 params               8 litFlags (write)
     kernel void illuminate(device const float3* positions [[buffer(0)]],
                            device const float*   radii    [[buffer(1)]],
                            device const uint*    binStarts [[buffer(2)]],
@@ -693,13 +704,11 @@ enum Shaders {
                            device const uint*    bound2   [[buffer(5)]],
                            device const uint*    cellCounter [[buffer(6)]],
                            constant SimParams&   params   [[buffer(7)]],
+                           device uint*          litFlags [[buffer(8)]],
                            uint gid [[thread_position_in_grid]])
     {
         if (gid >= cellCounter[0]) return;
-        // First-order decay, then production in lit cells (order keeps the
-        // steady state at lightNutrient/lightDecay for a persistently lit
-        // cell regardless of the previous level).
-        float n = nutrient[gid] * (1.0f - params.lightDecay);
+        float n = nutrient[gid];
 
         float3 P = float3(positions[gid]);
         float3 L = normalize(float3(params.lightDirX, params.lightDirY, params.lightDirZ));
@@ -710,19 +719,24 @@ enum Shaders {
         float sceneR = sqrt(as_type<float>(bound2[0]));
         float t1 = sceneR + length(P) + 2.0f * params.roi;
 
-        if (!lightOccluded(P, L, 1e-3f, t1, gid, positions, radii,
-                           binStarts, particleIndices, params)) {
-            n += params.lightNutrient;   // lit: stimulate nutrient creation
+        bool blocked = lightOccluded(P, L, 1e-3f, t1, gid, positions, radii,
+                                     binStarts, particleIndices, params);
+        if (!blocked) {
+            n += params.lightNutrient * (float)params.lightInterval;   // pulsed production
         }
+        litFlags[gid] = blocked ? 0u : 1u;
         nutrient[gid] = clamp(n, 0.0f, kNutrientMax);
     }
 
-    // M5 nutrient diffusion (paper: nutrient "can also diffuse from one cell
-    // to another along the links between cells"): one Jacobi pass per step,
-    //   nutrient' = nutrient + lightDiffusionRate * (avg(ring) - nutrient)
+    // M5 nutrient decay + diffusion (paper: nutrient "can also diffuse from
+    // one cell to another along the links between cells"): one Jacobi pass per
+    // step, with the first-order decay folded in:
+    //   nutrient' = (1 - lightDecay) * (nutrient + lightDiffusionRate *
+    //                                   (avg(ring) - nutrient))
     // Double-buffered like positions (read current, write next; host swaps).
-    // Stability: lightDiffusionRate in [0, 1] makes the update a convex
-    // combination of the cell and its ring (CLI clamps the value).
+    // Stability: lightDiffusionRate in [0, 1] makes the diffusion a convex
+    // combination of the cell and its ring (CLI clamps); the decay factor
+    // shrinks the whole update — both preserve non-negativity.
     //
     // Buffer table:
     //   0 links (const)   1 linkCounts (const)   2 nutrientCur (const)
@@ -744,7 +758,8 @@ enum Shaders {
             acc += nutrientCur[links[base + k]];
         }
         float avg = cnt > 0 ? acc / float(cnt) : n;
-        nutrientNext[gid] = n + params.lightDiffusionRate * (avg - n);
+        float diffused = n + params.lightDiffusionRate * (avg - n);
+        nutrientNext[gid] = (1.0f - params.lightDecay) * diffused;
     }
 
     // Deterministic per-cell integer hash for the RDE seed noise (independent
@@ -1679,6 +1694,7 @@ enum Shaders {
         float lightNutrient;
         float lightDecay;
         float lightBase;
+        uint  lightInterval;
         float rdeF;
         float rdeK;
         float rdeDu;
@@ -1918,69 +1934,6 @@ enum Shaders {
         return clamp(1.0f - aoStrength * occ, 0.0f, 1.0f);
     }
 
-    // M5 unified light: shadow test for the directional solid style — the SAME
-    // segment march the growth illumination uses (Shaders.sim lightOccluded;
-    // duplicated here because the two MSL libraries are compiled separately).
-    // Amanatides–Woo DDA through the sim's own hash; a cell blocks when its
-    // sphere (radius clamped below roi for the grid-path proof) overlaps the
-    // segment. selfIdx (the hit cell) is excluded.
-    static bool shadowRay(float3 ro, float3 rd, float t0, float t1, uint selfIdx,
-                          device const float3* positions,
-                          device const float* radii,
-                          device const uint* binStarts,
-                          device const uint* particleIndices,
-                          constant SimParams& sp)
-    {
-        if (!(t1 > t0)) return false;
-        const float h = sp.roi;
-        float3 p0 = ro + rd * t0;
-        int3 c = int3((int)floor(p0.x / h), (int)floor(p0.y / h), (int)floor(p0.z / h));
-        int3 st = int3(rd.x > 0.0f ? 1 : -1, rd.y > 0.0f ? 1 : -1, rd.z > 0.0f ? 1 : -1);
-        float3 tDelta = fabs(float3(h) / rd);
-        float3 tMax;
-        tMax.x = rd.x != 0.0f ? t0 + ((rd.x > 0.0f ? (float)(c.x + 1) * h : (float)c.x * h) - p0.x) / rd.x : INFINITY;
-        tMax.y = rd.y != 0.0f ? t0 + ((rd.y > 0.0f ? (float)(c.y + 1) * h : (float)c.y * h) - p0.y) / rd.y : INFINITY;
-        tMax.z = rd.z != 0.0f ? t0 + ((rd.z > 0.0f ? (float)(c.z + 1) * h : (float)c.z * h) - p0.z) / rd.z : INFINITY;
-
-        float tCur = t0;
-        for (uint iter = 0; iter < 8192u && tCur < t1; ++iter) {
-            for (int dz = -1; dz <= 1; ++dz) {
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        uint hh = binHash(c + int3(dx, dy, dz), sp);
-                        uint s = binStarts[hh];
-                        uint e = binStarts[hh + 1];
-                        for (uint idx = s; idx < e; ++idx) {
-                            uint r = particleIndices[idx];
-                            if (r == selfIdx) continue;
-                            float rad = min(radii[r], 0.99f * h);
-                            if (rad <= 0.0f) continue;
-                            float3 C = float3(positions[r]);
-                            float3 toC = C - ro;
-                            float tc = dot(toC, rd);
-                            float dLine2 = dot(toC, toC) - tc * tc;
-                            if (dLine2 > rad * rad) continue;
-                            float thc = sqrt(max(rad * rad - dLine2, 0.0f));
-                            float ta = tc - thc;
-                            float tb = tc + thc;
-                            if (tb > t0 && ta < t1) return true;
-                        }
-                    }
-                }
-            }
-            float tExit = min(min(tMax.x, tMax.y), tMax.z);
-            if (tExit >= t1) break;
-            if (tMax.x <= tMax.y && tMax.x <= tMax.z) {
-                c.x += st.x; tCur = tMax.x; tMax.x += tDelta.x;
-            } else if (tMax.y <= tMax.z) {
-                c.y += st.y; tCur = tMax.y; tMax.y += tDelta.y;
-            } else {
-                c.z += st.z; tCur = tMax.z; tMax.z += tDelta.z;
-            }
-        }
-        return false;
-    }
-
     // One thread per pixel of the current tile.
     //
     // Buffer table:
@@ -1991,6 +1944,7 @@ enum Shaders {
     //   6 SimParams (roi + grid hash bits; the sim's own params buffer)
     //   7 bigCells (const; supplement indices, rad >= roi)
     //   8 tint (const; M5 per-cell albedo from the cellTint kernel)
+    //   9 litFlags (const; M5 per-cell illumination verdict from illuminate)
     kernel void raytraceTile(texture2d<float, access::write> outTex [[texture(0)]],
                              device const float3* positions [[buffer(0)]],
                              device const float*   radii [[buffer(1)]],
@@ -2001,6 +1955,7 @@ enum Shaders {
                              constant SimParams& sp [[buffer(6)]],
                              device const uint*   bigCells [[buffer(7)]],
                              device const float3* tint [[buffer(8)]],
+                             device const uint*   litFlags [[buffer(9)]],
                              uint2 gid [[thread_position_in_grid]])
     {
         if (gid.x >= rp.tileW || gid.y >= rp.tileH) return;
@@ -2062,19 +2017,15 @@ enum Shaders {
                                                 particleIndices, sp);
                     // M5 unified light: per-cell tint (neutral = the pre-M5
                     // albedo, so unbiased renders are byte-identical to M4).
+                    // Directional mode shades with the SAME per-cell
+                    // illumination verdict the growth used (litFlags — no
+                    // separate shadow march; the ambient floor keeps shaded
+                    // form readable while lit surfaces read bright).
                     float shade = 1.0f;
                     if (rp.directionalLight != 0u) {
-                        // Directional mode: the SAME light the growth
-                        // illumination uses. Shadow march from the hit point
-                        // toward the light (bounding sphere bounds the ray:
-                        // every blocker lies within it, t1 = 2*R covers
-                        // |Ph - c| + R). Shade = ambient + shadowed Lambert.
                         float3 L = normalize(rp.lightDir.xyz);
                         float ndl = max(dot(N, L), 0.0f);
-                        bool blocked = shadowRay(Ph, L, 1e-3f, 2.0f * rp.boundingRadius,
-                                                 hitIdx, positions, radii, binStarts,
-                                                 particleIndices, sp);
-                        shade = 0.25f + 0.75f * ndl * (blocked ? 0.0f : 1.0f);
+                        shade = 0.2f + 0.8f * ndl * (litFlags[hitIdx] != 0u ? 1.0f : 0.0f);
                     }
                     accum += float3(tint[hitIdx])
                            * (rp.aoFloor + (1.0f - rp.aoFloor) * ao) * shade;

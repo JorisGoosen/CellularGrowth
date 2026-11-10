@@ -8,52 +8,56 @@ including the `bulgeDist` typo analysis) lives in
 [`docs/reference/lomas_cellular_forms_extraction.md`](docs/reference/lomas_cellular_forms_extraction.md),
 with page screenshots in `docs/reference/pages/`.
 
-## Status — M4: offline ray-traced rendering (ambient occlusion + X-ray)
+## Status — M5: growth modes (light nutrient, Gray-Scott RDE) + unified light
 
-- M1–M3 base unchanged (forces, food + division, spatial-hash repulsion,
-  `--selftest`/`--lockstep`/golden machinery). The interactive raster
-  renderer and both M3 goldens are untouched.
-- **Offline ray tracer** (M4, `Render/RayRenderer.swift` + the `raytrace`
-  MSL in `Shaders.swift`): compute-kernel ray tracing of the cells-as-spheres
-  model (paper §5) through the simulation's OWN spatial hash (bin size = roi),
-  built once for the final state (`CellSim.encodeGridRebuild`). Amanatides–Woo
-  3D-DDA along each ray; per visited bin the K-bin neighbourhood is queried
-  (K = 1 for hits, K = ceil(profileSupport) for density — the traversal-proof
-  needs the crossing point within K bins of the cell's centre bin). Cells with
-  radius >= roi (division-stretched cells) leave the grid's correctness domain
-  and are brute-forced per ray from a small supplement list.
-- **Solid style** (paper §6 style 1, Fig. 8): nearest sphere hit, Lambertian
-  reflectance under a uniform omnidirectional diffuse light — with an
-  isotropic light field the Lambertian irradiance integral reduces to a pure
-  visibility quantity, implemented as ANALYTIC solid-angle ambient occlusion
-  (per neighbour: sin^2(alpha)·max(N·C,0), sin alpha = rad/d, summed within
-  aoRadius; noise-free and ~30x cheaper than hemisphere ray sampling). Tuned
-  (aoRadius 9.6, aoStrength 0.35, aoFloor 0.18) to the pale sculptural
-  Fig. 8 look on a paper-white background.
-- **X-ray style** (paper §6 style 2, Fig. 9): per-ray accumulated density —
-  every sphere within profileSupport·radius of the ray segment contributes
-  its smooth radial profile; each sphere is counted exactly once via the
-  entry-anchor rule (the visited bin whose [tEnter,tExit) contains the
-  clamped foot — the per-bin ranges partition the ray, so the anchor selects
-  exactly one bin). Film-curve tone map 1−exp(−x·exposure) to grayscale.
-  Matches the Fig. 9 microscopy look (ghostly translucent envelope, wispy
-  folded sheets, bright knots).
-- **Validation**: the render kernels are checked against a CPU brute force
-  (CGDBG=1: 64 pixels re-computed over ALL cells — validates the DDA, the
-  anchor dedup and the AO sum; X-ray agrees at the byte-quantization floor,
-  solid within near-tangent-hit conditioning). Two grown-state goldens
-  (`m4-grown-solid`, `m4-grown-xray`) store the final structure in a state
-  snapshot — the growth itself is NOT run-to-run reproducible (daughter slot
-  allocation is GPU-schedule-dependent; measured: 43.7% of pixels differ
-  between two identical growth runs) — and `--golden-check` replays the
-  render pixel-exactly (max diff 0/255).
-- 8600×8600 artefact resolution renders in 7.5 s (solid) / 21 s (X-ray) via
-  automatic 1024² tiling (paper §6 artefact size).
+- M1–M4 base unchanged. Uniform random growth (paper §4 method 1) is the
+  default and is bit-identical to the pre-M5 semantics (the RNG stream is
+  consumed exactly once per cell per step in every mode; `--lockstep` and all
+  goldens still pass).
+- **Three food/growth modes** (`--growth uniform|light|rde`, paper §4):
+  - **light** (method 3): per-cell illumination — a ray is marched from each
+    cell TOWARD the light through the simulation's own spatial hash
+    (Amanatides–Woo 3D-DDA, same traversal pattern as the M4 renderer); a cell
+    with no blocking sphere is lit and produces nutrient
+    (`lightNutrient`, pulsed every `--light-interval` steps with proportional
+    amplitude — the shadow pattern evolves on ~100-step scales, so the march
+    is amortized; decay + diffusion stay per-step). Nutrient diffuses along
+    links (Jacobi) and decays first-order (`--light-decay`); the food
+    increment is ∝ (lightBase + nutrient). LOW diffusion (0.02) + single
+    direction → plant-like elongated growth toward the light; HIGH diffusion
+    (0.3) → organ-like folded forms (paper §7).
+  - **rde** (method 2): Gray-Scott à la Turk on the cell graph — chemicals
+    u, v stored per cell, diffusing along links (graph Laplacian
+    avg(ring) − x), explicit Euler dt=1, defaults F=0.037, k=0.06,
+    Du=0.35, Dv=0.15 (halved from the classic mixing weights so the pattern
+    wavelength localizes on small domains — measured at `--rde-probe`).
+    The v chemical drives the food increment (∝ rdeBase + rdeGain·v).
+    `--rde-probe` validates pattern formation on a static ball (variance
+    amplification, substrate consumption, spatial organization R², stability).
+  - **Chemical tinting**: in rde mode cells render tinted — base green,
+    toward blue ∝ u, toward red ∝ v (weights 0.30/1.60 on clamped u/v; the
+    neutral pre-M5 albedo elsewhere) — in BOTH render paths (per-cell tint
+    buffer filled by the `cellTint` kernel every step).
+- **Unified light**: ONE light direction (SimParams lightDirX/Y/Z, default
+  the pre-M5 impostor direction (0.55, 0.75, 0.4)) drives BOTH the growth
+  illumination AND rendering. The interactive impostor path shades with it;
+  the offline solid style gains `--render-light auto|growth|unbiased` —
+  auto selects the directional shading in light-growth mode (shading with the
+  per-cell illumination verdicts the growth itself computed — lit cells bright,
+  shadowed dark), unbiased (the paper's omnidirectional look, default) keeps
+  all goldens byte-identical. X-ray is density-based (no lighting).
+- **State snapshots v2**: the CGST format now carries the growth config
+  (mode + light/rde coupling), so `--state-load` renders/continues with the
+  mode that grew the state; v1 files (M4 goldens) still load.
+- **Validation**: `--selftest` gains phases C (light growth: invariants +
+  lit/dark nutrient gradient gate) and D (rde growth); `--lockstep` unchanged
+  (forces growthMode 0 + division off — the new kernels write only the
+  chemical buffers, never positions/links); all goldens pass byte-identically.
 
-The M3 status (spatial-hash repulsion) is unchanged; see the M3 section of
-git history or docs/benchlog.md for details:
-forces + food + division + hashed-grid repulsion, `--selftest` invariants,
-`--lockstep` CPU golden reference, deterministic raster goldens.
+The M4 status (offline ray tracer) is unchanged; see the M4 section of
+git history or docs/benchlog.md for details: solid + analytic AO, X-ray
+density accumulation, CPU brute-force pixel verification, grown-state
+snapshot goldens, 8600² tiled renders.
 
 ## Build & run
 
@@ -111,5 +115,5 @@ frame, jitter and subdivision (applied on Reset).
 | M2 ✅ | food levels + cell division (topology change) | `--selftest` invariants + growing screenshots; expected degeneration without repulsion (paper Fig. 5) |
 | M3 ✅ | spatial-hash grid + repulsion | `--lockstep` probe/trajectory gates + goldens; Fig. 5 (degeneration without) vs Fig. 6 (coherent with) screenshots |
 | M4 ✅ | offline ray tracer: solid + analytic AO, X-ray density accumulation | CPU brute-force pixel verification (CGDBG), grown-state snapshot goldens (pixel-exact replay), paper-gate comparison vs Fig. 8/9, 8600² tiled render |
-| M5 | growth modes: light-based nutrient (+ diffusion), then RDE (Gray-Scott) | paper §6 styles |
+| M5 ✅ | growth modes: light-based nutrient (+ diffusion), Gray-Scott RDE; unified light + chemical tinting | `--rde-probe` pattern-formation gates (variance/R²/stability), `--selftest` phases C/D, directional-vs-unbiased render side-by-side, per-mode bench |
 | M6 | app polish: state save/load, animation export, stereo pairs, presets | — |

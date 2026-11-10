@@ -73,7 +73,11 @@ Headless flags: `--steps N`, `--subdiv N`, `--jitter F`, `--spring F`,
 `--threshold F`, `--seed N`, `--max-cells N`, `--roi F`, `--repulsion F`,
 `--bench-growth`, `--render PATH`, `--style solid|xray`, `--width N`,
 `--height N`, `--tiled`, `--samples N`, `--state-save PATH`,
-`--state-load PATH`.
+`--state-load PATH`. M5: `--growth uniform|light|rde`, `--light-dir "x,y,z"`,
+`--light-diffuse F`, `--light-nutrient F`, `--light-decay F`, `--light-base F`,
+`--light-interval N`, `--rde-F F`, `--rde-k F`, `--rde-du F`, `--rde-dv F`,
+`--rde-base F`, `--rde-gain F`, `--rde-probe`, `--rde-dump DIR`,
+`--render-light auto|growth|unbiased`.
 
 Scratch-artefact policy: screenshots, test renders and debug dumps go under
 `/private/tmp/opencode/cellulargrowth/` (pre-approved scratch) — NOT generic

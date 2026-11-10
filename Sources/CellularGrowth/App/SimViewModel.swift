@@ -82,6 +82,9 @@ final class SimViewModel: ObservableObject, ViewInput {
     @Published var lightBase: Double = 0.15 {
         didSet { sim.params.lightBase = Float(lightBase); sim.syncParams() }
     }
+    @Published var lightInterval: Double = 8 {
+        didSet { sim.params.lightInterval = UInt32(max(Int(lightInterval), 1)); sim.syncParams() }
+    }
     @Published var lightAzimuth: Double = 54 { didSet { updateLightDir() } }    // degrees; cosmetic defaults matching the (0.55, 0.75, 0.4) shared light
     @Published var lightElevation: Double = 47.8 { didSet { updateLightDir() } } // degrees (didSet does not fire at init, so the SimParams default stays until touched)
     @Published var rdeF: Double = 0.037 {

@@ -46,6 +46,7 @@ struct ContentView: View {
                 slider("Nutrient/step", $vm.lightNutrient, 0...0.2)
                 slider("Decay", $vm.lightDecay, 0...0.2)
                 slider("Coupling base", $vm.lightBase, 0...1)
+                slider("March interval (steps)", $vm.lightInterval, 1...64, step: 1)
                 slider("Light azimuth°", $vm.lightAzimuth, 0...360, step: 5)
                 slider("Light elevation°", $vm.lightElevation, 0...180, step: 5)
             }

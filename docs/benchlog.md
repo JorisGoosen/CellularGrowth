@@ -127,3 +127,57 @@ count once the hash table caps at T = 2^22 (subdiv 9: 14x the 655k time for
 walk (125 bins visited per centreline bin) and the full-segment traversal,
 so it is 3-4x solid throughout. Both styles render the 8600² artefact
 resolution in seconds at 100k cells — practical for print-sized output.
+
+## M5 growth modes (division ON: food 0.01, threshold 1.0, seed 12345, 50 steps/level, repulsion roi 1.6 strength 0.1) — 2026-11-10 — Apple M1 Pro
+
+Per growth mode (`--bench-growth --growth <mode>`). Light mode marches the
+illumination every `lightInterval` = 8 steps (pulsed production; steady state
+unchanged — see the M5 report). All three tables from the same session/binary.
+
+**uniform (control)**
+| cells | ms/step cpu | ms/step gpu | steps/s |
+|---|---|---|---|
+| 2 562 → 3 288 | 0.316 | 0.278 | 3 169 |
+| 10 242 → 13 241 | 0.333 | 0.302 | 3 006 |
+| 40 962 → 53 179 | 1.098 | 1.065 | 911 |
+| 163 842 → 212 709 | 4.700 | 4.667 | 213 |
+| 655 362 → 851 454 | 24.603 | 24.564 | 41 |
+
+**light (interval 8)**
+| cells | ms/step cpu | ms/step gpu | steps/s |
+|---|---|---|---|
+| 2 562 → 2 886 | 0.393 | 0.357 | 2 546 |
+| 10 242 → 11 662 | 0.509 | 0.468 | 1 966 |
+| 40 962 → 46 617 | 2.149 | 2.108 | 465 |
+| 163 842 → 186 550 | 12.241 | 12.194 | 82 |
+| 655 362 → 745 651 | 88.938 | 88.890 | 11 |
+
+**rde (Gray-Scott F 0.037, k 0.06, Du 0.35, Dv 0.15)**
+| cells | ms/step cpu | ms/step gpu | steps/s |
+|---|---|---|---|
+| 2 562 → 2 975 | 0.298 | 0.263 | 3 355 |
+| 10 242 → 11 901 | 0.392 | 0.361 | 2 549 |
+| 40 962 → 47 619 | 0.974 | 0.939 | 1 027 |
+| 163 842 → 190 249 | 4.950 | 4.906 | 202 |
+| 655 362 → 761 457 | 22.354 | 22.310 | 45 |
+
+Grid memory at level ends (same shape for all modes; T grows with the live
+count): T=8 192/123–131 kB, T=32 768/494–527 kB, T=131 072/1.98–2.11 MB,
+T=524 288/7.9–8.45 MB, T=2 097 152/31.6–33.8 MB (counts + starts + indices +
+collisionOffsets at the final count).
+
+Observations:
+- RDE ≈ uniform per-step cost (one ring walk per cell, explicit Euler dt=1);
+  slightly cheaper at equal levels because patterned growth reaches fewer
+  cells in 50 steps (761k vs 851k).
+- Light mode ≈ uniform at validation scale (march amortized over 8 steps:
+  0.39 vs 0.32 ms at 2.5k cells). At 655k cells the cost is dominated by the
+  DARK hemisphere's rays crossing the smooth ball's EMPTY interior (~250 bins
+  x 27 binStarts lookups per cell): measured 835 ms/step with interval 1
+  (the first light bench run) vs 88.9 ms/step at interval 8. The structural
+  fix (coarse occupancy skip: 8^3-fine-bin blocks, 27 bit-lookups per coarse
+  DDA step instead of 512x27) is sketched in the M5 report as future work.
+- uniform at 655k measured 24.6 ms/step vs M3-growth's 36.5 — same config;
+  session/thermal variance (the M5 comparison is internally consistent).
+- Chemical buffers add 6 x 4 B/cell preallocated (nutrient A/B, u A/B,
+  v A/B = 48 MB at the 2M cap) + 1 x 4 B litFlags; no per-step allocations.

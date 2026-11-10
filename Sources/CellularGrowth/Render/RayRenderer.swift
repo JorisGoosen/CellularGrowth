@@ -327,6 +327,7 @@ final class RayRenderer {
                 enc.setBuffer(sim.paramsBuffer, offset: 0, index: 6)
                 enc.setBuffer(bigCellsBuffer, offset: 0, index: 7)
                 enc.setBuffer(sim.tintBuffer, offset: 0, index: 8)   // M5 per-cell colour
+                enc.setBuffer(sim.litFlagsBuffer, offset: 0, index: 9)   // M5 illumination verdicts
                 enc.dispatchThreads(MTLSize(width: tw, height: th, depth: 1),
                                     threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
                 enc.endEncoding()

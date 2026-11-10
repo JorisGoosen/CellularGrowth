@@ -34,6 +34,7 @@ enum HeadlessRunner {
             || args.contains("--growth") || args.contains("--light-dir")
             || args.contains("--light-diffuse") || args.contains("--light-nutrient")
             || args.contains("--light-decay") || args.contains("--light-base")
+            || args.contains("--light-interval")
             || args.contains("--rde-F") || args.contains("--rde-k")
             || args.contains("--rde-du") || args.contains("--rde-dv")
             || args.contains("--rde-base") || args.contains("--rde-gain")
@@ -82,6 +83,7 @@ enum HeadlessRunner {
         var lightNutrient: Float = 0.05
         var lightDecay: Float = 0.02
         var lightBase: Float = 0.15
+        var lightInterval = 8
         var rdeF: Float = 0.037
         var rdeK: Float = 0.06
         var rdeDu: Float = 0.35
@@ -153,6 +155,7 @@ enum HeadlessRunner {
             case "--light-nutrient": o.lightNutrient = Float(value("--light-nutrient") ?? "") ?? o.lightNutrient
             case "--light-decay": o.lightDecay = Float(value("--light-decay") ?? "") ?? o.lightDecay
             case "--light-base": o.lightBase = Float(value("--light-base") ?? "") ?? o.lightBase
+            case "--light-interval": o.lightInterval = Int(value("--light-interval") ?? "") ?? o.lightInterval
             case "--rde-F": o.rdeF = Float(value("--rde-F") ?? "") ?? o.rdeF
             case "--rde-k": o.rdeK = Float(value("--rde-k") ?? "") ?? o.rdeK
             case "--rde-du": o.rdeDu = Float(value("--rde-du") ?? "") ?? o.rdeDu
@@ -224,6 +227,7 @@ enum HeadlessRunner {
         sim.params.lightNutrient = max(o.lightNutrient, 0)
         sim.params.lightDecay = min(max(o.lightDecay, 0), 0.999)
         sim.params.lightBase = max(o.lightBase, 0)
+        sim.params.lightInterval = UInt32(max(o.lightInterval, 1))
         sim.params.rdeF = o.rdeF
         sim.params.rdeK = o.rdeK
         sim.params.rdeDu = min(max(o.rdeDu, 0), 1)
@@ -662,10 +666,33 @@ enum HeadlessRunner {
         }
 
         // Fresh radii (daughters from the final step) + one grid rebuild for
-        // the final state, in a single waited command buffer.
+        // the final state, in a single waited command buffer. States rendered
+        // with the DIRECTIONAL unified light additionally recompute the
+        // per-cell illumination verdicts (litFlags) — a state snapshot stores
+        // geometry, not lit flags. The light mode is decided BEFORE the prep
+        // CB so the refresh can be encoded into it.
+        let sharedLight = SIMD3<Float>(sim.params.lightDirX, sim.params.lightDirY, sim.params.lightDirZ)
+        var directional: SIMD3<Float>? = nil
+        switch o.renderLight {
+        case "growth":
+            directional = sharedLight
+            print("render light: directional (shared growth light)")
+        case "unbiased":
+            directional = nil
+            print("render light: unbiased omnidirectional (paper default)")
+        case "auto":
+            directional = sim.params.growthMode == 1 ? sharedLight : nil
+            print("render light: auto -> \(directional != nil ? "directional (light-growth mode)" : "unbiased omnidirectional")")
+        default:
+            print("--render-light '\(o.renderLight)' unknown (auto | growth | unbiased)")
+            exit(1)
+        }
         if let cb = queue.makeCommandBuffer() {
             sim.refreshRadii(cb)
             sim.encodeGridRebuild(cb)
+            if directional != nil {
+                sim.encodeIlluminationRefresh(cb)
+            }
             cb.commit()
             cb.waitUntilCompleted()
             if let e = cb.error { print("render prep CB ERROR: \(e)") }
@@ -677,27 +704,9 @@ enum HeadlessRunner {
         if o.style != "solid" && o.style != "xray" {
             print("--style '\(o.style)' unknown; using solid")
         }
-        // M5 unified light: the solid style shades with the SAME light the
-        // growth illumination uses when directionality is requested. auto
-        // selects directional in light-growth mode (so the render shows which
-        // cells receive light) and the paper's unbiased omnidirectional look
-        // otherwise; "growth"/"unbiased" override explicitly. X-ray has no
-        // lighting (density accumulation) — unaffected.
-        let sharedLight = SIMD3<Float>(sim.params.lightDirX, sim.params.lightDirY, sim.params.lightDirZ)
-        switch o.renderLight {
-        case "growth":
-            settings.directionalLight = sharedLight
-            print("render light: directional (shared growth light)")
-        case "unbiased":
-            settings.directionalLight = nil
-            print("render light: unbiased omnidirectional (paper default)")
-        case "auto":
-            settings.directionalLight = sim.params.growthMode == 1 ? sharedLight : nil
-            print("render light: auto -> \(settings.directionalLight != nil ? "directional (light-growth mode)" : "unbiased omnidirectional")")
-        default:
-            print("--render-light '\(o.renderLight)' unknown (auto | growth | unbiased)")
-            exit(1)
-        }
+        // M5 unified light: decided above (before the prep CB, so litFlags can
+        // be refreshed in it). X-ray has no lighting — unaffected.
+        settings.directionalLight = directional
         settings.width = o.width
         settings.height = o.height
         settings.samples = o.samples
@@ -1063,19 +1072,27 @@ enum HeadlessRunner {
 
     /// Binary snapshot of the live state: magic "CGST", version, cellCount,
     /// maxValence, then positions (SIMD3 stride 16), links (strided per cell),
-    /// linkCounts. GPU must be idle.
+    /// linkCounts. v2 (M5) appends a growth-config block (growthMode + the
+    /// light/rde coupling params) so a loaded state renders and continues with
+    /// the mode that grew it — the per-cell tint and the unified render light
+    /// key off growthMode. GPU must be idle.
     private static func saveStateSnapshot(_ path: String, sim: CellSim) throws {
         let count = sim.cellCount
         var bytes = [UInt8]()
         bytes.reserveCapacity(16 + count * (MemoryLayout<SIMD3<Float>>.stride
                                             + CellSim.maxValence * MemoryLayout<UInt32>.stride
-                                            + MemoryLayout<UInt32>.stride))
+                                            + MemoryLayout<UInt32>.stride)
+                              + 56)   // v2 growth block: 1 uint + 13 floats
         func append(_ v: UInt32) {
             var x = v.littleEndian
             withUnsafeBytes(of: &x) { bytes.append(contentsOf: $0) }
         }
+        func append(_ v: Float) {
+            var x = v.bitPattern.littleEndian
+            withUnsafeBytes(of: &x) { bytes.append(contentsOf: $0) }
+        }
         bytes.append(contentsOf: Array("CGST".utf8))
-        append(1)                               // version
+        append(2 as UInt32)                     // version (v2: + growth block)
         append(UInt32(count))
         append(UInt32(CellSim.maxValence))
         let pos = UnsafeBufferPointer(start: sim.positionsPointer, count: count)
@@ -1091,31 +1108,74 @@ enum HeadlessRunner {
         for l in links { append(l) }
         let counts = UnsafeBufferPointer(start: sim.linkCountsPointer, count: count)
         for c in counts { append(c) }
+        // Growth-config block (v2): the mode + coupling the state was grown in.
+        append(sim.params.growthMode)
+        append(sim.params.lightDirX)
+        append(sim.params.lightDirY)
+        append(sim.params.lightDirZ)
+        append(sim.params.lightDiffusionRate)
+        append(sim.params.lightNutrient)
+        append(sim.params.lightDecay)
+        append(sim.params.lightBase)
+        append(sim.params.rdeF)
+        append(sim.params.rdeK)
+        append(sim.params.rdeDu)
+        append(sim.params.rdeDv)
+        append(sim.params.rdeBase)
+        append(sim.params.rdeGain)
         try Data(bytes).write(to: URL(fileURLWithPath: path))
     }
 
     /// Load a state snapshot and install it via CellSim.reset (recomputes
-    /// normals, radii, food/RNG placeholders deterministically).
+    /// normals, radii, food/RNG placeholders deterministically). v1 files
+    /// (M4 goldens) carry no growth block — the current params stay. v2 files
+    /// restore the growth config (mode + light/rde coupling) BEFORE reset, so
+    /// cellTint and the unified render light see the grown mode.
     private static func loadStateSnapshot(_ path: String, sim: CellSim) throws {
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
         func u32(_ off: Int) -> UInt32 {
             UInt32(data[off]) | (UInt32(data[off+1]) << 8) | (UInt32(data[off+2]) << 16) | (UInt32(data[off+3]) << 24)
         }
-        guard data.count >= 16, String(bytes: data[0..<4], encoding: .ascii) == "CGST",
-              u32(4) == 1 else {
-            throw NSError(domain: "golden", code: 10,
-                          userInfo: [NSLocalizedDescriptionKey: "\(path): not a CGST v1 state snapshot"])
+        func f32(_ off: Int) -> Float {
+            Float(bitPattern: u32(off))
         }
+        guard data.count >= 16, String(bytes: data[0..<4], encoding: .ascii) == "CGST",
+              u32(4) == 1 || u32(4) == 2 else {
+            throw NSError(domain: "golden", code: 10,
+                          userInfo: [NSLocalizedDescriptionKey: "\(path): not a CGST v1/v2 state snapshot"])
+        }
+        let version = u32(4)
         let count = Int(u32(8))
         let maxValence = Int(u32(12))
         guard maxValence == CellSim.maxValence else {
             throw NSError(domain: "golden", code: 11,
                           userInfo: [NSLocalizedDescriptionKey: "\(path): maxValence \(maxValence) != \(CellSim.maxValence)"])
         }
-        let expected = 16 + count * (MemoryLayout<SIMD3<Float>>.stride + maxValence * 4 + 4)
+        let baseSize = 16 + count * (MemoryLayout<SIMD3<Float>>.stride + maxValence * 4 + 4)
+        let expected = version == 2 ? baseSize + 56 : baseSize   // v2 block: 1 uint + 13 floats
         guard data.count == expected else {
             throw NSError(domain: "golden", code: 12,
-                          userInfo: [NSLocalizedDescriptionKey: "\(path): size \(data.count) != expected \(expected) for \(count) cells"])
+                          userInfo: [NSLocalizedDescriptionKey: "\(path): size \(data.count) != expected \(expected) for \(count) cells (v\(version))"])
+        }
+        if version == 2 {
+            // Growth block: 1 uint + 13 floats after the linkCounts block.
+            var off = baseSize
+            sim.params.growthMode = u32(off); off += 4
+            sim.params.lightDirX = f32(off); off += 4
+            sim.params.lightDirY = f32(off); off += 4
+            sim.params.lightDirZ = f32(off); off += 4
+            sim.params.lightDiffusionRate = f32(off); off += 4
+            sim.params.lightNutrient = f32(off); off += 4
+            sim.params.lightDecay = f32(off); off += 4
+            sim.params.lightBase = f32(off); off += 4
+            sim.params.rdeF = f32(off); off += 4
+            sim.params.rdeK = f32(off); off += 4
+            sim.params.rdeDu = f32(off); off += 4
+            sim.params.rdeDv = f32(off); off += 4
+            sim.params.rdeBase = f32(off); off += 4
+            sim.params.rdeGain = f32(off); off += 4
+            let modes = ["uniform", "light", "rde"]
+            print("state growth config: \(modes[Int(min(sim.params.growthMode, 2))]) (light diffuse \(sim.params.lightDiffusionRate), rde F \(sim.params.rdeF)/k \(sim.params.rdeK))")
         }
         var positions = [SIMD3<Float>](repeating: .zero, count: count)
         data.withUnsafeBytes { src in
@@ -1249,6 +1309,7 @@ enum HeadlessRunner {
         sim.params.lightNutrient = 0.05
         sim.params.lightDecay = 0.02
         sim.params.lightBase = 0.15
+        sim.params.lightInterval = 8
         sim.params.rdeF = 0.037
         sim.params.rdeK = 0.06
         sim.params.rdeDu = 0.35
