@@ -1,0 +1,10 @@
+# Build artifacts
+.build/
+CellularGrowth.app/
+.swiftpm/
+
+# macOS
+.DS_Store
+
+# Scratch
+*.xcresult

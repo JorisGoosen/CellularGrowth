@@ -1,0 +1,16 @@
+# CellularGrowth golden image metadata (deterministic config, division OFF)
+name=m3-ball-norepulsion
+rendererVersion=1
+configHash=6e364f9e4b00a68d
+subdiv=4
+jitter=0.250000
+spring=0.330000
+planar=0.330000
+bulge=0.330000
+roi=1.600000
+repulsion=0.000000
+seed=12345
+steps=400
+width=800
+height=600
+meanAbsTolerance=0.007843
