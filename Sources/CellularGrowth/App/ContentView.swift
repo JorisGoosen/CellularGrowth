@@ -20,13 +20,45 @@ struct ContentView: View {
 
     private var controlPanel: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Cellular Growth — M5")
+            Text("Cellular Growth — M6")
                 .font(.headline)
 
             HStack(spacing: 8) {
                 Button(vm.playing ? "Pause" : "Play") { vm.playing.toggle() }
                     .buttonStyle(.borderedProminent)
                 Button("Reset") { vm.reset() }
+            }
+
+            GroupBox("Preset") {
+                Picker("Preset", selection: $vm.presetName) {
+                    Text("—").tag(String?.none)
+                    ForEach(SimPreset.all, id: \.name) { p in
+                        Text(p.name).tag(String?.some(p.name))
+                    }
+                }
+                if let name = vm.presetName, let p = SimPreset.named(name) {
+                    Text(p.summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            GroupBox("Render style") {
+                Picker("Style", selection: $vm.renderStyle) {
+                    Text("Solid").tag(Renderer.RenderStyle.solid)
+                    Text("X-ray").tag(Renderer.RenderStyle.xray)
+                }
+                .pickerStyle(.segmented)
+                if vm.renderStyle == .xray {
+                    slider("X-ray gain", $vm.xrayGain, 0.05...2)
+                }
+            }
+
+            GroupBox("State") {
+                HStack(spacing: 8) {
+                    Button("Save State…") { vm.saveStatePanel() }
+                    Button("Load State…") { vm.loadStatePanel() }
+                }
             }
 
             GroupBox("Growth") {
@@ -79,6 +111,12 @@ struct ContentView: View {
             }
 
             Divider()
+
+            if let msg = vm.statusMessage {
+                Text(msg)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             VStack(alignment: .leading, spacing: 4) {
                 Text("Cells: \(vm.cellCount)")

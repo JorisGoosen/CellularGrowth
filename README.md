@@ -8,56 +8,70 @@ including the `bulgeDist` typo analysis) lives in
 [`docs/reference/lomas_cellular_forms_extraction.md`](docs/reference/lomas_cellular_forms_extraction.md),
 with page screenshots in `docs/reference/pages/`.
 
-## Status — M5: growth modes (light nutrient, Gray-Scott RDE) + unified light
+## Status — M6 complete: app polish (all milestones ✅)
 
-- M1–M4 base unchanged. Uniform random growth (paper §4 method 1) is the
-  default and is bit-identical to the pre-M5 semantics (the RNG stream is
-  consumed exactly once per cell per step in every mode; `--lockstep` and all
-  goldens still pass).
-- **Three food/growth modes** (`--growth uniform|light|rde`, paper §4):
-  - **light** (method 3): per-cell illumination — a ray is marched from each
-    cell TOWARD the light through the simulation's own spatial hash
-    (Amanatides–Woo 3D-DDA, same traversal pattern as the M4 renderer); a cell
-    with no blocking sphere is lit and produces nutrient
-    (`lightNutrient`, pulsed every `--light-interval` steps with proportional
-    amplitude — the shadow pattern evolves on ~100-step scales, so the march
-    is amortized; decay + diffusion stay per-step). Nutrient diffuses along
-    links (Jacobi) and decays first-order (`--light-decay`); the food
-    increment is ∝ (lightBase + nutrient). LOW diffusion (0.02) + single
-    direction → plant-like elongated growth toward the light; HIGH diffusion
-    (0.3) → organ-like folded forms (paper §7).
-  - **rde** (method 2): Gray-Scott à la Turk on the cell graph — chemicals
-    u, v stored per cell, diffusing along links (graph Laplacian
-    avg(ring) − x), explicit Euler dt=1, defaults F=0.037, k=0.06,
-    Du=0.35, Dv=0.15 (halved from the classic mixing weights so the pattern
-    wavelength localizes on small domains — measured at `--rde-probe`).
-    The v chemical drives the food increment (∝ rdeBase + rdeGain·v).
-    `--rde-probe` validates pattern formation on a static ball (variance
-    amplification, substrate consumption, spatial organization R², stability).
-  - **Chemical tinting**: in rde mode cells render tinted — base green,
-    toward blue ∝ u, toward red ∝ v (weights 0.30/1.60 on clamped u/v; the
-    neutral pre-M5 albedo elsewhere) — in BOTH render paths (per-cell tint
-    buffer filled by the `cellTint` kernel every step).
-- **Unified light**: ONE light direction (SimParams lightDirX/Y/Z, default
-  the pre-M5 impostor direction (0.55, 0.75, 0.4)) drives BOTH the growth
-  illumination AND rendering. The interactive impostor path shades with it;
-  the offline solid style gains `--render-light auto|growth|unbiased` —
-  auto selects the directional shading in light-growth mode (shading with the
-  per-cell illumination verdicts the growth itself computed — lit cells bright,
-  shadowed dark), unbiased (the paper's omnidirectional look, default) keeps
-  all goldens byte-identical. X-ray is density-based (no lighting).
-- **State snapshots v2**: the CGST format now carries the growth config
-  (mode + light/rde coupling), so `--state-load` renders/continues with the
-  mode that grew the state; v1 files (M4 goldens) still load.
-- **Validation**: `--selftest` gains phases C (light growth: invariants +
-  lit/dark nutrient gradient gate) and D (rde growth); `--lockstep` unchanged
-  (forces growthMode 0 + division off — the new kernels write only the
-  chemical buffers, never positions/links); all goldens pass byte-identically.
+**M1–M5 base** (details in git history / docs/benchlog.md): over-damped
+spring/planar/bulge forces (paper §4, Fig. 3); food + cell division with
+race-free claim/execute topology change; hashed sparse-grid repulsion
+(`--roi`, `--repulsion`; without it forms degenerate — paper Fig. 5 vs 6);
+offline ray tracer (solid + analytic ambient occlusion = paper Fig. 8 look;
+X-ray density accumulation = Fig. 9 look; CPU brute-force pixel verification;
+8600² tiled renders); three growth modes `--growth uniform|light|rde`
+(uniform random / light-created nutrient with link diffusion + decay — low
+diffusion grows plant-like forms toward the light, high diffusion organ-like /
+Gray-Scott RDE on the cell graph driving patterned growth, `--rde-probe`
+validates pattern formation); ONE unified light direction shared by growth
+illumination and rendering (`--render-light auto|growth|unbiased`); RDE
+chemical tinting in both render paths.
 
-The M4 status (offline ray tracer) is unchanged; see the M4 section of
-git history or docs/benchlog.md for details: solid + analytic AO, X-ray
-density accumulation, CPU brute-force pixel verification, grown-state
-snapshot goldens, 8600² tiled renders.
+M6 additions:
+- **Interactive X-ray** (paper §6 style 2, realtime): the GUI gains a
+  Solid / X-ray render-style switch. X-ray renders every cell as an additive
+  density sprite (same radial profile as the offline accumulation,
+  `rad·(1−(d/(rad·S))²)²` with S = 2) with additive blending and no depth —
+  dense knots glow on a black background, chemical tint included. Documented
+  approximation: the film curve is nonlinear in the *accumulated* density;
+  fixed-function additive blending sums per-sprite terms in 8-bit sRGB and the
+  clamp is the tone map (`xrayGain` slider, default 0.3). The default Solid
+  path is pixel-identical to M5 (all goldens pass without recapture).
+- **State save/load unified (CGST v3)**: one writer/reader for CLI, goldens
+  and GUI. v3 persists EVERYTHING — positions, links, linkCounts, food,
+  nutrient, u, v, tint, rngState + the full SimParams — so a saved state
+  *continues* exactly where it left off. v1 (M4) and v2 (M5) files still load
+  (v2 restores the growth config and reseeds chemicals; v1 keeps current
+  params). Round-trip validation: grow → save → load → render is
+  byte-identical to the pre-save render, and save→load→save reproduces the
+  file bit-for-bit. GUI: Save State…/Load State… (NSSavePanel/NSOpenPanel,
+  default directory ~/Documents); CLI `--state-save`/`--state-load` now
+  round-trip chemicals everywhere (including `--screenshot`).
+- **Animation export** (paper §6): `--anim DIR --anim-steps N --anim-frames M`
+  renders equally spaced frames with the offline ray tracer (style/size/
+  samples/`--render-light` configurable) into numbered PNGs and assembles an
+  H.264 .mov via AVFoundation (30 fps; if the encoder fails the PNG sequence
+  is still written and an ffmpeg one-liner is printed). Camera re-frames per
+  frame so the growing structure stays in view.
+- **Stereo pairs** (paper §6): `--stereo` renders left/right eyes with the
+  camera shifted ±interocular/2 along the camera right axis (parallel-axis
+  stereo, no toe-in) and composites a side-by-side PNG; separation is a
+  fraction of the scene scale (`--interocular F`, default 0.03).
+- **Presets**: `ball`, `brain`, `plant`, `coral`, `degenerate-demo` — full
+  parameter bundles (Core/Presets.swift, one source of truth) with documented
+  values; GUI dropdown and CLI `--preset NAME` (explicit flags still win).
+- **Light-march occupancy skip** (M5 open issue): coarse 8³-bin occupancy
+  bitfield + DDA block jumps make light mode ~4x faster at interval 1 and
+  ~2.5x at the default interval 8 (655k cells; interleaved A/B in
+  docs/benchlog.md). Skip proven trajectory-exact by a byte-identical A/B.
+- **Determinism fix (found by the M6 A/B)**: Icosphere ring ordering used
+  Swift `Set` iteration order (randomized per process) as the angle-sort
+  reference — every ring's cyclic rotation differed run to run. Now
+  deterministic (min-index reference); the M3 goldens still pass within their
+  recorded tolerance, no recapture needed.
+- **Division/tint fix (found by the round-trip validation)**: `cellTint` now
+  runs after the division block, so same-step daughters no longer render with
+  a stale (zeroed = black) tint.
+- **Validation**: `--selftest` (4 phases) PASS, `--lockstep` PASS, all six
+  goldens PASS (m3 ×2 unchanged, m4 ×2 unchanged, m6 impostor-X-ray ball +
+  grown added), `--headless` sane.
 
 ## Build & run
 
@@ -89,9 +103,16 @@ Flags: `--steps N`, `--subdiv N`, `--jitter F`, `--spring F`, `--planar F`,
 `--bench-growth`, `--selftest`, `--roi F`, `--repulsion F`, `--lockstep`,
 `--golden-capture NAME`, `--golden-check NAME`, `--render PATH`,
 `--style solid|xray`, `--width N`, `--height N`, `--tiled`, `--samples N`,
-`--state-save PATH`, `--state-load PATH`. Diagnostic: `--div-stop N`
-(disable division after step N; used to separate growth effects from
-settling).
+`--state-save PATH`, `--state-load PATH`. M5: `--growth uniform|light|rde`,
+`--light-dir "x,y,z"`, `--light-diffuse F`, `--light-nutrient F`,
+`--light-decay F`, `--light-base F`, `--light-interval N`, `--rde-F F`,
+`--rde-k F`, `--rde-du F`, `--rde-dv F`, `--rde-base F`, `--rde-gain F`,
+`--rde-probe`, `--rde-dump DIR`, `--render-light auto|growth|unbiased`.
+M6: `--preset ball|brain|plant|coral|degenerate-demo`, `--anim DIR
+--anim-steps N --anim-frames M`, `--stereo`, `--interocular F`,
+`--screenshot-style solid|xray`. Diagnostic: `--div-stop N` (disable division
+after step N); env `CG_NO_COARSE_SKIP=1` disables the light-march occupancy
+skip (A/B kill switch).
 
 ```bash
 # M4: ray-traced renders of the grown state (paper Fig. 8 / Fig. 9 styles)
@@ -103,9 +124,10 @@ swift run -c release CellularGrowth --render xray.png --style xray \
 
 ## Controls
 
-Drag to orbit, scroll/pinch to zoom. Sliders: spring/planar/bulge factors,
-radius scale, food increment, split threshold, cell division toggle, steps per
-frame, jitter and subdivision (applied on Reset).
+Drag to orbit, scroll/pinch to zoom. Panel: preset dropdown (ball / brain /
+plant / coral / degenerate-demo), Solid/X-ray render-style switch (+ X-ray
+gain), Save State…/Load State…, growth mode + light/RDE parameter groups,
+repulsion, forces, run controls. Jitter and subdivision apply on Reset.
 
 ## Roadmap
 
@@ -116,4 +138,4 @@ frame, jitter and subdivision (applied on Reset).
 | M3 ✅ | spatial-hash grid + repulsion | `--lockstep` probe/trajectory gates + goldens; Fig. 5 (degeneration without) vs Fig. 6 (coherent with) screenshots |
 | M4 ✅ | offline ray tracer: solid + analytic AO, X-ray density accumulation | CPU brute-force pixel verification (CGDBG), grown-state snapshot goldens (pixel-exact replay), paper-gate comparison vs Fig. 8/9, 8600² tiled render |
 | M5 ✅ | growth modes: light-based nutrient (+ diffusion), Gray-Scott RDE; unified light + chemical tinting | `--rde-probe` pattern-formation gates (variance/R²/stability), `--selftest` phases C/D, directional-vs-unbiased render side-by-side, per-mode bench |
-| M6 | app polish: state save/load, animation export, stereo pairs, presets | — |
+| M6 ✅ | app polish: interactive X-ray, CGST v3 state save/load, animation export, stereo pairs, presets, light-march occupancy skip (~4x) | `--selftest` 4 phases, `--lockstep`, 6/6 goldens (no recapture), state round-trip byte-identical, 20-frame animation + H.264, stereo parallax check, interleaved occupancy A/B (benchlog) |

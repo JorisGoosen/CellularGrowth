@@ -70,7 +70,13 @@ enum Icosphere {
             let n = simd_normalize(v)
             let nbrs = Array(adjacency[i])
             precondition(nbrs.count >= 3, "Icosphere vertex with degenerate valence")
-            let ref = verts[Int(nbrs[0])] - v
+            // Reference neighbour for the angle sort: the MINIMUM index, not
+            // Set iteration order — Set ordering is randomized per process in
+            // Swift, which used to rotate every ring differently each run
+            // (run-to-run nondeterminism of the whole seeded pipeline; found
+            // by the M6 state A/B validation). With a fixed reference and no
+            // angle ties the sort result is unique regardless of Set order.
+            let ref = verts[Int(nbrs.min()!)] - v
             let sorted = nbrs.sorted { u, w in
                 let au = verts[Int(u)] - v
                 let aw = verts[Int(w)] - v

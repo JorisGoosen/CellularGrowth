@@ -75,6 +75,18 @@ struct RayRenderSettings {
     /// with this direction — the SAME light vector the growth illumination
     /// uses (auto-selected in light-growth mode; see HeadlessRunner).
     var directionalLight: SIMD3<Float>? = nil
+    // --- M6 stereo pairs (paper §6) ---
+    /// When true, render() produces TWO images with the eye shifted along the
+    /// camera RIGHT axis by ±interocular/2 (parallel-axis stereo, no toe-in)
+    /// and composites them side by side (left eye on the left): output is
+    /// (2×width)×height. Left = eye − right·io/2, right = eye + right·io/2.
+    var stereo: Bool = false
+    /// Eye separation as a FRACTION of the scene scale (the bounding-sphere
+    /// radius), applied by the caller — default 0.03 ("~0.03× scene scale").
+    var interocular: Float = 0.03
+    /// Lateral eye offset in world units (set internally per eye; do not set
+    /// by hand).
+    var eyeShift: SIMD3<Float> = .zero
 }
 
 /// Must mirror MSL `struct RenderParams` (Shaders.raytrace) EXACTLY.
@@ -202,8 +214,10 @@ final class RayRenderer {
         boundingRadius += maxRad + 1e-3
 
         // Camera basis: EXACTLY the same convention as Renderer.updateCameraBuffer.
+        // M6 stereo: the eye is shifted along the camera RIGHT axis
+        // (settings.eyeShift, set by renderStereo; zero for monocular).
         let cam = settings.camera
-        let eye = cam.eye
+        let eye = cam.eye + settings.eyeShift
         let fwd = simd_normalize(cam.target - eye)
         let worldUp = SIMD3<Float>(0, 1, 0)
         let right = simd_normalize(simd_cross(fwd, worldUp))
@@ -269,9 +283,73 @@ final class RayRenderer {
     }
 
     /// Render the CURRENT state (host must be in sync: GPU idle, radii fresh,
-    /// grid rebuilt via CellSim.encodeGridRebuild). Returns BGRA8 bytes
-    /// (same memory order the raster offscreen path uses) + GPU seconds.
+    /// grid rebuilt via CellSim.encodeGridRebuild). With settings.stereo the
+    /// output is a side-by-side composite (left | right), width doubled.
+    /// Returns BGRA8 bytes (same memory order the raster offscreen path uses)
+    /// + GPU seconds.
     func render(settings: RayRenderSettings) -> (bytes: [UInt8], width: Int, height: Int, gpuSeconds: Double) {
+        guard !settings.stereo else { return renderStereo(settings: settings) }
+        return renderSingle(settings: settings)
+    }
+
+    /// Stereo: two parallel-axis renders (±interocular/2 along camera right),
+    /// composited side by side. Each eye renders the FULL image; the scene
+    /// bounding sphere is shared (it depends only on the cells).
+    private func renderStereo(settings: RayRenderSettings) -> (bytes: [UInt8], width: Int, height: Int, gpuSeconds: Double) {
+        // Camera basis (same convention as makeParams).
+        let cam = settings.camera
+        let fwd = simd_normalize(cam.target - cam.eye)
+        let right = simd_normalize(simd_cross(fwd, SIMD3<Float>(0, 1, 0)))
+        let io = settings.interocular * sceneScale(settings: settings) * 0.5
+
+        var left = settings
+        left.eyeShift = -right * io
+        var rightSettings = settings
+        rightSettings.eyeShift = right * io
+
+        let l = renderSingle(settings: left)
+        let r = renderSingle(settings: rightSettings)
+        precondition(l.width == r.width && l.height == r.height, "stereo eye sizes diverged")
+        let w = l.width, h = l.height
+        var out = [UInt8](repeating: 0, count: w * 2 * h * 4)
+        for row in 0..<h {
+            // Left eye into columns [0, w), right eye into [w, 2w).
+            out.withUnsafeMutableBytes { dst in
+                l.bytes.withUnsafeBytes { src in
+                    memcpy(dst.baseAddress! + row * 2 * w * 4,
+                           src.baseAddress! + row * w * 4, w * 4)
+                }
+                r.bytes.withUnsafeBytes { src in
+                    memcpy(dst.baseAddress! + (row * 2 * w + w) * 4,
+                           src.baseAddress! + row * w * 4, w * 4)
+                }
+            }
+        }
+        return (out, w * 2, h, l.gpuSeconds + r.gpuSeconds)
+    }
+
+    /// Scene scale for the interocular fraction: the bounding-sphere radius
+    /// (the same quantity makeParams computes; duplicated host-side here).
+    private func sceneScale(settings: RayRenderSettings) -> Float {
+        let pos = sim.positionsBuffer.contents().assumingMemoryBound(to: SIMD3<Float>.self)
+        let rad = sim.radiiBuffer.contents().assumingMemoryBound(to: Float.self)
+        var lo = SIMD3<Float>(Float.greatestFiniteMagnitude, 0, 0)
+        var hi = SIMD3<Float>(-Float.greatestFiniteMagnitude, 0, 0)
+        for i in 0..<sim.cellCount {
+            let p = pos[i]
+            lo = simd_min(lo, p)
+            hi = simd_max(hi, p)
+        }
+        let centre = (lo + hi) * 0.5
+        var boundingRadius: Float = 0
+        for i in 0..<sim.cellCount {
+            boundingRadius = max(boundingRadius, simd_distance(pos[i], centre) + rad[i])
+        }
+        return boundingRadius
+    }
+
+    /// Single-eye tile loop (the M4 renderer, unchanged semantics).
+    private func renderSingle(settings: RayRenderSettings) -> (bytes: [UInt8], width: Int, height: Int, gpuSeconds: Double) {
         precondition(sim.cellCount > 0, "RayRenderer: no cells")
         let (w, h) = (settings.width, settings.height)
 

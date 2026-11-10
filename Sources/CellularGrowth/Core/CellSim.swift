@@ -8,7 +8,9 @@
 //    scatter] -> [repulsionAccumulate when repulsionStrength > 0]
 //    -> [M5 chemicals: boundMax + illuminate + clearBound + nutrientDiffuse
 //    (light mode) | rdeStep (rde mode)] -> integrateForces (adds
-//    collisionOffset) -> food -> division (decide, execute, finalize) -> radii
+//    collisionOffset) -> food -> division (decide, execute, finalize)
+//    -> cellTint (AFTER division so this step's daughters are tinted — M6)
+//    -> radii
 //  The chemical passes read the same frozen pre-step state as repulsion and
 //  write ONLY the chemical buffers, so the force/repulsion semantics are
 //  untouched (--lockstep forces growthMode 0 + division off, as before).
@@ -130,6 +132,19 @@ struct SimParams {
     /// v sits ~0.4 in spots, ~0 elsewhere → ~5x differential at the defaults.
     var rdeBase: Float = 0.25
     var rdeGain: Float = 2.5
+    // --- M6 (appended) ---
+    /// Coarse occupancy hash bits per axis (the light-march skip map: a bit
+    /// per 8³-fine-bin coordinate block, hashed like the fine grid). Derived
+    /// host-side in setGridBits as max(bits − 3, 2) per axis; collisions are
+    /// harmless (a spuriously SET bit only disables the skip — conservative).
+    var gridCoarseBitsX: UInt32 = 2
+    var gridCoarseBitsY: UInt32 = 2
+    var gridCoarseBitsZ: UInt32 = 2
+    /// M6 light-march coarse skip enable (1 = on). Kill switch for A/B
+    /// validation (CG_NO_COARSE_SKIP=1): the skip is provably verdict-identical
+    /// (only ever taken over regions proven free of cells), and this flag is
+    /// how that proof is checked in practice.
+    var lightCoarseSkip: UInt32 = 1
 }
 
 enum ShaderError: Error {
@@ -192,6 +207,20 @@ final class CellSim {
     /// tracer's directional solid style shades with it — the render shows
     /// exactly the cells the growth illuminated.
     let litFlagsBuffer: MTLBuffer
+    // --- M6 light-march occupancy ---
+    /// Coarse occupancy BITFIELD for the light march's empty-interior skip:
+    /// one bit per hashed 8³-fine-bin coordinate block (FIXED 7-bit packed
+    /// hash per axis → T_c = 2^21 slots → 2^18 words = 256 KB, L2-resident).
+    /// Set by gridCount (atomic OR), cleared by a blit fill at the START of
+    /// every grid rebuild (the map must persist through the post-scatter
+    /// march — a "self-cleaning" count mirrored in gridScatter is WRONG: the
+    /// scatter would zero it before illuminate ever reads it; found by the
+    /// M6 A/B). A CLEAR bit proves the 3×3×3 coarse neighbourhood holds no
+    /// cell (safe to skip); hash collisions only over-report (conservative).
+    /// Sized for block coordinates ±63 (structures up to ~800 world units
+    /// across at roi 1.6); beyond that the skip degrades to a no-op, never
+    /// wrong.
+    let occupancyBuffer: MTLBuffer
     private var usingNutA = true
     private var usingChemA = true
 
@@ -288,8 +317,8 @@ final class CellSim {
 
         // Layout drift guard: the MSL SimParams mirror is appended-only; a
         // mismatch here corrupts every kernel silently.
-        precondition(MemoryLayout<SimParams>.size == 128,
-                     "SimParams layout drift: \(MemoryLayout<SimParams>.size) != 128 (see Shaders.swift)")
+        precondition(MemoryLayout<SimParams>.size == 144,
+                     "SimParams layout drift: \(MemoryLayout<SimParams>.size) != 144 (see Shaders.swift)")
 
         let f3 = MemoryLayout<SIMD3<Float>>.stride
         positionsA = device.makeBuffer(length: maxCells * f3, options: .storageModeShared)!
@@ -378,12 +407,18 @@ final class CellSim {
         litFlagsBuffer = device.makeBuffer(length: maxCells * MemoryLayout<UInt32>.stride,
                                            options: .storageModeShared)!
         litFlagsBuffer.label = "litFlags"
+        // M6 coarse occupancy bitfield: 2^21 slots → 2^18 words = 256 KB.
+        // Blit-cleared at every grid rebuild (256 KB ≈ microseconds).
+        occupancyBuffer = device.makeBuffer(
+            length: (1 << 18) * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
+        occupancyBuffer.label = "lightOccupancy"
         memset(binCountsBuffer.contents(), 0, binCountsBuffer.length)
         memset(collisionOffsetBuffer.contents(), 0, collisionOffsetBuffer.length)
         memset(nutrientA.contents(), 0, nutrientA.length)
         memset(nutrientB.contents(), 0, nutrientB.length)
         memset(boundBuffer.contents(), 0, boundBuffer.length)
         memset(litFlagsBuffer.contents(), 0, litFlagsBuffer.length)
+        memset(occupancyBuffer.contents(), 0, occupancyBuffer.length)
     }
 
     // MARK: - Setup
@@ -502,6 +537,18 @@ final class CellSim {
         params.gridBitsX = UInt32(a)
         params.gridBitsY = UInt32(a)
         params.gridBitsZ = UInt32(Int(k) - 2 * a)
+        // M6 coarse occupancy bits: FIXED 7 per axis (NOT derived from the
+        // fine table — the first attempt derived max(bits−3, 2), which at
+        // high cell counts left a 2^12-slot map for a shell spanning ±18
+        // blocks: wrap collisions saturated every slot and the skip never
+        // fired). 7 bits per axis covers block coordinates ±63 with no wrap
+        // at our scales (structure radius ≤ ~63·8·roi ≈ 800 world units);
+        // larger scenes merely lose the skip (conservative). The bitfield is
+        // blit-cleared at the start of every grid rebuild (the map must be
+        // LIVE during the post-scatter illumination march).
+        params.gridCoarseBitsX = 7
+        params.gridCoarseBitsY = 7
+        params.gridCoarseBitsZ = 7
     }
 
     /// Current hash table size T = 2^(bx+by+bz).
@@ -557,6 +604,7 @@ final class CellSim {
         encodeNormals(cb, width: width)
         let needGrid = params.repulsionStrength > 0 || params.growthMode == 1
         if needGrid {
+            encodeClearOccupancy(cb)   // M6: the skip map is per-rebuild state
             encodeGridCount(cb, width: width)
             encodeGridScanLocal(cb)
             encodeGridScanBlocks(cb)
@@ -583,9 +631,13 @@ final class CellSim {
             encodeRdeStep(cb, width: width)
             usingChemA.toggle()
         }
-        // M5 per-cell render colour (reads the post-pass chemicals; writes the
-        // neutral albedo in uniform/light modes — keeps every render path and
-        // the freshly divided daughters current).
+        // M5 per-cell render colour: AFTER the division block so the daughters
+        // of THIS step are tinted too (they are born inside divisionExecute,
+        // which writes their chemicals into the current buffers — tint must
+        // be recomputed from those, or last-step daughters render with a
+        // stale/zero tint = black speckles at silhouettes; found by the M6
+        // state-round-trip validation). Uniform/light modes still write the
+        // neutral albedo for every cell, so no golden pixels change.
         encodeCellTint(cb, width: width)
         encodeIntegrate(cb, width: width)
         if params.divisionEnabled != 0 {
@@ -593,6 +645,9 @@ final class CellSim {
             encodeDivisionDecide(cb, width: width)
             encodeDivisionExecute(cb, width: width)
             encodeFinalizeFood(cb, width: width)
+            // Tint AFTER division: daughters inherit the parent's u/v, and
+            // cellTint must see them (see comment above).
+            encodeCellTint(cb, width: width)
         }
         encodeRadii(into: cb, positions: nextPositionsBuffer, width: width)
         usingA.toggle()
@@ -640,13 +695,25 @@ final class CellSim {
     // the scatter pass is what zeroes binCounts again (fill cursor), so a
     // partial rebuild would leave the counts dirty for the next step.
 
+    /// Clear the coarse occupancy bitfield (blit fill — 256 KB, trivially
+    /// fast) in the same command buffer BEFORE the gridCount pass that sets
+    /// it again. Called by every grid-rebuild path (step, encodeGridRebuild,
+    /// probe): the map must be live during the post-scatter illumination
+    /// march, so it is per-rebuild state.
+    private func encodeClearOccupancy(_ cb: MTLCommandBuffer) {
+        guard let enc = cb.makeBlitCommandEncoder() else { return }
+        enc.fill(buffer: occupancyBuffer, range: 0..<occupancyBuffer.length, value: 0)
+        enc.endEncoding()
+    }
+
     private func encodeGridCount(_ cb: MTLCommandBuffer, width: Int) {
         guard let enc = cb.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pGridCount)
         enc.setBuffer(positionsBuffer, offset: 0, index: 0)
         enc.setBuffer(binCountsBuffer, offset: 0, index: 1)
-        enc.setBuffer(counterBuffer, offset: 0, index: 2)
-        enc.setBuffer(paramsBuffer, offset: 0, index: 3)
+        enc.setBuffer(occupancyBuffer, offset: 0, index: 2)   // M6 coarse occupancy bits
+        enc.setBuffer(counterBuffer, offset: 0, index: 3)
+        enc.setBuffer(paramsBuffer, offset: 0, index: 4)
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         enc.endEncoding()
@@ -736,6 +803,7 @@ final class CellSim {
     /// before the (exactly one) accumulate pass.
     func encodeRepulsionProbe(_ cb: MTLCommandBuffer) {
         guard cellCount > 0 else { return }
+        encodeClearOccupancy(cb)
         encodeGridCount(cb, width: cellCount)
         encodeGridScanLocal(cb)
         encodeGridScanBlocks(cb)
@@ -755,6 +823,7 @@ final class CellSim {
     /// batch loop syncs with allowGridGrowth: true after every batch.
     func encodeGridRebuild(_ cb: MTLCommandBuffer) {
         guard cellCount > 0 else { return }
+        encodeClearOccupancy(cb)   // M6: skip map always corresponds to the live grid
         encodeGridCount(cb, width: cellCount)
         encodeGridScanLocal(cb)
         encodeGridScanBlocks(cb)
@@ -942,6 +1011,7 @@ final class CellSim {
         enc.setBuffer(counterBuffer, offset: 0, index: 6)
         enc.setBuffer(paramsBuffer, offset: 0, index: 7)
         enc.setBuffer(litFlagsBuffer, offset: 0, index: 8)
+        enc.setBuffer(occupancyBuffer, offset: 0, index: 9)   // M6 coarse occupancy skip
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         enc.endEncoding()
@@ -1019,8 +1089,11 @@ final class CellSim {
     /// state — render-time use for loaded states (a state snapshot stores
     /// geometry, not litFlags; the directional solid style needs the verdict
     /// the growth's last step produced). Runs boundMax + illuminate + clearBound
-    /// at the exact cell count; host must be in sync (GPU idle). The nutrient
-    /// side effect (one decay+production pass) is harmless at render time.
+    /// at the exact cell count; host must be in sync (GPU idle). CONTRACT: the
+    /// caller must rebuild the grid (encodeGridRebuild — which also refreshes
+    /// the M6 coarse occupancy the march skips on) in the SAME or an earlier
+    /// command buffer. The nutrient side effect (one decay+production pass) is
+    /// harmless at render time.
     func encodeIlluminationRefresh(_ cb: MTLCommandBuffer) {
         guard cellCount > 0 else { return }
         encodeBoundMax(cb, width: cellCount)
@@ -1176,5 +1249,296 @@ final class CellSim {
     }
     func readChemV() -> [Float] {
         Array(UnsafeBufferPointer(start: chemVPointer, count: cellCount))
+    }
+
+    // MARK: - State snapshots (CGST; M6 unification)
+    //
+    // One writer/reader pair for every consumer (CLI --state-save/--state-load,
+    // golden .state files, GUI Save/Load). Binary format, all little-endian:
+    //
+    //   v1 (M4): "CGST" | u32 ver=1 | u32 count | u32 maxValence
+    //            | positions (N x 16 B: 3 f32 + pad)
+    //            | links (N x maxValence x u32) | linkCounts (N x u32)
+    //   v2 (M5): v1 + growth-config block (u32 growthMode + 13 floats: the
+    //            light dir + light/rde coupling). Loaded by restoring the
+    //            config and then reset()-ing (chemicals/RNG/food re-seeded).
+    //   v3 (M6): v1 body + FULL per-cell state + raw SimParams — everything
+    //            the sim needs to CONTINUE exactly where it left off:
+    //              food (N x f32) | nutrient (N x f32) | chemU (N x f32)
+    //            | chemV (N x f32) | tint (N x 16 B) | rngState (N x u64)
+    //            | SimParams (128 B raw)
+    //            Loaded WITHOUT reset(): buffers installed directly, normals/
+    //            radii/tint recomputed (deterministic functions of the state).
+    //
+    // GPU must be idle for both save and load.
+
+    enum StateSnapshotError: Error {
+        case notCGST(String)
+        case unsupportedVersion(Int)
+        case sizeMismatch(path: String, got: Int, expected: Int)
+        case maxValenceMismatch(Int)
+    }
+
+    /// Write the complete live state (v3). GPU must be idle.
+    func saveState(to path: String) throws {
+        let count = cellCount
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(16 + count * (MemoryLayout<SIMD3<Float>>.stride
+                                             + CellSim.maxValence * MemoryLayout<UInt32>.stride
+                                             + 4 * MemoryLayout<UInt32>.stride
+                                             + MemoryLayout<Float>.stride * 4
+                                             + MemoryLayout<UInt64>.stride)
+                              + MemoryLayout<SimParams>.size)
+        func append(_ v: UInt32) {
+            var x = v.littleEndian
+            withUnsafeBytes(of: &x) { bytes.append(contentsOf: $0) }
+        }
+        func append(_ v: Float) {
+            var x = v.bitPattern.littleEndian
+            withUnsafeBytes(of: &x) { bytes.append(contentsOf: $0) }
+        }
+        func append(_ v: UInt64) {
+            var x = v.littleEndian
+            withUnsafeBytes(of: &x) { bytes.append(contentsOf: $0) }
+        }
+        bytes.append(contentsOf: Array("CGST".utf8))
+        append(3 as UInt32)                     // version (v3: full state)
+        append(UInt32(count))
+        append(UInt32(CellSim.maxValence))
+        let pos = UnsafeBufferPointer(start: positionsPointer, count: count)
+        for p in pos {
+            for c in [p.x, p.y, p.z] {
+                var f = c.bitPattern.littleEndian
+                withUnsafeBytes(of: &f) { bytes.append(contentsOf: $0) }
+            }
+            var pad: UInt32 = 0
+            withUnsafeBytes(of: &pad) { bytes.append(contentsOf: $0) }
+        }
+        let links = UnsafeBufferPointer(start: linksPointer, count: count * CellSim.maxValence)
+        for l in links { append(l) }
+        let counts = UnsafeBufferPointer(start: linkCountsPointer, count: count)
+        for c in counts { append(c) }
+        // --- v3 payload: full per-cell state ---
+        for f in UnsafeBufferPointer(start: foodPointer, count: count) { append(f) }
+        for f in UnsafeBufferPointer(start: nutrientPointer, count: count) { append(f) }
+        for f in UnsafeBufferPointer(start: chemUPointer, count: count) { append(f) }
+        for f in UnsafeBufferPointer(start: chemVPointer, count: count) { append(f) }
+        let tint = UnsafeBufferPointer(start: tintBuffer.contents()
+            .assumingMemoryBound(to: SIMD3<Float>.self), count: count)
+        for t in tint {
+            for c in [t.x, t.y, t.z] {
+                var f = c.bitPattern.littleEndian
+                withUnsafeBytes(of: &f) { bytes.append(contentsOf: $0) }
+            }
+            var pad: UInt32 = 0
+            withUnsafeBytes(of: &pad) { bytes.append(contentsOf: $0) }
+        }
+        let rng = UnsafeBufferPointer(start: rngBuffer.contents()
+            .assumingMemoryBound(to: UInt64.self), count: count)
+        for r in rng { append(r) }
+        // Raw SimParams (the simulation contract; appended-only layout).
+        withUnsafeBytes(of: &params) { src in
+            bytes.append(contentsOf: src.prefix(MemoryLayout<SimParams>.size))
+        }
+        try Data(bytes).write(to: URL(fileURLWithPath: path))
+    }
+
+    /// Load a state snapshot of ANY version (v1/v2/v3) and install it.
+    /// Returns the snapshot version + the growth mode it carries (callers
+    /// print diagnostics). GPU must be idle.
+    ///
+    /// v1/v2 semantics preserved from the M4/M5 loader: v2 restores the
+    /// growth config BEFORE reset() so cellTint and the unified render light
+    /// see the grown mode; reset() re-seeds food/RNG/chemicals (v2 files
+    /// predate chemical persistence — chemicals reseed, food re-seeded).
+    @discardableResult
+    func loadState(from path: String) throws -> (version: Int, growthMode: UInt32) {
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        func u32(_ off: Int) -> UInt32 {
+            UInt32(data[off]) | (UInt32(data[off+1]) << 8) | (UInt32(data[off+2]) << 16) | (UInt32(data[off+3]) << 24)
+        }
+        func f32(_ off: Int) -> Float {
+            Float(bitPattern: u32(off))
+        }
+        guard data.count >= 16, String(bytes: data[0..<4], encoding: .ascii) == "CGST" else {
+            throw StateSnapshotError.notCGST(path)
+        }
+        let version = Int(u32(4))
+        guard version >= 1 && version <= 3 else {
+            throw StateSnapshotError.unsupportedVersion(version)
+        }
+        let count = Int(u32(8))
+        let maxValence = Int(u32(12))
+        guard maxValence == CellSim.maxValence else {
+            throw StateSnapshotError.maxValenceMismatch(maxValence)
+        }
+        let baseSize = 16 + count * (MemoryLayout<SIMD3<Float>>.stride + maxValence * 4 + 4)
+        let v3Size = baseSize + count * (4 * 4 + MemoryLayout<Float>.stride * 4
+                                         + MemoryLayout<UInt64>.stride)
+                     + MemoryLayout<SimParams>.size
+        let expected = version == 2 ? baseSize + 56      // v2 block: 1 uint + 13 floats
+                     : version == 3 ? v3Size
+                     : baseSize
+        guard data.count == expected else {
+            throw StateSnapshotError.sizeMismatch(path: path, got: data.count, expected: expected)
+        }
+
+        if version == 2 {
+            // Growth block: 1 uint + 13 floats after the linkCounts block.
+            var off = baseSize
+            params.growthMode = u32(off); off += 4
+            params.lightDirX = f32(off); off += 4
+            params.lightDirY = f32(off); off += 4
+            params.lightDirZ = f32(off); off += 4
+            params.lightDiffusionRate = f32(off); off += 4
+            params.lightNutrient = f32(off); off += 4
+            params.lightDecay = f32(off); off += 4
+            params.lightBase = f32(off); off += 4
+            params.rdeF = f32(off); off += 4
+            params.rdeK = f32(off); off += 4
+            params.rdeDu = f32(off); off += 4
+            params.rdeDv = f32(off); off += 4
+            params.rdeBase = f32(off); off += 4
+            params.rdeGain = f32(off); off += 4
+        }
+
+        // Geometry blocks (identical layout in every version).
+        var positions = [SIMD3<Float>](repeating: .zero, count: count)
+        data.withUnsafeBytes { src in
+            positions.withUnsafeMutableBytes { dst in
+                dst.copyBytes(from: UnsafeRawBufferPointer(rebasing: src.dropFirst(16).prefix(count * MemoryLayout<SIMD3<Float>>.stride)))
+            }
+        }
+        var flatLinks = [UInt32](repeating: 0, count: count * maxValence)
+        data.withUnsafeBytes { src in
+            flatLinks.withUnsafeMutableBytes { dst in
+                dst.copyBytes(from: UnsafeRawBufferPointer(rebasing: src.dropFirst(16 + count * MemoryLayout<SIMD3<Float>>.stride).prefix(count * maxValence * 4)))
+            }
+        }
+        var counts = [UInt32](repeating: 0, count: count)
+        data.withUnsafeBytes { src in
+            counts.withUnsafeMutableBytes { dst in
+                dst.copyBytes(from: UnsafeRawBufferPointer(rebasing: src.dropFirst(16 + count * (MemoryLayout<SIMD3<Float>>.stride + maxValence * 4)).prefix(count * 4)))
+            }
+        }
+        var links = [[UInt32]](repeating: [], count: count)
+        for i in 0..<count {
+            let n = Int(counts[i])
+            links[i] = Array(flatLinks[i * maxValence..<(i * maxValence + n)])
+        }
+
+        if version <= 2 {
+            try resetWithGrowthConfig(positions: positions, links: links)
+            return (version, params.growthMode)
+        }
+
+        // --- v3: full restore, NO reseeding ---
+        var off = baseSize
+        func readFloats(_ n: Int) -> [Float] {
+            var v = [Float](repeating: 0, count: n)
+            data.withUnsafeBytes { src in
+                v.withUnsafeMutableBytes { dst in
+                    dst.copyBytes(from: UnsafeRawBufferPointer(rebasing: src.dropFirst(off).prefix(n * 4)))
+                }
+            }
+            off += n * 4
+            return v
+        }
+        let food = readFloats(count)
+        let nutrient = readFloats(count)
+        let chemU = readFloats(count)
+        let chemV = readFloats(count)
+        // Tint: N x 16 B (3 f32 + pad).
+        var tint = [SIMD3<Float>](repeating: .zero, count: count)
+        data.withUnsafeBytes { src in
+            tint.withUnsafeMutableBytes { dst in
+                dst.copyBytes(from: UnsafeRawBufferPointer(rebasing: src.dropFirst(off).prefix(count * MemoryLayout<SIMD3<Float>>.stride)))
+            }
+        }
+        off += count * MemoryLayout<SIMD3<Float>>.stride
+        // RNG: N x u64.
+        var rng = [UInt64](repeating: 0, count: count)
+        data.withUnsafeBytes { src in
+            rng.withUnsafeMutableBytes { dst in
+                dst.copyBytes(from: UnsafeRawBufferPointer(rebasing: src.dropFirst(off).prefix(count * MemoryLayout<UInt64>.stride)))
+            }
+        }
+        off += count * MemoryLayout<UInt64>.stride
+        // Raw SimParams.
+        var restored = SimParams()
+        data.withUnsafeBytes { src in
+            withUnsafeMutableBytes(of: &restored) { dst in
+                dst.copyBytes(from: UnsafeRawBufferPointer(rebasing: src.dropFirst(off).prefix(MemoryLayout<SimParams>.size)))
+            }
+        }
+        // Safety clamps on restored params: never exceed THIS sim's capacity;
+        // the host mirror of the count is authoritative from the header.
+        restored.maxCells = UInt32(min(Int(restored.maxCells), maxCells))
+        restored.cellCount = UInt32(count)
+        params = restored
+
+        installFullState(positions: positions, flatLinks: flatLinks, counts: counts,
+                         food: food, nutrient: nutrient, chemU: chemU, chemV: chemV,
+                         tint: tint, rng: rng)
+        return (version, params.growthMode)
+    }
+
+    /// v1/v2 loader path (historical semantics): install geometry via the
+    /// standard reset (which re-seeds food/RNG deterministically and seeds
+    /// chemicals).
+    private func resetWithGrowthConfig(positions: [SIMD3<Float>], links: [[UInt32]]) throws {
+        reset(positions: positions, links: links)
+    }
+
+    /// Install a COMPLETE state snapshot (v3) without reseeding anything:
+    /// positions/links/counts/food/nutrient/u/v/tint/rng + params, then
+    /// recompute the derived per-cell data (normals, radii, tint) in a waited
+    /// command buffer. Derived state that only render paths consume
+    /// (litFlags) is zeroed — directional renders call
+    /// encodeIlluminationRefresh, and the next light-mode step re-marches.
+    private func installFullState(positions: [SIMD3<Float>], flatLinks: [UInt32],
+                                  counts: [UInt32], food: [Float], nutrient: [Float],
+                                  chemU: [Float], chemV: [Float], tint: [SIMD3<Float>],
+                                  rng: [UInt64]) {
+        precondition(positions.count <= maxCells, "state exceeds maxCells")
+        cellCount = positions.count
+        params.cellCount = UInt32(cellCount)
+        setGridBits(forCellCount: cellCount)
+        memset(binCountsBuffer.contents(), 0, binCountsBuffer.length)
+        syncParams()
+        usingA = true
+        usingNutA = true
+        usingChemA = true
+        stepIndex = 0
+
+        func copy<T>(_ src: [T], to buffer: MTLBuffer) {
+            src.withUnsafeBytes { s in
+                buffer.contents().copyMemory(from: s.baseAddress!,
+                                             byteCount: src.count * MemoryLayout<T>.stride)
+            }
+        }
+        copy(positions, to: positionsA)
+        copy(flatLinks, to: linksBuffer)
+        copy(counts, to: linkCountsBuffer)
+        copy(food, to: foodBuffer)
+        copy(nutrient, to: nutrientA)
+        copy(chemU, to: chemUA)
+        copy(chemV, to: chemVA)
+        copy(tint, to: tintBuffer)
+        copy(rng, to: rngBuffer)
+        counterBuffer.contents().assumingMemoryBound(to: UInt32.self)[0] = UInt32(cellCount)
+        memset(boundBuffer.contents(), 0, boundBuffer.length)
+        memset(litFlagsBuffer.contents(), 0, litFlagsBuffer.length)
+
+        // Derived per-cell data: normals + radii + tint (tint is a pure
+        // function of u/v/growthMode, so recomputing it reproduces the saved
+        // tint bit-for-bit; recomputing anyway keeps daughters-after-load
+        // consistent).
+        guard let cb = queue.makeCommandBuffer() else { fatalError("no command buffer") }
+        encodeNormals(cb, width: cellCount)
+        encodeRadii(into: cb, positions: positionsA, width: cellCount)
+        encodeCellTint(cb, width: cellCount)
+        cb.commit()
+        cb.waitUntilCompleted()
     }
 }

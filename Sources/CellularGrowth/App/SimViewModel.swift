@@ -63,11 +63,13 @@ final class SimViewModel: ObservableObject, ViewInput {
     }
     /// Switching modes takes effect immediately; entering RDE reseeds the
     /// chemicals (v = 0 everywhere is a fixed point — no pattern would form).
+    /// During a state load the reseed is suppressed (v3 files carry their
+    /// chemicals; v1/v2 files are reseeded by the loader itself).
     @Published var growthMode: GrowthMode = .uniform {
         didSet {
             sim.params.growthMode = UInt32(growthMode.rawValue)
             sim.syncParams()
-            if growthMode == .rde { sim.reseedChemicals() }
+            if growthMode == .rde && !loadingState { sim.reseedChemicals() }
         }
     }
     @Published var lightDiffusionRate: Double = 0.02 {
@@ -107,6 +109,33 @@ final class SimViewModel: ObservableObject, ViewInput {
     }
     @Published var jitter: Double = 0.2          // applied on reset
     @Published var subdivision: Double = 3       // applied on reset
+
+    // --- M6 render style (Solid = historical path; X-ray = additive impostor
+    // density accumulation — the interactive approximation of the offline
+    // X-ray; see cellFragmentXray) ---
+    @Published var renderStyle: Renderer.RenderStyle = .solid {
+        didSet { renderer.renderStyle = renderStyle }
+    }
+    /// Interactive X-ray exposure gain (per-sprite premultiplier; the 8-bit
+    /// additive clamp is the tone map).
+    @Published var xrayGain: Double = 0.3 {
+        didSet { renderer.xrayGain = Float(xrayGain) }
+    }
+    // --- M6 presets (Core/Presets.swift) ---
+    @Published var presetName: String? {
+        didSet {
+            guard !applyingPreset, let name = presetName,
+                  let preset = SimPreset.named(name) else { return }
+            applyPreset(preset)
+        }
+    }
+    private var applyingPreset = false
+    /// True while a state file loads: the published vars are being synced
+    /// from the loaded SimParams, and side effects tied to `didSet` (RDE
+    /// chemical reseeding) must NOT run — a v3 file carries its chemicals.
+    private var loadingState = false
+    // --- M6 state save/load ---
+    @Published var statusMessage: String?
 
     // Live readouts.
     @Published var cellCount = 0
@@ -174,6 +203,129 @@ final class SimViewModel: ObservableObject, ViewInput {
         sim.params.lightDirY = d.y
         sim.params.lightDirZ = d.z
         sim.syncParams()
+    }
+
+    // MARK: - M6 presets
+
+    /// Apply a named preset: full param bundle + reset-time shape knobs,
+    /// then reset. The panel is synced first (each didSet pushes the value
+    /// into SimParams), so sliders always show what runs.
+    func applyPreset(_ preset: SimPreset) {
+        applyingPreset = true
+        defer { applyingPreset = false }
+        let p = preset.params
+        springFactor = Double(p.springFactor)
+        planarFactor = Double(p.planarFactor)
+        bulgeFactor = Double(p.bulgeFactor)
+        radiusScale = Double(p.radiusScale)
+        foodIncrement = Double(p.foodIncrement)
+        splitThreshold = Double(p.splitThreshold)
+        divisionEnabled = p.divisionEnabled != 0
+        roi = Double(p.roi)
+        repulsionStrength = Double(p.repulsionStrength)
+        growthMode = GrowthMode(rawValue: Int(p.growthMode)) ?? .uniform
+        lightDiffusionRate = Double(p.lightDiffusionRate)
+        lightNutrient = Double(p.lightNutrient)
+        lightDecay = Double(p.lightDecay)
+        lightBase = Double(p.lightBase)
+        lightInterval = Double(p.lightInterval)
+        setLightDirFromParams(x: p.lightDirX, y: p.lightDirY, z: p.lightDirZ)
+        rdeF = Double(p.rdeF)
+        rdeK = Double(p.rdeK)
+        rdeDu = Double(p.rdeDu)
+        rdeDv = Double(p.rdeDv)
+        rdeBase = Double(p.rdeBase)
+        rdeGain = Double(p.rdeGain)
+        subdivision = Double(preset.subdivision)
+        jitter = Double(preset.jitter)
+        reset()
+        statusMessage = "Preset '\(preset.name)' applied"
+    }
+
+    /// Convert a stored light direction into the azimuth/elevation slider
+    /// pair (inverse of updateLightDir).
+    private func setLightDirFromParams(x: Float, y: Float, z: Float) {
+        let len = max(simd_length(SIMD3<Float>(x, y, z)), 1e-6)
+        lightElevation = Double(asin(y / len)) * 180 / .pi
+        lightAzimuth = Double(atan2(x, z)) * 180 / .pi
+    }
+
+    // MARK: - M6 state save/load (CGST v3)
+
+    /// Save the full sim state via NSSavePanel (default directory:
+    /// ~/Documents — the standard user-visible location; the CLI
+    /// --state-save takes explicit paths instead).
+    func saveStatePanel() {
+        let panel = NSSavePanel()
+        panel.title = "Save simulation state (CGST v3)"
+        panel.nameFieldStringValue = "cellular-state.cgst"
+        panel.directoryURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        panel.allowedContentTypes = [.data]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try sim.saveState(to: url.path)
+            statusMessage = "State saved (\(sim.cellCount) cells): \(url.lastPathComponent)"
+        } catch {
+            statusMessage = "State save FAILED: \(error.localizedDescription)"
+        }
+    }
+
+    /// Load a state snapshot (v1/v2/v3) via NSOpenPanel and sync the panel
+    /// to the loaded params. v3 restores chemicals/food/RNG exactly; v1/v2
+    /// reseed them (historical semantics).
+    func loadStatePanel() {
+        let panel = NSOpenPanel()
+        panel.title = "Load simulation state (CGST)"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        panel.allowedContentTypes = [.data]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let snap = try sim.loadState(from: url.path)
+            refreshPublishedFromParams()
+            let modes = ["uniform", "light", "rde"]
+            statusMessage = "State loaded (v\(snap.version), \(sim.cellCount) cells, mode \(modes[Int(min(snap.growthMode, 2))]))"
+        } catch {
+            statusMessage = "State load FAILED: \(error.localizedDescription)"
+        }
+    }
+
+    /// Sync every published parameter from sim.params after a load (the
+    /// loaded values must SHOW on the panel). Side effects suppressed while
+    /// `loadingState` is up.
+    private func refreshPublishedFromParams() {
+        loadingState = true
+        defer { loadingState = false }
+        let p = sim.params
+        growthMode = GrowthMode(rawValue: Int(p.growthMode)) ?? .uniform
+        springFactor = Double(p.springFactor)
+        planarFactor = Double(p.planarFactor)
+        bulgeFactor = Double(p.bulgeFactor)
+        radiusScale = Double(p.radiusScale)
+        foodIncrement = Double(p.foodIncrement)
+        splitThreshold = Double(p.splitThreshold)
+        divisionEnabled = p.divisionEnabled != 0
+        roi = Double(p.roi)
+        repulsionStrength = Double(p.repulsionStrength)
+        lightDiffusionRate = Double(p.lightDiffusionRate)
+        lightNutrient = Double(p.lightNutrient)
+        lightDecay = Double(p.lightDecay)
+        lightBase = Double(p.lightBase)
+        lightInterval = Double(p.lightInterval)
+        setLightDirFromParams(x: p.lightDirX, y: p.lightDirY, z: p.lightDirZ)
+        rdeF = Double(p.rdeF)
+        rdeK = Double(p.rdeK)
+        rdeDu = Double(p.rdeDu)
+        rdeDv = Double(p.rdeDv)
+        rdeBase = Double(p.rdeBase)
+        rdeGain = Double(p.rdeGain)
+        cellCount = sim.cellCount
+        // Re-frame the camera on the loaded structure.
+        let ballRadius = sim.readPositions().map { simd_length($0) }.max() ?? 1
+        renderer.camera.target = .zero
+        renderer.camera.distance = ballRadius * 2.6
     }
 
     // MARK: - ViewInput (orbit / zoom)

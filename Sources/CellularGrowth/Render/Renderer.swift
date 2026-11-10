@@ -9,7 +9,7 @@ import Metal
 import MetalKit
 import simd
 
-/// Must mirror MSL `struct Camera` (192 bytes).
+/// Must mirror MSL `struct Camera` (208 bytes: 192 + the M6 xrayPad float4).
 struct CameraUniforms {
     var view: simd_float4x4
     var proj: simd_float4x4
@@ -17,9 +17,19 @@ struct CameraUniforms {
     var up: SIMD4<Float>
     var negFwd: SIMD4<Float>
     var lightDir: SIMD4<Float>
+    var xrayPad: SIMD4<Float>   // M6: .x = interactive X-ray exposure gain
 }
 
 final class Renderer: NSObject, MTKViewDelegate {
+
+    /// M6 render style: Solid = the original depth-tested impostor path
+    /// (unchanged — the M3 goldens compare its offscreen output), X-ray = the
+    /// additive density-sprite accumulation (interactive approximation of the
+    /// offline X-ray; see cellFragmentXray in Shaders.swift).
+    enum RenderStyle {
+        case solid
+        case xray
+    }
 
     let device: MTLDevice
     let queue: MTLCommandQueue
@@ -28,11 +38,19 @@ final class Renderer: NSObject, MTKViewDelegate {
     // Plain vars, written from the main thread, read on the display-link thread.
     var isPlaying = true
     var stepsPerFrame = 4
+    var renderStyle: RenderStyle = .solid
+    /// Interactive X-ray exposure gain (per-sprite premultiplier; the 8-bit
+    /// additive clamp is the tone map — see cellFragmentXray). Tuned against
+    /// the offline X-ray of the same grown state (M6 report): 0.3 keeps dense
+    /// knots from saturating to flat white while dim regions still read.
+    var xrayGain: Float = 0.3
 
     var camera = OrbitCamera()
 
     private var pCellRender: MTLRenderPipelineState!
+    private var pCellRenderXray: MTLRenderPipelineState!
     private var depthState: MTLDepthStencilState!
+    private var depthStateXray: MTLDepthStencilState!   // test off, write off
     private let cameraBuffer: MTLBuffer
 
     // Stats plumbing
@@ -63,10 +81,33 @@ final class Renderer: NSObject, MTKViewDelegate {
             desc.depthAttachmentPixelFormat = .depth32Float
             pCellRender = try device.makeRenderPipelineState(descriptor: desc)
 
+            // M6 X-ray: same vertex layout, density fragment, ADDITIVE
+            // blending (one/one — premultiplied accumulation), no depth
+            // test/write so every sprite accumulates regardless of position.
+            let xvfn = lib.makeFunction(name: "cellVertexXray")!
+            let xffn = lib.makeFunction(name: "cellFragmentXray")!
+            let xdesc = MTLRenderPipelineDescriptor()
+            xdesc.vertexFunction = xvfn
+            xdesc.fragmentFunction = xffn
+            xdesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+            xdesc.depthAttachmentPixelFormat = .depth32Float
+            xdesc.colorAttachments[0].isBlendingEnabled = true
+            xdesc.colorAttachments[0].sourceRGBBlendFactor = .one
+            xdesc.colorAttachments[0].destinationRGBBlendFactor = .one
+            xdesc.colorAttachments[0].sourceAlphaBlendFactor = .one
+            xdesc.colorAttachments[0].destinationAlphaBlendFactor = .one
+            xdesc.colorAttachments[0].rgbBlendOperation = .add
+            xdesc.colorAttachments[0].alphaBlendOperation = .add
+            pCellRenderXray = try device.makeRenderPipelineState(descriptor: xdesc)
+
             let ds = MTLDepthStencilDescriptor()
             ds.depthCompareFunction = .less
             ds.isDepthWriteEnabled = true
             depthState = device.makeDepthStencilState(descriptor: ds)
+            let xds = MTLDepthStencilDescriptor()
+            xds.depthCompareFunction = .always
+            xds.isDepthWriteEnabled = false
+            depthStateXray = device.makeDepthStencilState(descriptor: xds)
         } catch {
             fatalError("Renderer: failed to build pipeline: \(error)")
         }
@@ -77,9 +118,14 @@ final class Renderer: NSObject, MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
-        guard let rpd = view.currentRenderPassDescriptor,
-              let drawable = view.currentDrawable,
+        guard let drawable = view.currentDrawable,
               let cb = queue.makeCommandBuffer() else { return }
+        // The X-ray look needs a BLACK background (density accumulation on
+        // dark, like the offline style); solid keeps the studio blue-grey.
+        view.clearColor = renderStyle == .xray
+            ? MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+            : MTLClearColor(red: 0.065, green: 0.075, blue: 0.095, alpha: 1)
+        guard let rpd = view.currentRenderPassDescriptor else { return }
 
         runFrame(into: rpd, commandBuffer: cb, aspect: aspect(of: view.drawableSize))
         cb.present(drawable)
@@ -147,7 +193,8 @@ final class Renderer: NSObject, MTKViewDelegate {
             right: SIMD4(right, 0),
             up: SIMD4(up, 0),
             negFwd: SIMD4(-fwd, 0),
-            lightDir: SIMD4(light, 0)
+            lightDir: SIMD4(light, 0),
+            xrayPad: SIMD4(xrayGain, 0, 0, 0)
         )
         withUnsafeBytes(of: &u) { src in
             cameraBuffer.contents().copyMemory(from: src.baseAddress!,
@@ -156,11 +203,22 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     /// Shared scene encoding for the MTKView path and the offscreen path.
+    /// The style selects the pipeline: solid = depth-tested opaque impostors
+    /// (the historical path, byte-identical); xray = additive density sprites
+    /// (depth test/write off). The CALLER owns the clear colour (the MTKView
+    /// path sets black for xray; the offscreen path's render-pass descriptor
+    /// must do the same — see renderToBytes).
     func encodeScene(into rpd: MTLRenderPassDescriptor, commandBuffer cb: MTLCommandBuffer, aspect: Float) {
         guard sim.cellCount > 0, let enc = cb.makeRenderCommandEncoder(descriptor: rpd) else { return }
         updateCameraBuffer(aspect: aspect)
-        enc.setRenderPipelineState(pCellRender)
-        enc.setDepthStencilState(depthState)
+        switch renderStyle {
+        case .solid:
+            enc.setRenderPipelineState(pCellRender)
+            enc.setDepthStencilState(depthState)
+        case .xray:
+            enc.setRenderPipelineState(pCellRenderXray)
+            enc.setDepthStencilState(depthStateXray)
+        }
         enc.setVertexBuffer(sim.positionsBuffer, offset: 0, index: 0)
         enc.setVertexBuffer(sim.radiiBuffer, offset: 0, index: 1)
         enc.setVertexBuffer(cameraBuffer, offset: 0, index: 2)

@@ -77,7 +77,10 @@ Headless flags: `--steps N`, `--subdiv N`, `--jitter F`, `--spring F`,
 `--light-diffuse F`, `--light-nutrient F`, `--light-decay F`, `--light-base F`,
 `--light-interval N`, `--rde-F F`, `--rde-k F`, `--rde-du F`, `--rde-dv F`,
 `--rde-base F`, `--rde-gain F`, `--rde-probe`, `--rde-dump DIR`,
-`--render-light auto|growth|unbiased`.
+`--render-light auto|growth|unbiased`. M6: `--preset
+ball|brain|plant|coral|degenerate-demo`, `--anim DIR`, `--anim-steps N`,
+`--anim-frames M`, `--stereo`, `--interocular F`,
+`--screenshot-style solid|xray`.
 
 Scratch-artefact policy: screenshots, test renders and debug dumps go under
 `/private/tmp/opencode/cellulargrowth/` (pre-approved scratch) — NOT generic
@@ -101,7 +104,14 @@ cyclic CCW ring structure. The initial ball starts ~5–6 valence, cap is
 `CellSim.maxValence = 16`.
 
 Per-step kernel pipeline (extend in place, keep order):
-`normals → integrateForces → radii` (+ food/division kernels from M2).
+`normals → [grid rebuild: count, scanLocal, scanBlocks, scanOffset, scatter] →
+[repulsionAccumulate] → [M5 chemicals: boundMax + illuminate + clearBound +
+nutrientDiffuse | rdeStep] → integrateForces → food → division (decide,
+execute, finalize) → cellTint → radii`.
+
+State snapshots: **CGST v3** is the snapshot format (full state incl. chemicals,
+RNG, raw SimParams); v1/v2 files load read-only-legacy. `docs/golden/*.state`
+files written from M6 onward are v3.
 
 ## Data layout & Metal conventions
 
@@ -151,6 +161,11 @@ Per-step kernel pipeline (extend in place, keep order):
 10. New CLI flags must be added to BOTH `HeadlessRunner.shouldRun()` AND the
     `run()` dispatch — otherwise the app silently launches the GUI event loop
     and hangs with no output (`--bench-growth`, found in M3).
+11. Swift `Set`/`Dictionary` iteration order is per-process randomized — never
+    use it to seed deterministic data (Icosphere ring rotation, found in M6).
+12. A light-march skip map must be live during the post-scatter march —
+    "self-cleaning" counters consumed by the scatter are zero before the march
+    reads them (found in M6).
 
 ## Validation gates (per milestone)
 

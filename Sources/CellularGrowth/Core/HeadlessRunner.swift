@@ -13,7 +13,9 @@
 //  runs); the GUI keeps its non-seeded reset.
 
 import AppKit
+import AVFoundation
 import CoreGraphics
+import CoreVideo
 import Foundation
 import ImageIO
 import Metal
@@ -40,6 +42,12 @@ enum HeadlessRunner {
             || args.contains("--rde-base") || args.contains("--rde-gain")
             || args.contains("--rde-probe") || args.contains("--rde-dump")
             || args.contains("--render-light")
+            // --- M6 (pitfall 10: every new flag routes to the headless path) ---
+            || args.contains("--preset")
+            || args.contains("--anim") || args.contains("--anim-steps")
+            || args.contains("--anim-frames")
+            || args.contains("--stereo") || args.contains("--interocular")
+            || args.contains("--screenshot-style")
     }
 
     struct Options {
@@ -93,6 +101,14 @@ enum HeadlessRunner {
         var rdeProbe = false       // static-ball RDE pattern validation mode
         var rdeDump: String?       // chemical scatter dump directory (probe + runs)
         var renderLight = "auto"   // auto | growth | unbiased (M5 unified light)
+        // --- M6 ---
+        var preset: String?        // named parameter preset (Core/Presets.swift)
+        var animDir: String?       // animation export: numbered PNG frames + .mov
+        var animSteps = 150        // steps between frames
+        var animFrames = 20        // total frames (frame 0 = the initial state)
+        var stereo = false         // ray tracer: side-by-side stereo pair
+        var interocular: Float = 0.03  // eye separation as a fraction of the scene scale
+        var screenshotStyle = "solid"  // raster screenshot style: solid | xray (impostor)
     }
 
     private static func parseOptions() -> Options {
@@ -103,6 +119,42 @@ enum HeadlessRunner {
             return args[idx + 1]
         }
         func given(_ flag: String) -> Bool { args.contains(flag) }
+
+        // M6 presets FIRST: a preset is a full param bundle that pre-fills
+        // the options; explicit CLI flags later in the loop still win.
+        if let name = value("--preset") {
+            guard let preset = SimPreset.named(name) else {
+                let names = SimPreset.all.map { $0.name }.joined(separator: " | ")
+                print("--preset '\(name)' unknown (\(names))")
+                exit(1)
+            }
+            o.subdiv = preset.subdivision
+            o.jitter = preset.jitter
+            o.spring = preset.params.springFactor
+            o.planar = preset.params.planarFactor
+            o.bulge = preset.params.bulgeFactor
+            o.food = preset.params.foodIncrement
+            o.threshold = preset.params.splitThreshold
+            o.division = preset.params.divisionEnabled != 0
+            o.roi = preset.params.roi
+            o.repulsion = preset.params.repulsionStrength
+            o.growth = ["uniform", "light", "rde"][Int(min(preset.params.growthMode, 2))]
+            let ld = SIMD3<Float>(preset.params.lightDirX, preset.params.lightDirY, preset.params.lightDirZ)
+            if simd_length(ld) > 1e-6 { o.lightDir = ld }
+            o.lightDiffuse = preset.params.lightDiffusionRate
+            o.lightNutrient = preset.params.lightNutrient
+            o.lightDecay = preset.params.lightDecay
+            o.lightBase = preset.params.lightBase
+            o.lightInterval = Int(preset.params.lightInterval)
+            o.rdeF = preset.params.rdeF
+            o.rdeK = preset.params.rdeK
+            o.rdeDu = preset.params.rdeDu
+            o.rdeDv = preset.params.rdeDv
+            o.rdeBase = preset.params.rdeBase
+            o.rdeGain = preset.params.rdeGain
+            print("preset '\(preset.name)': \(preset.summary)")
+        }
+
         for a in args {
             switch a {
             case "--steps": o.steps = Int(value("--steps") ?? "") ?? o.steps
@@ -165,6 +217,15 @@ enum HeadlessRunner {
             case "--rde-probe": o.rdeProbe = true
             case "--rde-dump": o.rdeDump = value("--rde-dump")
             case "--render-light": o.renderLight = (value("--render-light") ?? "auto").lowercased()
+            // --- M6 ---
+            case "--preset": break   // consumed before the loop (preset-first)
+            case "--anim": o.animDir = value("--anim")
+            case "--anim-steps": o.animSteps = Int(value("--anim-steps") ?? "") ?? o.animSteps
+            case "--anim-frames": o.animFrames = Int(value("--anim-frames") ?? "") ?? o.animFrames
+            case "--stereo": o.stereo = true
+            case "--interocular": o.interocular = Float(value("--interocular") ?? "") ?? o.interocular
+            case "--screenshot-style":
+                o.screenshotStyle = (value("--screenshot-style") ?? "solid").lowercased()
             default: break
             }
         }
@@ -234,6 +295,11 @@ enum HeadlessRunner {
         sim.params.rdeDv = min(max(o.rdeDv, 0), 1)
         sim.params.rdeBase = max(o.rdeBase, 0)
         sim.params.rdeGain = o.rdeGain
+        // M6 diagnostic kill switch for the light-march coarse skip (A/B
+        // validation of the occupancy optimization).
+        if ProcessInfo.processInfo.environment["CG_NO_COARSE_SKIP"] != nil {
+            sim.params.lightCoarseSkip = 0
+        }
 
         if o.rdeProbe {
             runRdeProbe(queue: queue, sim: sim, o: o)   // exits
@@ -255,6 +321,9 @@ enum HeadlessRunner {
         }
         if o.renderPath != nil {
             runRender(queue: queue, sim: sim, o: o)   // exits
+        }
+        if o.animDir != nil {
+            runAnimation(queue: queue, sim: sim, o: o)   // exits (M6)
         }
         runHeadless(queue: queue, sim: sim, o: o)
     }
@@ -616,14 +685,27 @@ enum HeadlessRunner {
     }
 
     private static func runHeadless(queue: MTLCommandQueue, sim: CellSim, o: Options) -> Never {
-        growAndReport(queue: queue, sim: sim, o: o)
+        // M6: --state-load works in the headless path too — render/screenshot
+        // a stored state instead of growing (matches the --render workflow).
+        if let loadPath = o.stateLoad {
+            do {
+                let snap = try sim.loadState(from: loadPath)
+                let modes = ["uniform", "light", "rde"]
+                print("state loaded: \(loadPath) (CGST v\(snap.version), \(sim.cellCount) cells, mode \(modes[Int(min(snap.growthMode, 2))]))")
+            } catch {
+                print("state load FAILED: \(error)")
+                exit(1)
+            }
+        } else {
+            growAndReport(queue: queue, sim: sim, o: o)
+        }
 
         // M5: --state-save now works in the headless path too (it was only
         // handled by --render before; the flag silently did nothing here).
         if let savePath = o.stateSave {
             do {
-                try saveStateSnapshot(savePath, sim: sim)
-                print("state saved: \(savePath) (\(sim.cellCount) cells)")
+                try sim.saveState(to: savePath)
+                print("state saved: \(savePath) (\(sim.cellCount) cells, CGST v3 full state)")
             } catch {
                 print("state save FAILED: \(error)")
                 exit(1)
@@ -638,7 +720,10 @@ enum HeadlessRunner {
                 cb.commit()
                 cb.waitUntilCompleted()
             }
-            renderScreenshot(sim: sim, queue: queue, to: path)
+            if o.screenshotStyle != "solid" && o.screenshotStyle != "xray" {
+                print("--screenshot-style '\(o.screenshotStyle)' unknown; using solid")
+            }
+            renderScreenshot(sim: sim, queue: queue, to: path, style: o.screenshotStyle)
         }
 
         exit(0)
@@ -655,12 +740,13 @@ enum HeadlessRunner {
             // Render a STORED state (--state-load): skips the growth entirely
             // (paper-gate workflow: same state rendered in both styles).
             do {
-                try loadStateSnapshot(loadPath, sim: sim)
+                let snap = try sim.loadState(from: loadPath)
+                let modes = ["uniform", "light", "rde"]
+                print("state loaded: \(loadPath) (CGST v\(snap.version), \(sim.cellCount) cells, mode \(modes[Int(min(snap.growthMode, 2))]))")
             } catch {
                 print("state load FAILED: \(error)")
                 exit(1)
             }
-            print("state loaded: \(loadPath) (\(sim.cellCount) cells)")
         } else {
             growAndReport(queue: queue, sim: sim, o: o, useSeededJitter: true)
         }
@@ -726,6 +812,17 @@ enum HeadlessRunner {
         settings.densityScale = envFloat("CG_DENSITY_SCALE", settings.densityScale)
         settings.profileSupport = envFloat("CG_PROFILE_SUPPORT", settings.profileSupport)
 
+        // M6 stereo pairs (paper §6): two renders with the eye shifted along
+        // the camera RIGHT axis by ±interocular/2 (parallel-axis stereo — no
+        // toe-in, so there is no keystone distortion), composited side by
+        // side (left eye on the left). Separation is a FRACTION of the scene
+        // scale (the bounding radius), default 0.03 — the paper only says
+        // "cameras with an interocular separation".
+        if o.stereo {
+            settings.stereo = true
+            settings.interocular = o.interocular
+        }
+
         // Same framing convention as --screenshot: camera distance from the
         // structure's max |P| (OrbitCamera yaw/pitch/fov defaults shared).
         var maxAbs: Float = 0
@@ -736,11 +833,11 @@ enum HeadlessRunner {
         let t0 = CFAbsoluteTimeGetCurrent()
         let result = renderer.render(settings: settings)
         let wall = CFAbsoluteTimeGetCurrent() - t0
-        print("Render: \(settings.style.rawValue == 0 ? "solid" : "xray") \(o.width)x\(o.height) samples=\(settings.samples) cells=\(sim.cellCount)  wall \(String(format: "%.2f", wall))s  gpu \(String(format: "%.2f", result.gpuSeconds))s")
+        print("Render: \(settings.style.rawValue == 0 ? "solid" : "xray") \(result.width)x\(result.height)\(o.stereo ? " (stereo pair, interocular \(o.interocular)x scene)" : "") samples=\(settings.samples) cells=\(sim.cellCount)  wall \(String(format: "%.2f", wall))s  gpu \(String(format: "%.2f", result.gpuSeconds))s")
         if let savePath = o.stateSave {
             do {
-                try saveStateSnapshot(savePath, sim: sim)
-                print("state saved: \(savePath) (\(sim.cellCount) cells)")
+                try sim.saveState(to: savePath)
+                print("state saved: \(savePath) (\(sim.cellCount) cells, CGST v3 full state)")
             } catch {
                 print("state save FAILED: \(error)")
                 exit(1)
@@ -769,6 +866,198 @@ enum HeadlessRunner {
             print("CGDBG: raw BGRA bytes written to \(rawPath)")
         }
         exit(0)
+    }
+
+    // MARK: - M6 animation export (paper §6: "High definition animations taken
+    // by rendering images at equally spaced time intervals")
+
+    /// --anim DIR --anim-steps N --anim-frames M: grow the configured state
+    /// and render a frame every N steps with the OFFLINE ray tracer (style /
+    /// size / samples from --style/--width/--height/--samples) into DIR as
+    /// frame_0000.png …, then assemble a H.264 .mov (AVFoundation, 30 fps).
+    /// Frame 0 is the initial state; frame f is at step f·N. The camera is
+    /// re-framed per frame (max |P| × 2.6, the shared convention) so the
+    /// growing structure stays in frame.
+    private static func runAnimation(queue: MTLCommandQueue, sim: CellSim, o: Options) -> Never {
+        let dir = o.animDir!
+        let frames = max(1, o.animFrames)
+        let stepsPerFrame = max(0, o.animSteps)
+        do { try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) } catch {
+            print("animation FAILED: cannot create \(dir): \(error)")
+            exit(1)
+        }
+        print("animation: \(frames) frames every \(stepsPerFrame) steps, style \(o.style), \(o.width)x\(o.height), into \(dir)")
+
+        // Same deterministic setup as --render (seeded jitter).
+        let (base, links) = Icosphere.generate(subdivisions: o.subdiv, spacing: sim.params.linkRestLength)
+        let positions = o.jitter > 0 ? seededJitter(base, radius: o.jitter, seed: o.seed) : base
+        sim.reset(positions: positions, links: links)
+
+        var settings = RayRenderSettings()
+        settings.style = o.style == "xray" ? .xray : .solid
+        settings.width = o.width
+        settings.height = o.height
+        settings.samples = o.samples
+        // M6: the animation honours --render-light exactly like --render
+        // (auto = directional only in light-growth mode). For paper-style
+        // artefacts pass --render-light unbiased.
+        switch o.renderLight {
+        case "growth":
+            settings.directionalLight = SIMD3<Float>(sim.params.lightDirX, sim.params.lightDirY, sim.params.lightDirZ)
+        case "unbiased":
+            settings.directionalLight = nil
+        case "auto":
+            settings.directionalLight = sim.params.growthMode == 1
+                ? SIMD3<Float>(sim.params.lightDirX, sim.params.lightDirY, sim.params.lightDirZ)
+                : nil
+        default:
+            print("--render-light '\(o.renderLight)' unknown (auto | growth | unbiased)")
+            exit(1)
+        }
+
+        let renderer = RayRenderer(device: sim.device, queue: queue, sim: sim)
+        var totalGpu = 0.0
+        let totalWall = CFAbsoluteTimeGetCurrent()
+        let pngPaths = (0..<frames).map { "\(dir)/frame_\(String(format: "%04d", $0)).png" }
+
+        for f in 0..<frames {
+            if f > 0 && stepsPerFrame > 0 {
+                runSteps(queue: queue, sim: sim, count: stepsPerFrame)
+            }
+            // Render prep at the exact current count: fresh radii + ONE grid
+            // rebuild + (light mode) refreshed illumination verdicts.
+            if let cb = queue.makeCommandBuffer() {
+                sim.refreshRadii(cb)
+                sim.encodeGridRebuild(cb)
+                if settings.directionalLight != nil {
+                    sim.encodeIlluminationRefresh(cb)
+                }
+                cb.commit()
+                cb.waitUntilCompleted()
+                if let e = cb.error { print("animation frame \(f) prep CB ERROR: \(e)") }
+            }
+            sim.syncCellCountFromDevice()
+            var maxAbs: Float = 0
+            for p in sim.readPositions() { maxAbs = max(maxAbs, simd_length(p)) }
+            settings.camera.distance = maxAbs * 2.6
+
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let result = renderer.render(settings: settings)
+            let wall = CFAbsoluteTimeGetCurrent() - t0
+            totalGpu += result.gpuSeconds
+            do {
+                try writePNG(result.bytes, width: result.width, height: result.height, to: pngPaths[f])
+            } catch {
+                print("animation FAILED: frame \(f) PNG: \(error)")
+                exit(1)
+            }
+            print("frame \(f)/\(frames - 1) t=\(f * stepsPerFrame) cells=\(sim.cellCount)  wall \(String(format: "%.2f", wall))s  gpu \(String(format: "%.2f", result.gpuSeconds))s")
+        }
+
+        if let savePath = o.stateSave {
+            do {
+                try sim.saveState(to: savePath)
+                print("state saved: \(savePath) (\(sim.cellCount) cells, CGST v3 full state)")
+            } catch {
+                print("state save FAILED: \(error)")
+                exit(1)
+            }
+        }
+
+        // Assemble the H.264 movie (30 fps; frames at equally spaced times =
+        // equally spaced step intervals, per the paper).
+        let movPath = "\(dir)/animation.mov"
+        do {
+            try assembleMOV(frames: pngPaths, width: o.width, height: o.height,
+                            fps: 30, to: movPath)
+            let total = CFAbsoluteTimeGetCurrent() - totalWall
+            print("animation done: \(frames) frames + \(movPath)  total wall \(String(format: "%.2f", total))s  render gpu \(String(format: "%.2f", totalGpu))s")
+        } catch {
+            // Honest fallback: the PNG sequence is complete; say what failed.
+            print("MOV assembly FAILED (\(error)) — the PNG sequence in \(dir) is complete; assemble manually e.g.:\n  ffmpeg -framerate 30 -i \(dir)/frame_%04d.png -c:v libx264 -pix_fmt yuv420p \(dir)/animation.mp4")
+        }
+        exit(0)
+    }
+
+    /// Encode a numbered PNG sequence into an H.264 .mov via AVFoundation
+    /// (AVAssetWriter + pixel-buffer adaptor; BGRA in, yuv420p out). Works
+    /// headless — no GUI/app bundle required.
+    private static func assembleMOV(frames: [String], width: Int, height: Int,
+                                    fps: Int32, to path: String) throws {
+        let url = URL(fileURLWithPath: path)
+        try? FileManager.default.removeItem(at: url)   // overwrite a previous run
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let settings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: max(2_000_000, width * height * 4),   // ~4 bit/px
+            ],
+        ]
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        input.expectsMediaDataInRealTime = false
+        let attrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height,
+        ]
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input,
+                                                           sourcePixelBufferAttributes: attrs)
+        guard writer.canAdd(input) else {
+            throw NSError(domain: "anim", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter rejected the video input"])
+        }
+        writer.add(input)
+        guard writer.startWriting() else {
+            throw writer.error ?? NSError(domain: "anim", code: 2)
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
+            throw NSError(domain: "anim", code: 3)
+        }
+        let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue
+            | CGBitmapInfo.byteOrder32Little.rawValue   // BGRA, same as the PNG writer
+
+        for (f, pngPath) in frames.enumerated() {
+            guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: pngPath) as CFURL, nil),
+                  let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+                throw NSError(domain: "anim", code: 4,
+                              userInfo: [NSLocalizedDescriptionKey: "cannot decode \(pngPath)"])
+            }
+            var pb: CVPixelBuffer?
+            guard CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA,
+                                      attrs as CFDictionary, &pb) == kCVReturnSuccess,
+                  let pixelBuffer = pb else {
+                throw NSError(domain: "anim", code: 5,
+                              userInfo: [NSLocalizedDescriptionKey: "pixel buffer alloc failed"])
+            }
+            CVPixelBufferLockBaseAddress(pixelBuffer, [])
+            if let ctx = CGContext(data: CVPixelBufferGetBaseAddress(pixelBuffer),
+                                   width: width, height: height, bitsPerComponent: 8,
+                                   bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+                                   space: colorSpace, bitmapInfo: bitmapInfo) {
+                ctx.draw(img, in: CGRect(x: 0, y: 0, width: width, height: height))
+            }
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+            while !input.isReadyForMoreMediaData {
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+            let time = CMTime(value: CMTimeValue(f), timescale: fps)
+            guard adaptor.append(pixelBuffer, withPresentationTime: time) else {
+                throw writer.error ?? NSError(domain: "anim", code: 6,
+                                              userInfo: [NSLocalizedDescriptionKey: "append failed at frame \(f)"])
+            }
+        }
+        input.markAsFinished()
+        let sema = DispatchSemaphore(value: 0)
+        writer.finishWriting { sema.signal() }
+        sema.wait()
+        guard writer.status == .completed else {
+            throw writer.error ?? NSError(domain: "anim", code: 7,
+                                          userInfo: [NSLocalizedDescriptionKey: "writer status \(writer.status.rawValue)"])
+        }
     }
 
     // MARK: - Bench
@@ -1069,139 +1358,20 @@ enum HeadlessRunner {
     private static func goldenStatePath(_ name: String) -> String { "\(goldenDir)/\(name).state" }
 
     // MARK: State snapshots (grown goldens; see RenderGoldenSettings.snapshot)
+    //
+    // M6: the CGST writer/reader now lives on CellSim (saveState(to:) /
+    // loadState(from:)) — one implementation for the CLI, the goldens and the
+    // GUI. Golden .state files written from M6 on are v3 (full state); the
+    // stored M4 goldens are v1 and still load (CellSim.loadState).
 
-    /// Binary snapshot of the live state: magic "CGST", version, cellCount,
-    /// maxValence, then positions (SIMD3 stride 16), links (strided per cell),
-    /// linkCounts. v2 (M5) appends a growth-config block (growthMode + the
-    /// light/rde coupling params) so a loaded state renders and continues with
-    /// the mode that grew it — the per-cell tint and the unified render light
-    /// key off growthMode. GPU must be idle.
-    private static func saveStateSnapshot(_ path: String, sim: CellSim) throws {
-        let count = sim.cellCount
-        var bytes = [UInt8]()
-        bytes.reserveCapacity(16 + count * (MemoryLayout<SIMD3<Float>>.stride
-                                            + CellSim.maxValence * MemoryLayout<UInt32>.stride
-                                            + MemoryLayout<UInt32>.stride)
-                              + 56)   // v2 growth block: 1 uint + 13 floats
-        func append(_ v: UInt32) {
-            var x = v.littleEndian
-            withUnsafeBytes(of: &x) { bytes.append(contentsOf: $0) }
-        }
-        func append(_ v: Float) {
-            var x = v.bitPattern.littleEndian
-            withUnsafeBytes(of: &x) { bytes.append(contentsOf: $0) }
-        }
-        bytes.append(contentsOf: Array("CGST".utf8))
-        append(2 as UInt32)                     // version (v2: + growth block)
-        append(UInt32(count))
-        append(UInt32(CellSim.maxValence))
-        let pos = UnsafeBufferPointer(start: sim.positionsPointer, count: count)
-        for p in pos {
-            for c in [p.x, p.y, p.z] {
-                var f = c.bitPattern.littleEndian
-                withUnsafeBytes(of: &f) { bytes.append(contentsOf: $0) }
-            }
-            var pad: UInt32 = 0
-            withUnsafeBytes(of: &pad) { bytes.append(contentsOf: $0) }
-        }
-        let links = UnsafeBufferPointer(start: sim.linksPointer, count: count * CellSim.maxValence)
-        for l in links { append(l) }
-        let counts = UnsafeBufferPointer(start: sim.linkCountsPointer, count: count)
-        for c in counts { append(c) }
-        // Growth-config block (v2): the mode + coupling the state was grown in.
-        append(sim.params.growthMode)
-        append(sim.params.lightDirX)
-        append(sim.params.lightDirY)
-        append(sim.params.lightDirZ)
-        append(sim.params.lightDiffusionRate)
-        append(sim.params.lightNutrient)
-        append(sim.params.lightDecay)
-        append(sim.params.lightBase)
-        append(sim.params.rdeF)
-        append(sim.params.rdeK)
-        append(sim.params.rdeDu)
-        append(sim.params.rdeDv)
-        append(sim.params.rdeBase)
-        append(sim.params.rdeGain)
-        try Data(bytes).write(to: URL(fileURLWithPath: path))
+    private static func saveGoldenState(_ path: String, sim: CellSim) throws {
+        try sim.saveState(to: path)
     }
 
-    /// Load a state snapshot and install it via CellSim.reset (recomputes
-    /// normals, radii, food/RNG placeholders deterministically). v1 files
-    /// (M4 goldens) carry no growth block — the current params stay. v2 files
-    /// restore the growth config (mode + light/rde coupling) BEFORE reset, so
-    /// cellTint and the unified render light see the grown mode.
-    private static func loadStateSnapshot(_ path: String, sim: CellSim) throws {
-        let data = try Data(contentsOf: URL(fileURLWithPath: path))
-        func u32(_ off: Int) -> UInt32 {
-            UInt32(data[off]) | (UInt32(data[off+1]) << 8) | (UInt32(data[off+2]) << 16) | (UInt32(data[off+3]) << 24)
-        }
-        func f32(_ off: Int) -> Float {
-            Float(bitPattern: u32(off))
-        }
-        guard data.count >= 16, String(bytes: data[0..<4], encoding: .ascii) == "CGST",
-              u32(4) == 1 || u32(4) == 2 else {
-            throw NSError(domain: "golden", code: 10,
-                          userInfo: [NSLocalizedDescriptionKey: "\(path): not a CGST v1/v2 state snapshot"])
-        }
-        let version = u32(4)
-        let count = Int(u32(8))
-        let maxValence = Int(u32(12))
-        guard maxValence == CellSim.maxValence else {
-            throw NSError(domain: "golden", code: 11,
-                          userInfo: [NSLocalizedDescriptionKey: "\(path): maxValence \(maxValence) != \(CellSim.maxValence)"])
-        }
-        let baseSize = 16 + count * (MemoryLayout<SIMD3<Float>>.stride + maxValence * 4 + 4)
-        let expected = version == 2 ? baseSize + 56 : baseSize   // v2 block: 1 uint + 13 floats
-        guard data.count == expected else {
-            throw NSError(domain: "golden", code: 12,
-                          userInfo: [NSLocalizedDescriptionKey: "\(path): size \(data.count) != expected \(expected) for \(count) cells (v\(version))"])
-        }
-        if version == 2 {
-            // Growth block: 1 uint + 13 floats after the linkCounts block.
-            var off = baseSize
-            sim.params.growthMode = u32(off); off += 4
-            sim.params.lightDirX = f32(off); off += 4
-            sim.params.lightDirY = f32(off); off += 4
-            sim.params.lightDirZ = f32(off); off += 4
-            sim.params.lightDiffusionRate = f32(off); off += 4
-            sim.params.lightNutrient = f32(off); off += 4
-            sim.params.lightDecay = f32(off); off += 4
-            sim.params.lightBase = f32(off); off += 4
-            sim.params.rdeF = f32(off); off += 4
-            sim.params.rdeK = f32(off); off += 4
-            sim.params.rdeDu = f32(off); off += 4
-            sim.params.rdeDv = f32(off); off += 4
-            sim.params.rdeBase = f32(off); off += 4
-            sim.params.rdeGain = f32(off); off += 4
-            let modes = ["uniform", "light", "rde"]
-            print("state growth config: \(modes[Int(min(sim.params.growthMode, 2))]) (light diffuse \(sim.params.lightDiffusionRate), rde F \(sim.params.rdeF)/k \(sim.params.rdeK))")
-        }
-        var positions = [SIMD3<Float>](repeating: .zero, count: count)
-        data.withUnsafeBytes { src in
-            positions.withUnsafeMutableBytes { dst in
-                dst.copyBytes(from: UnsafeRawBufferPointer(rebasing: src.dropFirst(16).prefix(count * MemoryLayout<SIMD3<Float>>.stride)))
-            }
-        }
-        var flatLinks = [UInt32](repeating: 0, count: count * maxValence)
-        data.withUnsafeBytes { src in
-            flatLinks.withUnsafeMutableBytes { dst in
-                dst.copyBytes(from: UnsafeRawBufferPointer(rebasing: src.dropFirst(16 + count * MemoryLayout<SIMD3<Float>>.stride).prefix(count * maxValence * 4)))
-            }
-        }
-        // linkCounts block follows the links block.
-        var counts = [UInt32](repeating: 0, count: count)
-        data.withUnsafeBytes { src in
-            counts.withUnsafeMutableBytes { dst in
-                dst.copyBytes(from: UnsafeRawBufferPointer(rebasing: src.dropFirst(16 + count * (MemoryLayout<SIMD3<Float>>.stride + maxValence * 4)).prefix(count * 4)))
-            }
-        }
-        var links = [[UInt32]](repeating: [], count: count)
-        for i in 0..<count {
-            let n = Int(counts[i])
-            links[i] = Array(flatLinks[i * maxValence..<(i * maxValence + n)])
-        }
-        sim.reset(positions: positions, links: links)
+    /// Golden .state replay: CellSim.loadState handles v1/v2/v3 (the stored
+    /// M4 goldens are v1, M6 captures are v3).
+    private static func loadGoldenState(_ path: String, sim: CellSim) throws {
+        _ = try sim.loadState(from: path)
     }
 
     private static func writeGoldenMeta(_ name: String, cfg: GoldenConfig) throws {
@@ -1342,7 +1512,7 @@ enum HeadlessRunner {
 
         if loadSnapshot && r.snapshot {
             do {
-                try loadStateSnapshot(goldenStatePath(name), sim: sim)
+                try loadGoldenState(goldenStatePath(name), sim: sim)
             } catch {
                 print("golden render FAILED: \(error)")
                 exit(1)
@@ -1374,6 +1544,15 @@ enum HeadlessRunner {
             if let e = cb.error { print("golden render prep CB ERROR: \(e)") }
         }
         sim.syncCellCountFromDevice()
+
+        // M6: the interactive ADDITIVE X-ray (raster impostor path) can be
+        // locked by its own golden — style "xray-impostor" selects it instead
+        // of the ray tracer. The ao*/xray*/density meta keys are ray-tracer
+        // knobs (recorded for meta compatibility; unused by the impostor).
+        if r.style == "xray-impostor" {
+            return renderToBytes(sim: sim, queue: queue, width: cfg.width, height: cfg.height,
+                                 style: "xray")
+        }
 
         var settings = RayRenderSettings()
         settings.style = r.style == "xray" ? .xray : .solid
@@ -1430,7 +1609,7 @@ enum HeadlessRunner {
             try FileManager.default.createDirectory(atPath: goldenDir, withIntermediateDirectories: true)
             try writePNG(bytes, width: cfg.width, height: cfg.height, to: goldenPNGPath(name))
             if cfg.render?.snapshot == true {
-                try saveStateSnapshot(goldenStatePath(name), sim: sim)
+                try saveGoldenState(goldenStatePath(name), sim: sim)
                 print("state snapshot written: \(goldenStatePath(name)) (\(sim.cellCount) cells)")
             }
             try writeGoldenMeta(name, cfg: cfg)
@@ -1775,12 +1954,17 @@ enum HeadlessRunner {
     // MARK: - Offscreen render + PNG
 
     /// Render the current state offscreen and return the raw RGBA bytes
-    /// (shared by --screenshot and the golden capture/check).
-    private static func renderToBytes(sim: CellSim, queue: MTLCommandQueue, width: Int, height: Int) -> [UInt8] {
+    /// (shared by --screenshot and the golden capture/check). style: "solid"
+    /// (the historical depth-tested impostors) or "xray" (the M6 additive
+    /// density-sprite impostors — the interactive X-ray, NOT the ray tracer).
+    /// Goldens always pass "solid" (default), so their pixels are unchanged.
+    private static func renderToBytes(sim: CellSim, queue: MTLCommandQueue, width: Int, height: Int,
+                                      style: String = "solid") -> [UInt8] {
         let device = sim.device
 
         let renderer = Renderer(device: device, queue: queue, sim: sim)
         renderer.isPlaying = false
+        renderer.renderStyle = style == "xray" ? .xray : .solid
         let ballRadius = sim.readPositions().map { simd_length($0) }.max() ?? 1
         renderer.camera.distance = ballRadius * 2.6
 
@@ -1789,11 +1973,15 @@ enum HeadlessRunner {
             fatalError("screenshot: texture alloc failed")
         }
 
+        // X-ray accumulates density on a BLACK background (offline-style look).
+        let clear = style == "xray"
+            ? MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+            : MTLClearColor(red: 0.065, green: 0.075, blue: 0.095, alpha: 1)
         let rpd = MTLRenderPassDescriptor()
         rpd.colorAttachments[0].texture = color
         rpd.colorAttachments[0].loadAction = .clear
         rpd.colorAttachments[0].storeAction = .store
-        rpd.colorAttachments[0].clearColor = MTLClearColor(red: 0.065, green: 0.075, blue: 0.095, alpha: 1)
+        rpd.colorAttachments[0].clearColor = clear
         rpd.depthAttachment.texture = depth
         rpd.depthAttachment.loadAction = .clear
         rpd.depthAttachment.storeAction = .dontCare
@@ -1816,11 +2004,12 @@ enum HeadlessRunner {
     }
 
     private static func renderScreenshot(sim: CellSim, queue: MTLCommandQueue, to path: String,
-                                         width: Int = 1600, height: Int = 1200) {
-        let bytes = renderToBytes(sim: sim, queue: queue, width: width, height: height)
+                                         width: Int = 1600, height: Int = 1200,
+                                         style: String = "solid") {
+        let bytes = renderToBytes(sim: sim, queue: queue, width: width, height: height, style: style)
         do {
             try writePNG(bytes, width: width, height: height, to: path)
-            print("Screenshot written: \(path)")
+            print("Screenshot written: \(path) (\(style == "xray" ? "impostor X-ray" : "solid"))")
         } catch {
             print("Screenshot failed: \(error)")
         }

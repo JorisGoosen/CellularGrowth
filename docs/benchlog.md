@@ -181,3 +181,64 @@ Observations:
   session/thermal variance (the M5 comparison is internally consistent).
 - Chemical buffers add 6 x 4 B/cell preallocated (nutrient A/B, u A/B,
   v A/B = 48 MB at the 2M cap) + 1 x 4 B litFlags; no per-step allocations.
+
+## M6 light-march occupancy skip (interleaved A/B, division ON: food 0.01, seed 12345, interval 1, 12 steps/level) — 2026-11-11 — Apple M1 Pro
+
+The M5 open issue: the illumination march's empty-interior traversal dominates
+light-mode steps at scale (dark-hemisphere rays cross the hollow interior bin
+by bin, each empty bin costing 27 binStarts lookups into the 16 MB table).
+M6 fix: a coarse occupancy bitfield (one bit per hashed 8³-fine-bin block,
+FIXED 7-bit packed hash per axis, 2^21 slots = 256 KB, blit-cleared at every
+grid rebuild); the march tests the 27 coarse bits around the current 8³-bin
+block and, when all clear, jumps the DDA straight to the block's exit (proof
+that a skipped region cannot contain a blocker is in
+Shaders.swift/coarseNeighbourhoodClear). Skip correctness validated by an
+exact A/B: a --no-div light-mode run saves BYTE-IDENTICAL state files with the
+skip on (kill switch lightCoarseSkip/CG_NO_COARSE_SKIP) and off — the entire
+nutrient trajectory is unchanged; only the kill-switch byte in the saved
+SimParams differs.
+
+The machine's thermal state drifted >2x across this session (M5's 835 ms and
+the first M6 "before" at 460 ms are the same code), so the comparison below is
+INTERLEAVED (on/off alternating in one session, two passes) — the ratio is the
+measurement, not the absolute numbers:
+
+| cells | ms/step skip ON | ms/step skip OFF | speedup |
+|---|---|---|---|
+| 655 362 → 675 925 | 215.2 / 221.8 | 771.6 / 906.8 | 3.6–4.1x |
+
+Default light interval (8), same session (skip on, the shipped configuration):
+
+| cells | ms/step cpu | ms/step gpu | steps/s |
+|---|---|---|---|
+| 2 562 → 2 890 | 0.467 | 0.426 | 2 139 |
+| 10 242 → 11 648 | 0.592 | 0.553 | 1 688 |
+| 40 962 → 46 622 | 1.973 | 1.930 | 507 |
+| 163 842 → 186 533 | 7.587 | 7.540 | 132 |
+| 655 362 → 745 705 | 35.230 | 35.174 | 28 |
+
+vs the M5 interval-8 table (88.9 ms/step at 655k): ~2.5x. The two failed
+designs are documented so they are not re-tried: (1) coarse hash bits derived
+from the fine table size (max(bits−3, 2)) saturate by coordinate-wrap
+collisions at high cell counts — the skip never fires; (2) "self-cleaning"
+occupancy counts mirrored in gridScatter are zero by the time the march runs
+(the scatter consumes them) — the skip fires EVERYWHERE (every cell lit). Both
+were caught by the same A/B: (1) showed no speedup, (2) showed a massive
+lit/dark inversion. The shipped design needs the map LIVE during the march:
+blit-cleared per rebuild, set in gridCount, sized independently of the fine
+table.
+
+## M6 render/animation/stereo timings (release, this session — thermally noisy, treat as upper bounds) — 2026-11-11 — Apple M1 Pro
+
+- Offline ray tracer (grown states, --state-load): 800x600 solid 0.03–0.04 s;
+  800x600 xray 0.08 s (18 666 cells, 5 big cells).
+- Stereo pair (--stereo, 2 eyes + composite): 640x480 solid 0.06 s wall /
+  0.06 s gpu (18 666 cells).
+- Animation export (--anim, 20 frames at 150-step intervals, light growth
+  subdiv 4 → 60 000 cells, 800x600): total wall 10.7–11.3 s of which ray
+  render 1.1–1.3 s gpu, rest = growth (2 850 steps) + PNG encode + H.264
+  assembly (AVFoundation, 30 fps). X-ray style anim (3 frames, 640x480):
+  0.48 s total.
+- Static --bench (uniform, division off) this session measured ~3x the M3
+  numbers at 655k (31.9 vs 9.9 ms/step) — session/thermal variance, consistent
+  with the M5 observation; the interleaved A/B above is the trusted comparison.

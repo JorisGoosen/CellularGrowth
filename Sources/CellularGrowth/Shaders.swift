@@ -13,7 +13,7 @@ enum Shaders {
     #include <metal_stdlib>
     using namespace metal;
 
-    // NOTE: layout must mirror Swift struct SimParams exactly (32 x 4 bytes = 128).
+    // NOTE: layout must mirror Swift struct SimParams exactly (36 x 4 bytes = 144).
     // New fields are APPENDED at the end on both sides (AGENTS.md SimParams rule).
     struct SimParams {
         float linkRestLength;
@@ -54,6 +54,11 @@ enum Shaders {
         float rdeDv;             // v diffusion
         float rdeBase;           // food coupling floor in rde mode
         float rdeGain;           // food coupling gain on the v chemical
+        // --- M6 (appended) ---
+        uint  gridCoarseBitsX;   // coarse occupancy hash bits per axis (max(bits-3, 2)):
+        uint  gridCoarseBitsY;   // a bit per 8^3-fine-bin block for the light-march
+        uint  gridCoarseBitsZ;   // empty-interior skip (collisions conservative)
+        uint  lightCoarseSkip;   // 1 = coarse skip enabled (kill switch for A/B)
     };
 
     // Positions/normals use float3 (16-byte stride), matching Swift SIMD3<Float>
@@ -180,19 +185,76 @@ enum Shaders {
                             (int)floor(P.z / p.roi)), p);
     }
 
-    // Pass 1: count particles per hashed bin.
+    // M6: coarse occupancy hash — the SAME packed scheme over the 8³-block
+    // coordinates with FIXED 7 bits per axis (params.gridCoarseBits*; sized
+    // for block coordinates ±63 — see CellSim.setGridBits). Injectivity on a
+    // 3×3×3 neighbourhood is NOT required: counts ADD over colliding block
+    // coordinates, so a non-zero count may over-report occupancy (skip
+    // disabled — conservative); a count of 0 still proves no cell maps to
+    // the slot at all.
+    static inline uint coarseHash(int3 c, constant SimParams& p) {
+        uint maskX = (1u << p.gridCoarseBitsX) - 1u;
+        uint maskY = (1u << p.gridCoarseBitsY) - 1u;
+        uint maskZ = (1u << p.gridCoarseBitsZ) - 1u;
+        return ((uint)c.x & maskX)
+             | (((uint)c.y & maskY) << p.gridCoarseBitsX)
+             | (((uint)c.z & maskZ) << (p.gridCoarseBitsX + p.gridCoarseBitsY));
+    }
+
+    // M6: coarse occupancy test — true when ALL 27 coarse slots around the
+    // current block are CLEAR, i.e. no cell anywhere hashes into the blocks
+    // that could contain a blocker of a ray segment inside the central block.
+    // Safety proof (why the skip is exact, not approximate): a sphere the
+    // ray crosses inside the central coarse block has its centre P within
+    // rad < h of the crossing point X, so P's fine bin is within 1 fine bin
+    // of X's bin; X's bin lies in the central block, hence P's BLOCK lies in
+    // the 3×3×3 coarse neighbourhood of it. All 27 bits clear ⇒ no such P
+    // ⇒ nothing can block the segment inside the central block.
+    static bool coarseNeighbourhoodClear(int3 c, device const uint* occupancy,
+                                         constant SimParams& p) {
+        int3 cc = int3(floor(float3(c) * 0.125f));   // floor block coord (exact, see gridCount)
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    uint h = coarseHash(cc + int3(dx, dy, dz), p);
+                    if (occupancy[h >> 5] & (1u << (h & 31u))) return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // Pass 1: count particles per hashed bin. M6: also SET the coarse
+    // occupancy bit for the cell's 8³-fine-bin coordinate block (the light
+    // march's empty-interior skip map). The bitfield is blit-cleared at the
+    // start of this rebuild and must stay LIVE through the post-scatter
+    // illumination march. A bit is SET iff any cell's block-coordinate hashes
+    // to that slot — collisions are harmless (a spuriously set bit only
+    // disables the skip, never mis-skips).
     //
     // Buffer table:
-    //   0 positions (const)    1 binCounts (atomic add)   2 cellCounter   3 params
+    //   0 positions (const)    1 binCounts (atomic add)   2 occupancy (atomic or)
+    //   3 cellCounter   4 params
     kernel void gridCount(device const float3* positions [[buffer(0)]],
                           device atomic_uint* binCounts  [[buffer(1)]],
-                          device const uint*  cellCounter [[buffer(2)]],
-                          constant SimParams& params      [[buffer(3)]],
+                          device atomic_uint* occupancy  [[buffer(2)]],
+                          device const uint*  cellCounter [[buffer(3)]],
+                          constant SimParams& params      [[buffer(4)]],
                           uint gid [[thread_position_in_grid]])
     {
         if (gid >= cellCounter[0]) return;
-        uint h = binHashOfPos(float3(positions[gid]), params);
-        atomic_fetch_add_explicit(&binCounts[h], 1u, memory_order_relaxed);
+        int3 bc = int3((int)floor(positions[gid].x / params.roi),
+                       (int)floor(positions[gid].y / params.roi),
+                       (int)floor(positions[gid].z / params.roi));
+        atomic_fetch_add_explicit(&binCounts[binHash(bc, params)], 1u, memory_order_relaxed);
+        // Coarse block coordinate = fine bin coordinate >> 3, FLOORED (the
+        // block of bin c is [floor(c/8)*8, floor(c/8)*8+8)); c can be
+        // negative, so the shift must be arithmetic — computed exactly via
+        // the power-of-two float multiply + floor instead (c*0.125 is exact:
+        // |c| < 2^24).
+        int3 cc = int3(floor(float3(bc) * 0.125f));
+        uint ch = coarseHash(cc, params);
+        atomic_fetch_or_explicit(&occupancy[ch >> 5], 1u << (ch & 31u), memory_order_relaxed);
     }
 
     // Pass 2a: exclusive prefix scan, level 1. Scans the T bin counts into
@@ -615,11 +677,23 @@ enum Shaders {
     // radiusScale), CLAMPED below roi to stay inside the grid path's proof
     // (radii >= roi exist only on stretched cells, typically << 1% of a grown
     // state — they under-shadow slightly; documented in the M5 report).
+    //
+    // M6 coarse occupancy skip (the M5 report's two-level fix): rays from the
+    // dark hemisphere cross the structure's EMPTY interior bin by bin, and
+    // each empty bin costs 27 binStarts lookups into the 16 MB table. Before
+    // the fine walk, the 27 coarse occupancy bits around the current 8³-bin
+    // block are tested; if all clear, nothing can block inside that block
+    // (proof in coarseNeighbourhoodClear) and the DDA jumps straight to the
+    // block's exit — ~500 binStarts lookups collapse to 27 bit tests on a
+    // 1 KB bitfield (L1/L2-resident). Skips are only ever taken over regions
+    // provably free of cells, so the occlusion verdict is bit-identical to
+    // the fine-only walk.
     static bool lightOccluded(float3 ro, float3 rd, float t0, float t1, uint selfIdx,
                               device const float3* positions,
                               device const float* radii,
                               device const uint* binStarts,
                               device const uint* particleIndices,
+                              device const uint* occupancy,
                               constant SimParams& sp)
     {
         if (!(t1 > t0)) return false;
@@ -639,6 +713,36 @@ enum Shaders {
         // stalls the whole machine; 8192 bins is orders above any reachable
         // ray length: t1 <= sceneR + |P| + 2*roi <= ~2 * max |P|).
         for (uint iter = 0; iter < 8192u && tCur < t1; ++iter) {
+            // --- M6 coarse skip: jump over provably-empty 8³-bin blocks ---
+            // (lightCoarseSkip is the A/B kill switch; the skip is only ever
+            // taken over regions proven free of cells — see
+            // coarseNeighbourhoodClear — so the verdict is identical either way)
+            if (sp.lightCoarseSkip != 0u && coarseNeighbourhoodClear(c, occupancy, sp)) {
+                int3 bc0 = int3(floor(float3(c) * 0.125f));   // current block (floored)
+                float3 blockLo = float3(bc0 * 8) * h;
+                float3 blockHi = float3((bc0 + int3(1)) * 8) * h;
+                float tExitB = INFINITY;
+                if (rd.x > 0.0f)      tExitB = min(tExitB, (blockHi.x - ro.x) / rd.x);
+                else if (rd.x < 0.0f) tExitB = min(tExitB, (blockLo.x - ro.x) / rd.x);
+                if (rd.y > 0.0f)      tExitB = min(tExitB, (blockHi.y - ro.y) / rd.y);
+                else if (rd.y < 0.0f) tExitB = min(tExitB, (blockLo.y - ro.y) / rd.y);
+                if (rd.z > 0.0f)      tExitB = min(tExitB, (blockHi.z - ro.z) / rd.z);
+                else if (rd.z < 0.0f) tExitB = min(tExitB, (blockLo.z - ro.z) / rd.z);
+                if (tExitB >= t1) return false;   // segment ends inside the clear block
+                if (tExitB > tCur + 1e-4f) {
+                    // Jump: reinitialize the DDA state at the block exit
+                    // (same formulas as the loop head; tDelta/st unchanged).
+                    tCur = tExitB;
+                    p0 = ro + rd * tCur;
+                    c = int3((int)floor(p0.x / h), (int)floor(p0.y / h), (int)floor(p0.z / h));
+                    tMax.x = rd.x != 0.0f ? tCur + ((rd.x > 0.0f ? (float)(c.x + 1) * h : (float)c.x * h) - p0.x) / rd.x : INFINITY;
+                    tMax.y = rd.y != 0.0f ? tCur + ((rd.y > 0.0f ? (float)(c.y + 1) * h : (float)c.y * h) - p0.y) / rd.y : INFINITY;
+                    tMax.z = rd.z != 0.0f ? tCur + ((rd.z > 0.0f ? (float)(c.z + 1) * h : (float)c.z * h) - p0.z) / rd.z : INFINITY;
+                    continue;
+                }
+                // Degenerate (exit ~ tCur, ray clipping the block corner):
+                // fall through to the ordinary fine step.
+            }
             for (int dz = -1; dz <= 1; ++dz) {
                 for (int dy = -1; dy <= 1; ++dy) {
                     for (int dx = -1; dx <= 1; ++dx) {
@@ -696,6 +800,8 @@ enum Shaders {
     //   0 positions (const)       1 radii (const)        2 binStarts (const)
     //   3 particleIndices (const) 4 nutrient (read+write) 5 bound2 (const)
     //   6 cellCounter             7 params               8 litFlags (write)
+    //   9 occupancy (const; M6 coarse skip map — written by gridCount in the
+    //     SAME rebuild this step, cleared by the blit fill before it)
     kernel void illuminate(device const float3* positions [[buffer(0)]],
                            device const float*   radii    [[buffer(1)]],
                            device const uint*    binStarts [[buffer(2)]],
@@ -705,6 +811,7 @@ enum Shaders {
                            device const uint*    cellCounter [[buffer(6)]],
                            constant SimParams&   params   [[buffer(7)]],
                            device uint*          litFlags [[buffer(8)]],
+                           device const uint*    occupancy [[buffer(9)]],
                            uint gid [[thread_position_in_grid]])
     {
         if (gid >= cellCounter[0]) return;
@@ -720,7 +827,7 @@ enum Shaders {
         float t1 = sceneR + length(P) + 2.0f * params.roi;
 
         bool blocked = lightOccluded(P, L, 1e-3f, t1, gid, positions, radii,
-                                     binStarts, particleIndices, params);
+                                     binStarts, particleIndices, occupancy, params);
         if (!blocked) {
             n += params.lightNutrient * (float)params.lightInterval;   // pulsed production
         }
@@ -894,8 +1001,10 @@ enum Shaders {
     //                                     (v ≈ 0.35–0.45) read as clear red
     //                                     patches (wRed ≈ 0.56–0.72)
     //   wGreen = max(1 − wBlue − wRed, 0) — low-concentration cells stay green
-    // Runs every step (after the chemical passes) so freshly divided daughters
-    // always have a valid colour and every render path sees current state.
+    // Runs every step, AFTER the division block (M6: the daughters born this
+    // step inherit the parent's u/v inside divisionExecute, so tint must be
+    // recomputed from the post-division chemicals or last-step daughters
+    // render with a stale/zero tint).
     //
     // Buffer table:
     //   0 chemU (const)   1 chemV (const)   2 tint (write)   3 cellCounter   4 params
@@ -1479,6 +1588,7 @@ enum Shaders {
         float4 up;       // world-space camera up (unit)
         float4 negFwd;   // world-space direction from target toward the camera
         float4 lightDir; // world-space unit vector pointing TOWARD the light
+        float4 xrayPad;  // M6: .x = interactive X-ray exposure gain (solid path never reads it)
     };
 
     struct VOut {
@@ -1518,6 +1628,72 @@ enum Shaders {
         o.tint    = float3(tint[iid]);
         o.clip    = cam.proj * float4(cV + float3(uv * r, 0.0), 1.0);
         return o;
+    }
+
+    // ---- M6: interactive X-ray (additive impostor accumulation) ------------
+    //
+    // Approximation of the offline X-ray density accumulation (paper §6 style
+    // 2) for the realtime path: every cell draws ONE camera-facing density
+    // sprite with ADDITIVE blending (blend one/one, no depth test, no depth
+    // write) — overlapping sprites sum, so dense knots glow and the
+    // background stays dark. The per-sprite profile is the SAME radial
+    // profile the ray tracer accumulates (rad·(1-(d/(rad·S))²)², S =
+    // profileSupport = 2) with the quad enlarged S× so the skirt is drawn.
+    //
+    // Known approximation (documented): the film curve L = 1-exp(-Σd·e) is
+    // nonlinear in the ACCUMULATED density, but fixed-function additive
+    // blending can only sum per-sprite terms in 8-bit sRGB — the sum is then
+    // clamped at 1.0 (a hard saturating "film"). Per-sprite the contribution
+    // is premultiplied by an exposure gain so the mid densities land in the
+    // same tonal range as the offline render at the default exposure 0.1.
+    // Per-sprite output = tint·min(dens·gain, 1); the 8-bit clamp provides
+    // the tone map. Echoes the offline look (dark background, glowing
+    // density); not pixel-equivalent to the ray tracer by design.
+
+    // Enlarged density sprite: quad half-width = radius × profileSupport.
+    // Same buffer table as cellVertex.
+    vertex VOut cellVertexXray(uint vid [[vertex_id]],
+                               uint iid [[instance_id]],
+                               device const float3* positions [[buffer(0)]],
+                               device const float* radii             [[buffer(1)]],
+                               constant Camera& cam                  [[buffer(2)]],
+                               device const float3* tint             [[buffer(3)]])
+    {
+        const float support = 2.0;   // matches RayRenderSettings.profileSupport default
+        const float2 corners[4] = { float2(-1.0, -1.0), float2(1.0, -1.0),
+                                    float2(-1.0,  1.0), float2(1.0,  1.0) };
+        float2 uv = corners[vid];
+        float3 P  = float3(positions[iid]);
+        float  r  = radii[iid];
+
+        float3 cV = (cam.view * float4(P, 1.0)).xyz;
+
+        VOut o;
+        o.uv      = uv;
+        o.centerV = cV;
+        o.radius  = r;
+        o.right   = cam.right.xyz;
+        o.up      = cam.up.xyz;
+        o.negFwd  = cam.negFwd.xyz;
+        o.tint    = float3(tint[iid]);
+        o.clip    = cam.proj * float4(cV + float3(uv * r * support, 0.0), 1.0);
+        return o;
+    }
+
+    // Additive density fragment. uv here spans [-support, support] (the
+    // enlarged quad), so d/(rad·S) = |uv| exactly, and the profile value is
+    // rad·(1-|uv|²)² — identical math to the ray tracer's per-sphere
+    // contribution. Blended additively (one/one); alpha carries the same
+    // weight for the (unused) alpha channel.
+    fragment float4 cellFragmentXray(VOut in [[stage_in]],
+                                     constant Camera& cam [[buffer(0)]])
+    {
+        float q = 1.0 - dot(in.uv, in.uv);   // 1 - (d/(rad·S))²
+        if (q <= 0.0) { discard_fragment(); }
+        float dens = in.radius * q * q;      // rad·q² — the offline profile
+        float gain = cam.xrayPad.x;
+        float a = min(dens * gain, 1.0);
+        return float4(in.tint * a, a);       // premultiplied; blend one/one
     }
 
     struct FOut {
@@ -1701,6 +1877,11 @@ enum Shaders {
         float rdeDv;
         float rdeBase;
         float rdeGain;
+        // --- M6 (appended; must mirror Shaders.sim exactly) ---
+        uint  gridCoarseBitsX;
+        uint  gridCoarseBitsY;
+        uint  gridCoarseBitsZ;
+        uint  lightCoarseSkip;
     };
 
     // Bit-packed bin hash — IDENTICAL to Shaders.sim binHash (same grid).
