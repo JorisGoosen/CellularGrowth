@@ -311,3 +311,49 @@ was calibrated for the binary ~10x ratio and would pass a badly degraded
 gradient at the new operating point; 1.5 keeps a ~30% margin under the
 measured 2.07-2.15 while still asserting the gradient exists. Documented in
 the selftest source next to the gate.
+
+## V2.2 tint modes (food heatmap + mitosis pulse) — 2026-11-11 — Apple M1 Pro
+
+Cost of the V2.2 additions, measured as a four-way `--bench --bench-steps 50`
+sweep (uniform mode, division off — the per-step pipeline shape both modes
+share): the V2.1 binary (git 00e58ff worktree) as the pre-V2.2 baseline, then
+the V2.2 binary with tint auto (= baseline pipeline + the always-on
+pulseDecayStep pass), tint food, tint pulse. ms/step GPU
+(`commandBuffer.gpuStartTime/gpuEndTime`), CPU wall in parentheses:
+
+| cells | V2.1 baseline | V2.2 auto | V2.2 food | V2.2 pulse |
+|---|---|---|---|---|
+| 2 562 | 0.156 (0.188) | 0.334 (0.374) | 0.193 (0.224) | 0.159 (0.192) |
+| 10 242 | 0.225 (0.256) | 0.302 (0.338) | 0.226 (0.258) | 0.263 (0.296) |
+| 40 962 | 0.746 (0.785) | 0.800 (0.839) | 0.791 (0.831) | 0.793 (0.831) |
+| 163 842 | 2.540 (2.582) | 2.616 (2.660) | 2.596 (2.640) | 2.626 (2.667) |
+| 655 362 | 10.292 (10.335) | 10.296 (10.339) | 10.315 (10.361) | 10.290 (10.337) |
+
+The 2 562 / 10 242 rows are dispatch-and-clock dominated and swing ~2x
+between identical sweeps (the same V2.2 binary produced 0.19–0.37 ms/step at
+2 562 across the three sweeps above) — read them as noise. At the levels
+where the measurement is meaningful the four sweeps agree within ~1–3%
+(163 842) and ~0.05–0.2% (655 362): the pulse-decay pass (one extra kernel,
+one FMA per cell) and the heatmap/pulse tinting (two extra buffer reads + a
+few flops per cellTint pass) cost ~NIL, as designed. Per-step grid memory at
+the sweep levels (unchanged from M3/V2.1 — the pulse buffer adds 4 B/cell
+outside the grid): T=8192 116 780 B … T=2097152 29 884 460 B for the 655 362
+level.
+
+V2.2 mitosis-pulse wavefront metric (checkpoint host readback, tint pulse,
+subdiv 4, jitter 0.25, 2000 steps): ring R² of the pulse field
+(var(ring average)/var — ~1/valence ≈ 0.17 for an uncorrelated field):
+
+| t | light mode | uniform mode |
+|---|---|---|
+| 500 | 0.303 | 0.302 |
+| 1000 | 0.321 | 0.180 |
+| 1500 | 0.331 | 0.209 |
+| 2000 | 0.362 | 0.217 |
+
+In uniform growth the recent-division field decorrelates to the iid baseline
+(scattered flicker); in light mode it stays clustered and RISES with growth —
+divisions remain organized in the lit band that moves with the growing form
+(the paper §7 "rhythmic pulses and waves of growth propagating across
+surfaces"). Active fraction (pulse > 0.05) at t=2000: 14.1% light vs 6.0%
+uniform.

@@ -52,6 +52,9 @@ enum HeadlessRunner {
             || args.contains("--edges") || args.contains("--edge-width")
             || args.contains("--shadows") || args.contains("--xray-color")
             || args.contains("--light-soft")
+            // --- V2.2 (pitfall 10: every new flag routes to the headless path) ---
+            || args.contains("--tint") || args.contains("--heat-scale")
+            || args.contains("--pulse-decay")
     }
 
     struct Options {
@@ -119,6 +122,12 @@ enum HeadlessRunner {
         var shadows: Float = 1.0       // per-pixel shadow strength (directional solid)
         var xrayColor = false          // coloured X-ray (per-channel tinted density)
         var lightSoft: Float = 0.35    // light angular radius (rad); 0 = binary verdict
+        // --- V2.2 ---
+        var tint = "auto"              // auto | none | chemical | food | pulse
+        var heatScale: Float = 0       // food-heatmap normalization; 0 = auto default
+        var pulseDecay: Float = 0.95   // per-step multiplier on the division pulse
+        var heatScaleGiven = false     // --heat-scale present (golden meta provenance)
+        var pulseDecayGiven = false    // --pulse-decay present (golden meta provenance)
     }
 
     private static func parseOptions() -> Options {
@@ -242,6 +251,14 @@ enum HeadlessRunner {
             case "--shadows": o.shadows = Float(value("--shadows") ?? "") ?? o.shadows
             case "--xray-color": o.xrayColor = true
             case "--light-soft": o.lightSoft = Float(value("--light-soft") ?? "") ?? o.lightSoft
+            // --- V2.2 ---
+            case "--tint": o.tint = (value("--tint") ?? "auto").lowercased()
+            case "--heat-scale":
+                o.heatScale = Float(value("--heat-scale") ?? "") ?? o.heatScale
+                o.heatScaleGiven = true
+            case "--pulse-decay":
+                o.pulseDecay = Float(value("--pulse-decay") ?? "") ?? o.pulseDecay
+                o.pulseDecayGiven = true
             default: break
             }
         }
@@ -320,6 +337,10 @@ enum HeadlessRunner {
         // radians; 0 = the legacy binary verdict). Clamped to a sane range:
         // the coverage ramp degenerates for lightSoft >= pi.
         sim.params.lightSoft = min(max(o.lightSoft, 0), 1.5)
+        // --- V2.2 tint modes + mitosis pulse ---
+        sim.params.tintMode = tintModeCode(o.tint)
+        sim.params.heatScale = max(o.heatScale, 0)   // <= 1e-6 = shader-side auto default
+        sim.params.pulseDecay = min(max(o.pulseDecay, 0), 0.9999)
 
         if o.rdeProbe {
             runRdeProbe(queue: queue, sim: sim, o: o)   // exits
@@ -469,6 +490,34 @@ enum HeadlessRunner {
         default:
             break
         }
+        // V2.2 mitosis-pulse diagnostics (tint mode pulse): how much of the
+        // surface is flashing, and how SPATIALLY CLUSTERED the recent
+        // divisions are. The light-mode wavefront signature is a high ring
+        // R² (recent divisions cluster in the lit band and move with it) vs
+        // uniform mode's scattered speckle (uncorrelated neighbours,
+        // ring R² ~ 1/valence ≈ 0.17 like any iid field).
+        if sim.params.tintMode == 4 {
+            let v = sim.cellCount
+            if v > 0 {
+                let pulse = sim.readPulse()
+                let links = UnsafeBufferPointer(start: sim.linksPointer, count: v * CellSim.maxValence)
+                let counts = UnsafeBufferPointer(start: sim.linkCountsPointer, count: v)
+                var ringAvg = [Float](repeating: 0, count: v)
+                for i in 0..<v {
+                    let n = Int(counts[i])
+                    guard n > 0 else { ringAvg[i] = pulse[i]; continue }
+                    var acc: Float = 0
+                    let base = i * CellSim.maxValence
+                    for k in 0..<n { acc += pulse[Int(links[base + k])] }
+                    ringAvg[i] = acc / Float(n)
+                }
+                let s = fieldStats(pulse)
+                let rs = fieldStats(ringAvg)
+                let r2 = s.variance > 0 ? rs.variance / s.variance : 0
+                let active = pulse.lazy.filter { $0 > 0.05 }.count
+                print("      pulse: mean \(String(format: "%.3f", s.mean)) max \(String(format: "%.3f", s.max)) active(>0.05) \(String(format: "%.1f%%", 100 * Float(active) / Float(v)))  ring R² \(String(format: "%.3f", r2)) (clustered ≫ ~0.17)")
+            }
+        }
     }
 
     private struct FieldStats {
@@ -524,6 +573,22 @@ enum HeadlessRunner {
         case "rde": return 2
         default:
             print("--growth '\(s)' unknown (uniform | light | rde)")
+            exit(1)
+        }
+    }
+
+    /// V2.2 tint-mode code from the CLI string; exits on an unknown mode.
+    /// "auto" (the default) reproduces the pre-V2.2 behaviour exactly:
+    /// chemical colours in rde mode, neutral albedo otherwise.
+    static func tintModeCode(_ s: String) -> UInt32 {
+        switch s {
+        case "auto", "default": return 0
+        case "none": return 1
+        case "chemical": return 2
+        case "food": return 3
+        case "pulse": return 4
+        default:
+            print("--tint '\(s)' unknown (auto | none | chemical | food | pulse)")
             exit(1)
         }
     }
@@ -704,6 +769,21 @@ enum HeadlessRunner {
         guard CGImageDestinationFinalize(dest) else { throw NSError(domain: "dump", code: 3) }
     }
 
+    /// V2.2: an EXPLICIT CLI tint request overrides the tint mode a loaded
+    /// state carries (tintMode lives in SimParams — the cellTint kernel is
+    /// part of the step pipeline — but it is a RENDER knob: --tint pulse on a
+    /// state-load must render pulses, not the mode the state was saved with).
+    /// Without the flag the state's stored mode wins — that is what makes
+    /// golden snapshot replays byte-exact without repeating the flags.
+    private static func applyTintOverrideAfterLoad(sim: CellSim, o: Options) {
+        guard o.tint != "auto" || o.heatScaleGiven || o.pulseDecayGiven else { return }
+        if o.tint != "auto" { sim.params.tintMode = tintModeCode(o.tint) }
+        if o.heatScaleGiven { sim.params.heatScale = max(o.heatScale, 0) }
+        if o.pulseDecayGiven { sim.params.pulseDecay = min(max(o.pulseDecay, 0), 0.9999) }
+        sim.syncParams()
+        sim.refreshTint()
+    }
+
     private static func runHeadless(queue: MTLCommandQueue, sim: CellSim, o: Options) -> Never {
         // M6: --state-load works in the headless path too — render/screenshot
         // a stored state instead of growing (matches the --render workflow).
@@ -712,6 +792,7 @@ enum HeadlessRunner {
                 let snap = try sim.loadState(from: loadPath)
                 let modes = ["uniform", "light", "rde"]
                 print("state loaded: \(loadPath) (CGST v\(snap.version), \(sim.cellCount) cells, mode \(modes[Int(min(snap.growthMode, 2))]))")
+                applyTintOverrideAfterLoad(sim: sim, o: o)
             } catch {
                 print("state load FAILED: \(error)")
                 exit(1)
@@ -764,6 +845,7 @@ enum HeadlessRunner {
                 let snap = try sim.loadState(from: loadPath)
                 let modes = ["uniform", "light", "rde"]
                 print("state loaded: \(loadPath) (CGST v\(snap.version), \(sim.cellCount) cells, mode \(modes[Int(min(snap.growthMode, 2))]))")
+                applyTintOverrideAfterLoad(sim: sim, o: o)
             } catch {
                 print("state load FAILED: \(error)")
                 exit(1)
@@ -1359,6 +1441,9 @@ enum HeadlessRunner {
                     + "edges=\(fmt(v.edges));edgeWidth=\(fmt(v.edgeWidth));shadows=\(fmt(v.shadows));"
                     + "shadowSamples=\(v.shadowSamples);xrayColor=\(v.xrayColor ? 1 : 0);lightSoft=\(fmt(v.lightSoft))"
                 }
+                if let v = r.v22 {
+                    s += ";v22=1;tint=\(v.tint);heatScale=\(fmt(v.heatScale));pulseDecay=\(fmt(v.pulseDecay))"
+                }
             }
             return s
         }
@@ -1392,6 +1477,8 @@ enum HeadlessRunner {
         // must stay byte-identical, so the new keys are only appended when a
         // V2.1 capture declares any non-default V2.1 knob) ---
         var v21: RenderGoldenV21? = nil
+        // --- V2.2 (same rule: only appended when a V2.2 knob is declared) ---
+        var v22: RenderGoldenV22? = nil
     }
 
     /// V2.1 golden knobs: the new render flags + the growth config the
@@ -1416,6 +1503,19 @@ enum HeadlessRunner {
         var xrayColor: Bool
         var lightSoft: Float
     }
+
+    /// V2.2 golden knobs: tint mode + the heat/pulse tuning. Same provenance
+    /// pattern as the v21 block — a snapshot replay carries these values in
+    /// the state file's raw SimParams (the state is authoritative); the keys
+    /// record what the capture grew/rendered with.
+    struct RenderGoldenV22 {
+        var tint: String          // auto | none | chemical | food | pulse
+        var heatScale: Float      // 0 = auto default
+        var pulseDecay: Float
+    }
+    /// Default pulse decay (must match SimParams.pulseDecay — legacy metas
+    /// without a v22 block load with this).
+    static let defaultPulseDecay: Float = 0.95
 
     /// FNV-1a 64-bit over the canonical config string (the meta's config hash).
     static func configHash(_ s: String) -> String {
@@ -1498,6 +1598,12 @@ enum HeadlessRunner {
                 lines.append("xrayColor=\(v.xrayColor ? 1 : 0)")
                 lines.append("lightSoft=\(f(v.lightSoft))")
             }
+            if let v = r.v22 {
+                lines.append("v22=1")
+                lines.append("tint=\(v.tint)")
+                lines.append("heatScale=\(f(v.heatScale))")
+                lines.append("pulseDecay=\(f(v.pulseDecay))")
+            }
         }
         try lines.joined(separator: "\n").appending("\n").write(toFile: goldenMetaPath(name), atomically: true, encoding: .utf8)
     }
@@ -1560,6 +1666,12 @@ enum HeadlessRunner {
                     lightSoft: f("lightSoft") ?? 0.35)
                 render!.v21 = v21
             }
+            // V2.2 block: tint mode + heat/pulse tuning.
+            if kv["v22"] == "1" {
+                render!.v22 = RenderGoldenV22(tint: kv["tint"] ?? "auto",
+                                              heatScale: f("heatScale") ?? 0,
+                                              pulseDecay: f("pulseDecay") ?? defaultPulseDecay)
+            }
         }
         return GoldenConfig(steps: steps, subdiv: subdiv, jitter: jitter, spring: spring,
                             planar: planar, bulge: bulge, roi: roi, repulsion: repulsion,
@@ -1598,6 +1710,11 @@ enum HeadlessRunner {
         sim.params.rdeDv = 0.15
         sim.params.rdeBase = 0.25
         sim.params.rdeGain = 2.5
+        // V2.2 tint knobs: reset to the auto defaults so ambient CLI flags
+        // cannot leak into a golden (the meta keys / state file carry them).
+        sim.params.tintMode = 0
+        sim.params.heatScale = 0
+        sim.params.pulseDecay = defaultPulseDecay
         guard let r = cfg.render else {
             sim.params.divisionEnabled = 0
             sim.params.springFactor = cfg.spring
@@ -1650,6 +1767,12 @@ enum HeadlessRunner {
                 sim.params.rdeDv = v.rdeDv
                 sim.params.rdeBase = v.rdeBase
                 sim.params.rdeGain = v.rdeGain
+            }
+            // V2.2 capture-time tint config (same provenance pattern).
+            if let v = r.v22 {
+                sim.params.tintMode = tintModeCode(v.tint)
+                sim.params.heatScale = max(v.heatScale, 0)
+                sim.params.pulseDecay = min(max(v.pulseDecay, 0), 0.9999)
             }
             sim.syncParams()
 
@@ -1756,13 +1879,18 @@ enum HeadlessRunner {
                                   shadowSamples: shadowSamples, xrayColor: o.xrayColor,
                                   lightSoft: o.lightSoft)
                 : nil
+            // V2.2 knob block, same only-when-non-default rule.
+            let v22Active = o.tint != "auto" || o.heatScaleGiven || o.pulseDecayGiven
+            let v22: RenderGoldenV22? = v22Active
+                ? RenderGoldenV22(tint: o.tint, heatScale: o.heatScale, pulseDecay: o.pulseDecay)
+                : nil
             render = RenderGoldenSettings(style: o.style, samples: o.samples,
                                           maxCells: o.maxCells, division: o.division,
                                           aoRadius: d.aoRadius, aoStrength: d.aoStrength,
                                           aoFloor: d.aoFloor, xrayExposure: d.xrayExposure,
                                           xrayGamma: d.xrayGamma, densityScale: d.densityScale,
                                           profileSupport: d.profileSupport,
-                                          snapshot: true, seed: d.seed, v21: v21)
+                                          snapshot: true, seed: d.seed, v21: v21, v22: v22)
         }
         let cfg = GoldenConfig(steps: o.steps, subdiv: o.subdiv, jitter: o.jitter,
                                spring: o.spring, planar: o.planar, bulge: o.bulge,
@@ -2058,6 +2186,9 @@ enum HeadlessRunner {
             for x in UnsafeBufferPointer(start: sim.chemUPointer, count: v) where !x.isFinite { badChem += 1 }
             for x in UnsafeBufferPointer(start: sim.chemVPointer, count: v) where !x.isFinite { badChem += 1 }
         }
+        // V2.2: the pulse buffer is maintained every step (decay pass); a NaN
+        // there would leak into the tint (pulse mode blends by it).
+        for x in UnsafeBufferPointer(start: sim.pulsePointer, count: v) where !x.isFinite { badChem += 1 }
 
         // Pass 2: bidirectionality — every directed link (i -> j) must have
         // its reverse (j -> i). O(links * max valence) with early exit.
@@ -2101,7 +2232,7 @@ enum HeadlessRunner {
         add("links bidirectional", bidirOK, "every ring entry has its reverse")
         add("closed triangulation (sum valence == 6(V-2))", eulerOK, "sum=\(sumValence) target=\(eulerTarget)")
         add("valence in [3, maxValence]", valenceOK, "min=\(minValence == Int.max ? 0 : minValence) max=\(maxVal)")
-        add("no NaN/Inf (positions, food, M5 chemicals)", finiteOK, "bad positions=\(nanCount) food=\(badFood) chem=\(badChem)")
+        add("no NaN/Inf (positions, food, chemicals, pulse)", finiteOK, "bad positions=\(nanCount) food=\(badFood) chem=\(badChem)")
         add(settled ? "mean link length ~ rest (settle)" : "mean link length bounded (growing)",
             lenOK, "mean=\(String(format: "%.4f", meanLen)) rest=\(rest) \(settled ? "(tolerance 2%)" : "(limit \(meanLimit)x)")")
         add("max |P| bounded", boundOK, "max=\(String(format: "%.2f", maxAbs)) limit=10000")

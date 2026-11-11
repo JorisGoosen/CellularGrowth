@@ -81,7 +81,8 @@ Headless flags: `--steps N`, `--subdiv N`, `--jitter F`, `--spring F`,
 ball|brain|plant|coral|degenerate-demo`, `--anim DIR`, `--anim-steps N`,
 `--anim-frames M`, `--stereo`, `--interocular F`,
 `--screenshot-style solid|xray`. V2.1: `--edges F`, `--edge-width F`,
-`--shadows F`, `--xray-color`, `--light-soft F`.
+`--shadows F`, `--xray-color`, `--light-soft F`. V2.2: `--tint
+none|chemical|food|pulse`, `--heat-scale F`, `--pulse-decay F`.
 
 Scratch-artefact policy: screenshots, test renders and debug dumps go under
 `/private/tmp/opencode/cellulargrowth/` (pre-approved scratch) — NOT generic

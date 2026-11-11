@@ -53,6 +53,20 @@ struct ContentView: View {
                     slider("X-ray gain", $vm.xrayGain, 0.05...2)
                 }
                 slider("Edges", $vm.edges, 0...1)
+                // V2.2 tint modes (feeds solid AND X-ray — the tint buffer is
+                // shared). "Default" = chemical colours in RDE mode, neutral
+                // otherwise (the pre-V2.2 behaviour).
+                Picker("Tint", selection: $vm.tintMode) {
+                    ForEach(SimViewModel.TintMode.allCases) { m in
+                        Text(m.label).tag(m)
+                    }
+                }
+                if vm.tintMode == .food {
+                    slider("Heat scale (0 = auto)", $vm.heatScale, 0...8)
+                }
+                if vm.tintMode == .pulse {
+                    slider("Pulse decay", $vm.pulseDecay, 0.8...0.999)
+                }
             }
 
             GroupBox("State") {

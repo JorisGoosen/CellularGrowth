@@ -107,6 +107,31 @@ final class SimViewModel: ObservableObject, ViewInput {
     @Published var rdeGain: Double = 2.5 {
         didSet { sim.params.rdeGain = Float(rdeGain); sim.syncParams() }
     }
+    // --- V2.2 tint modes (cellTint kernel; feeds BOTH render paths and thus
+    // the coloured X-ray) ---
+    enum TintMode: Int, CaseIterable, Identifiable {
+        case auto = 0       // chemical iff rde mode (the pre-V2.2 behaviour)
+        case none = 1       // neutral albedo
+        case chemical = 2   // rde u/v mapping in every growth mode
+        case food = 3       // food/nutrient heatmap
+        case pulse = 4      // magenta division-pulse flashes over the base tint
+        var id: Int { rawValue }
+        var label: String { ["Default", "None", "Chemical", "Food heat", "Mitosis pulse"][rawValue] }
+    }
+    @Published var tintMode: TintMode = .auto {
+        didSet { sim.params.tintMode = UInt32(tintMode.rawValue); sim.syncParams() }
+    }
+    /// Food-heatmap normalization scale (0 = the shader-side auto default:
+    /// light mode splitThreshold + lightNutrient/lightDecay, else
+    /// splitThreshold).
+    @Published var heatScale: Double = 0 {
+        didSet { sim.params.heatScale = Float(max(heatScale, 0)); sim.syncParams() }
+    }
+    /// Mitosis pulse per-step decay multiplier (division writes 1.0; 0.95 ->
+    /// half-life ~13.5 steps).
+    @Published var pulseDecay: Double = 0.95 {
+        didSet { sim.params.pulseDecay = Float(min(max(pulseDecay, 0), 0.9999)); sim.syncParams() }
+    }
     @Published var jitter: Double = 0.2          // applied on reset
     @Published var subdivision: Double = 3       // applied on reset
 
@@ -327,6 +352,10 @@ final class SimViewModel: ObservableObject, ViewInput {
         rdeDv = Double(p.rdeDv)
         rdeBase = Double(p.rdeBase)
         rdeGain = Double(p.rdeGain)
+        // V2.2 tint knobs (a loaded state carries them in its raw params).
+        tintMode = TintMode(rawValue: Int(p.tintMode)) ?? .auto
+        heatScale = Double(p.heatScale)
+        pulseDecay = Double(p.pulseDecay)
         cellCount = sim.cellCount
         // Re-frame the camera on the loaded structure.
         let ballRadius = sim.readPositions().map { simd_length($0) }.max() ?? 1

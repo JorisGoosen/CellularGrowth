@@ -8,7 +8,7 @@ including the `bulgeDist` typo analysis) lives in
 [`docs/reference/lomas_cellular_forms_extraction.md`](docs/reference/lomas_cellular_forms_extraction.md),
 with page screenshots in `docs/reference/pages/`.
 
-## Status — V2.1 complete: edge layer, coloured X-ray, soft shadows + fractional light
+## Status — V2.2 complete: tint modes (food/nutrient heatmap, mitosis pulse visualization)
 
 **M1–M6 base** (details in git history / docs/benchlog.md): over-damped
 spring/planar/bulge forces (paper §4, Fig. 3); food + cell division with
@@ -64,6 +64,37 @@ V2.1 additions:
   shadows, coloured X-ray of a grown RDE state, solid with edges=1) capture +
   check PASS.
 
+V2.2 additions (both feed the shared cellTint pipeline — solid impostors,
+ray tracer AND the coloured X-ray):
+- **Food/nutrient heatmap** (`--tint food`, `--heat-scale F`): one scalar per
+  cell — `food + nutrient` in light mode, `food` otherwise — normalized by
+  `heatScale` (0 = auto: `splitThreshold + lightNutrient/lightDecay` in light
+  mode, `splitThreshold` otherwise) over a cool-to-warm ramp (deep blue →
+  green → yellow → red). Shows WHERE the growth substance sits: on a
+  light-grown form the lit canopy is hot, the shaded underside cold.
+- **Mitosis pulse** (`--tint pulse`, `--pulse-decay F`): every division sets
+  a per-cell pulse to 1.0 (parent + daughter, new `pulse` buffer, persisted
+  in CGST v3 so pulse renders replay byte-exact); `pulseDecayStep` multiplies
+  it by `--pulse-decay` (default 0.95 → half-life ~13.5 steps, visible ~45)
+  each step; cellTint blends a magenta flash over the base tint. This
+  visualizes the paper §7 observation ("rhythmic pulses and waves of growth
+  propagating across surfaces"): in light mode the flashes cluster in the
+  lit band and advance with the growth front (pulse-field ring R² 0.33–0.36
+  and rising at t=2000), while uniform growth decorrelates to the
+  uncorrelated baseline (~0.18–0.22 — scattered flicker). Measured in
+  benchlog V2.2.
+- **Render-time hygiene fix**: the directional render's illumination refresh
+  no longer leaks nutrient production into the simulation state (the food
+  heatmap reads nutrient — the v22-food-heat golden replay caught the
+  resulting tint drift; rendering is now strictly side-effect-free).
+- **Validation**: `swift build` (debug+release), `--selftest` (4 phases)
+  PASS, `--lockstep` PASS, all 9 previous goldens PASS, 3 new goldens
+  (food heatmap on a light-grown state, mitosis pulse on the same state —
+  byte-exact snapshot replay with the persisted pulse buffer — and coloured
+  X-ray of the heatmap state) capture + check PASS; CGST v3 round trip
+  byte-identical with the new pulse block; tint-mode bench ~nil cost
+  (benchlog).
+
 ## Build & run
 
 ```bash
@@ -105,7 +136,14 @@ M6: `--preset ball|brain|plant|coral|degenerate-demo`, `--anim DIR
 0 = off), `--edge-width F` (wall width in cell radii, default 0.12),
 `--shadows F` (per-pixel shadow strength, directional solid only, default 1),
 `--xray-color` (per-channel tinted X-ray), `--light-soft F` (light angular
-radius in radians, default 0.35, 0 = legacy binary illumination). Diagnostic:
+radius in radians, default 0.35, 0 = legacy binary illumination). V2.2:
+`--tint none|chemical|food|pulse` (cellTint colour mode; default auto =
+chemical colours in RDE mode, neutral otherwise — the pre-V2.2 behaviour;
+`food` = food/nutrient heatmap, `pulse` = magenta division flashes; an
+explicit `--tint` overrides the mode a loaded state carries),
+`--heat-scale F` (heatmap normalization, 0 = auto: splitThreshold +
+lightNutrient/lightDecay in light mode, splitThreshold otherwise),
+`--pulse-decay F` (per-step pulse multiplier, default 0.95). Diagnostic:
 `--div-stop N` (disable division after step N); env `CG_NO_COARSE_SKIP=1`
 disables the light-march occupancy skip (A/B kill switch); env
 `CG_SHADOW_SAMPLES=N` overrides the 4 default shadow rays per pixel (bench
@@ -137,3 +175,4 @@ repulsion, forces, run controls. Jitter and subdivision apply on Reset.
 | M5 ✅ | growth modes: light-based nutrient (+ diffusion), Gray-Scott RDE; unified light + chemical tinting | `--rde-probe` pattern-formation gates (variance/R²/stability), `--selftest` phases C/D, directional-vs-unbiased render side-by-side, per-mode bench |
 | M6 ✅ | app polish: interactive X-ray, CGST v3 state save/load, animation export, stereo pairs, presets, light-march occupancy skip (~4x) | `--selftest` 4 phases, `--lockstep`, 6/6 goldens (no recapture), state round-trip byte-identical, 20-frame animation + H.264, stereo parallax check, interleaved occupancy A/B (benchlog) |
 | V2.1 ✅ | render v2: edge-blend layer in all three paths (`--edges`), coloured X-ray (`--xray-color`), soft shadows + fractional per-cell light (`--shadows`, `--light-soft`) | `--selftest` 4 phases (recalibrated C gate), `--lockstep`, 6/6 legacy goldens byte-identical (no recapture), 3 new goldens capture+check, render-cost bench (edges ~free, shadows ~2–3x directional solid, coloured X-ray ~free), fractional-light A/B (benchlog) |
+| V2.2 ✅ | tint modes: food/nutrient heatmap (`--tint food`, `--heat-scale`), mitosis pulse visualization (`--tint pulse`, `--pulse-decay`) — division flashes trace the paper §7 growth wavefronts; CGST v3 persists the pulse buffer (byte-exact pulse replays); render-time illumination refresh made side-effect-free | `--selftest` 4 phases, `--lockstep`, 9/9 legacy goldens PASS, 3 new goldens capture+check (pulse + heatmap byte-exact snapshot replays), state round-trip byte-identical, tint-mode bench ~nil (benchlog), pulse ring-R² wavefront metric: light 0.33–0.36 vs uniform 0.18–0.22 |

@@ -7,8 +7,9 @@
 //    normals -> [grid rebuild: count, scanLocal, scanBlocks, scanOffset,
 //    scatter] -> [repulsionAccumulate when repulsionStrength > 0]
 //    -> [M5 chemicals: boundMax + illuminate + clearBound + nutrientDiffuse
-//    (light mode) | rdeStep (rde mode)] -> integrateForces (adds
-//    collisionOffset) -> food -> division (decide, execute, finalize)
+//    (light mode) | rdeStep (rde mode)] -> pulseDecay (V2.2 mitosis pulse,
+//    BEFORE division so this step's events flash at 1.0) -> integrateForces
+//    (adds collisionOffset) -> food -> division (decide, execute, finalize)
 //    -> cellTint (AFTER division so this step's daughters are tinted — M6)
 //    -> radii
 //  The chemical passes read the same frozen pre-step state as repulsion and
@@ -52,7 +53,7 @@ import Foundation
 import Metal
 import simd
 
-/// Must mirror MSL `struct SimParams` exactly (31 x 4 bytes = 124).
+/// Must mirror MSL `struct SimParams` exactly (40 x 4 bytes = 160).
 /// Fields are only ever APPENDED at the end, on both sides.
 struct SimParams {
     var linkRestLength: Float = 1.0
@@ -153,6 +154,24 @@ struct SimParams {
     /// (~20°): comparable to the angular radius of a typical blocking cell
     /// one rest length away (~0.5 rad), so grazing blockers grade smoothly.
     var lightSoft: Float = 0.35
+    // --- V2.2 (appended; struct grows 148 -> 160 bytes) ---
+    /// Per-cell tint mode for the cellTint kernel: 0 = auto (chemical colours
+    /// iff growthMode == rde — the pre-V2.2 behaviour; all pre-V2.2 goldens
+    /// are byte-identical under it), 1 = neutral albedo, 2 = chemical (rde
+    /// u/v mapping in every growth mode), 3 = food/nutrient heatmap,
+    /// 4 = mitosis pulse (base tint blended with the magenta division flash).
+    var tintMode: UInt32 = 0
+    /// Food-heatmap normalization scale (cellTint food mode): heat =
+    /// growth substance / heatScale. <= 1e-6 selects the shader-side auto
+    /// default (light mode: splitThreshold + lightNutrient/lightDecay;
+    /// otherwise splitThreshold) — see the cellTint comment in Shaders.swift.
+    var heatScale: Float = 0
+    /// Per-step multiplier on the division pulse (0 <= d <= 1). Default 0.95:
+    /// half-life ln(0.5)/ln(0.95) ≈ 13.5 steps, weight > 0.1 for ~45 steps —
+    /// the pulse stays visible for ~30-60 steps while the flash density stays
+    /// below "the whole surface is flashing" on fast-growing runs (measured:
+    /// 0.97 left 60-80% of cells active at the validation growth rate).
+    var pulseDecay: Float = 0.95
 }
 
 enum ShaderError: Error {
@@ -211,6 +230,10 @@ final class CellSim {
     private let chemVA: MTLBuffer
     private let chemVB: MTLBuffer
     private let boundBuffer: MTLBuffer      // UInt32: atomic max |P|² accumulator
+    /// V2.2: scratch for the render-time illumination refresh — the nutrient
+    /// prefix is saved aside and restored around the march so rendering never
+    /// perturbs the simulation (see encodeIlluminationRefresh).
+    private let nutrientScratchBuffer: MTLBuffer
     /// M5 per-cell render colour (cellTint kernel; neutral albedo unless rde).
     let tintBuffer: MTLBuffer
     /// V2.1 per-cell illumination FRACTION (illuminate kernel; 0 = fully
@@ -234,6 +257,12 @@ final class CellSim {
     /// across at roi 1.6); beyond that the skip degrades to a no-op, never
     /// wrong.
     let occupancyBuffer: MTLBuffer
+    /// V2.2 mitosis pulse (Float per cell): divisionExecute writes 1.0 for
+    /// the parent + daughter on the step of the split; pulseDecayStep
+    /// multiplies by params.pulseDecay every step. Zeroed at reset/state
+    /// load; persisted in CGST v3 files from V2.2 on (legacy files load with
+    /// pulse = 0) so pulse-tinted renders replay byte-exact.
+    let pulseBuffer: MTLBuffer
     private var usingNutA = true
     private var usingChemA = true
 
@@ -279,6 +308,7 @@ final class CellSim {
     private var pSeedChemicals: MTLComputePipelineState!
     private var pRdeStep: MTLComputePipelineState!
     private var pCellTint: MTLComputePipelineState!
+    private var pPulseDecay: MTLComputePipelineState!
     // TEMPORARY DEBUG (CELLDBG; remove after M3 gates are green):
     private var pParamEcho: MTLComputePipelineState!
     private var pQueryFingerprint: MTLComputePipelineState!
@@ -320,6 +350,7 @@ final class CellSim {
             pSeedChemicals = try pipeline("seedChemicals")
             pRdeStep = try pipeline("rdeStep")
             pCellTint = try pipeline("cellTint")
+            pPulseDecay = try pipeline("pulseDecayStep")
             // TEMPORARY DEBUG (CELLDBG; remove after M3 gates are green):
             pParamEcho = try pipeline("paramEcho")
             pQueryFingerprint = try pipeline("queryFingerprint")
@@ -330,8 +361,8 @@ final class CellSim {
 
         // Layout drift guard: the MSL SimParams mirror is appended-only; a
         // mismatch here corrupts every kernel silently.
-        precondition(MemoryLayout<SimParams>.size == 148,
-                     "SimParams layout drift: \(MemoryLayout<SimParams>.size) != 148 (see Shaders.swift)")
+        precondition(MemoryLayout<SimParams>.size == 160,
+                     "SimParams layout drift: \(MemoryLayout<SimParams>.size) != 160 (see Shaders.swift)")
 
         let f3 = MemoryLayout<SIMD3<Float>>.stride
         positionsA = device.makeBuffer(length: maxCells * f3, options: .storageModeShared)!
@@ -414,6 +445,9 @@ final class CellSim {
         boundBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride,
                                         options: .storageModeShared)!
         boundBuffer.label = "lightBound2"
+        nutrientScratchBuffer = device.makeBuffer(length: maxCells * MemoryLayout<Float>.stride,
+                                                  options: .storageModeShared)!
+        nutrientScratchBuffer.label = "nutrientScratch"
         tintBuffer = device.makeBuffer(length: maxCells * f3,
                                        options: .storageModeShared)!
         tintBuffer.label = "cellTint"
@@ -425,11 +459,16 @@ final class CellSim {
         occupancyBuffer = device.makeBuffer(
             length: (1 << 18) * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
         occupancyBuffer.label = "lightOccupancy"
+        // V2.2 mitosis pulse (Float per cell; zeroed — no division has run).
+        pulseBuffer = device.makeBuffer(length: maxCells * MemoryLayout<Float>.stride,
+                                        options: .storageModeShared)!
+        pulseBuffer.label = "mitosisPulse"
         memset(binCountsBuffer.contents(), 0, binCountsBuffer.length)
         memset(collisionOffsetBuffer.contents(), 0, collisionOffsetBuffer.length)
         memset(nutrientA.contents(), 0, nutrientA.length)
         memset(nutrientB.contents(), 0, nutrientB.length)
         memset(boundBuffer.contents(), 0, boundBuffer.length)
+        memset(pulseBuffer.contents(), 0, pulseBuffer.length)
         fillLitFraction(1.0, count: maxCells)   // neutral: no illumination verdict yet
         memset(occupancyBuffer.contents(), 0, occupancyBuffer.length)
     }
@@ -522,6 +561,7 @@ final class CellSim {
         memset(nutrientA.contents(), 0, nutrientA.length)
         memset(nutrientB.contents(), 0, nutrientB.length)
         memset(boundBuffer.contents(), 0, boundBuffer.length)
+        memset(pulseBuffer.contents(), 0, pulseBuffer.length)   // V2.2: no division has run
         fillLitFraction(1.0, count: cellCount)   // neutral until the first light march
 
         guard let cb = queue.makeCommandBuffer() else { fatalError("no command buffer") }
@@ -602,7 +642,11 @@ final class CellSim {
     /// normals -> [M3 grid rebuild + repulsionAccumulate, when
     /// repulsionStrength > 0] -> [M5 chemical passes: boundMax + illuminate +
     /// clearBound + nutrientDiffuse (light mode) | rdeStep (rde mode)] ->
-    /// integrate -> food -> division (decide, execute, finalize) -> radii.
+    /// [V2.2 pulseDecayStep] -> integrate -> food -> division (decide,
+    /// execute, finalize) -> cellTint -> radii.
+    /// The pulse decay runs BEFORE the division block: a division this step
+    /// flashes at pulse = 1.0 and the decay starts next step. cellTint runs
+    /// after division so this step's daughters are tinted (M6).
     /// All kernels bound on the device cell counter; the dispatch width is a
     /// benign over-estimate (see class docs). Buffers swap on the CPU side;
     /// GPU execution order is fixed within the CB (Metal hazard-tracks the
@@ -651,6 +695,11 @@ final class CellSim {
             encodeRdeStep(cb, width: width)
             usingChemA.toggle()
         }
+        // V2.2 mitosis pulse decay: every step, BEFORE the division block —
+        // a division THIS step flashes at pulse = 1.0 and the decay starts on
+        // the NEXT step. Independent of growthMode/tintMode (one FMA per
+        // cell; benchlog V2.2: ~nil), so tint-mode switches mid-run are sane.
+        encodePulseDecay(cb, width: width)
         // M5 per-cell render colour: AFTER the division block so the daughters
         // of THIS step are tinted too (they are born inside divisionExecute,
         // which writes their chemicals into the current buffers — tint must
@@ -977,6 +1026,7 @@ final class CellSim {
         enc.setBuffer(nutrientBuffer, offset: 0, index: 8)   // M5: cytoplasm split
         enc.setBuffer(chemUBuffer, offset: 0, index: 9)      // M5: daughter inheritance
         enc.setBuffer(chemVBuffer, offset: 0, index: 10)
+        enc.setBuffer(pulseBuffer, offset: 0, index: 11)     // V2.2: division flash
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         enc.endEncoding()
@@ -1073,6 +1123,21 @@ final class CellSim {
         enc.setBuffer(tintBuffer, offset: 0, index: 2)
         enc.setBuffer(counterBuffer, offset: 0, index: 3)
         enc.setBuffer(paramsBuffer, offset: 0, index: 4)
+        enc.setBuffer(foodBuffer, offset: 0, index: 5)      // V2.2 food heatmap
+        enc.setBuffer(nutrientBuffer, offset: 0, index: 6)  // V2.2 food heatmap (light mode)
+        enc.setBuffer(pulseBuffer, offset: 0, index: 7)     // V2.2 mitosis pulse
+        enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    /// V2.2 mitosis pulse decay (one FMA per cell; see pulseDecayStep).
+    private func encodePulseDecay(_ cb: MTLCommandBuffer, width: Int) {
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pPulseDecay)
+        enc.setBuffer(pulseBuffer, offset: 0, index: 0)
+        enc.setBuffer(counterBuffer, offset: 0, index: 1)
+        enc.setBuffer(paramsBuffer, offset: 0, index: 2)
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         enc.endEncoding()
@@ -1112,13 +1177,39 @@ final class CellSim {
     /// illuminate + clearBound at the exact cell count; host must be in sync
     /// (GPU idle). CONTRACT: the caller must rebuild the grid
     /// (encodeGridRebuild — which also refreshes the M6 coarse occupancy the
-    /// march skips on) in the SAME or an earlier command buffer. The nutrient
-    /// side effect (one decay+production pass) is harmless at render time.
+    /// march skips on) in the SAME or an earlier command buffer.
+    /// SIDE-EFFECT-FREE (V2.2): illuminate's nutrient production is STEP
+    /// semantics; at render time it used to leak into the state ("harmless"
+    /// while nothing render-visible read nutrient — the V2.2 food heatmap
+    /// DOES, and the v22-food-heat golden replay caught the resulting tint
+    /// drift: the capture saved a post-refresh state while its render had
+    /// used pre-refresh tint). The nutrient buffer is therefore saved aside
+    /// and restored around the march (blit copies of the live prefix —
+    /// trivially cheap). Rendering must never perturb the simulation.
     func encodeIlluminationRefresh(_ cb: MTLCommandBuffer) {
         guard cellCount > 0 else { return }
+        encodeNutrientSaveRestore(cb, restore: false)
         encodeBoundMax(cb, width: cellCount)
         encodeIlluminate(cb, width: cellCount)
         encodeClearBound(cb)
+        encodeNutrientSaveRestore(cb, restore: true)
+    }
+
+    /// Blit the live nutrient prefix aside (restore = false) or back
+    /// (restore = true) around the render-time illumination march. The
+    /// CURRENT buffer is the source/destination both ways (illuminate reads
+    /// and writes it in place).
+    private func encodeNutrientSaveRestore(_ cb: MTLCommandBuffer, restore: Bool) {
+        guard let enc = cb.makeBlitCommandEncoder() else { return }
+        let bytes = cellCount * MemoryLayout<Float>.stride
+        if restore {
+            enc.copy(from: nutrientScratchBuffer, sourceOffset: 0,
+                     to: nutrientBuffer, destinationOffset: 0, size: bytes)
+        } else {
+            enc.copy(from: nutrientBuffer, sourceOffset: 0,
+                     to: nutrientScratchBuffer, destinationOffset: 0, size: bytes)
+        }
+        enc.endEncoding()
     }
 
     private func encodeRadii(into cb: MTLCommandBuffer, positions: MTLBuffer, width: Int) {
@@ -1140,6 +1231,17 @@ final class CellSim {
     func refreshRadii(_ cb: MTLCommandBuffer) {
         guard cellCount > 0 else { return }
         encodeRadii(into: cb, positions: positionsBuffer, width: cellCount)
+    }
+
+    /// Recompute the tint buffer at the exact current cell count in a waited
+    /// command buffer (host must be in sync). V2.2: after a state load with
+    /// an explicit CLI tint override — installFullState computed the tint
+    /// with the state's own tintMode; the override needs one fresh pass.
+    func refreshTint() {
+        guard cellCount > 0, let cb = queue.makeCommandBuffer() else { return }
+        encodeCellTint(cb, width: cellCount)
+        cb.commit()
+        cb.waitUntilCompleted()
     }
 
     // MARK: - Stats
@@ -1257,6 +1359,10 @@ final class CellSim {
     var chemVPointer: UnsafeMutablePointer<Float> {
         chemVBuffer.contents().assumingMemoryBound(to: Float.self)
     }
+    /// V2.2 mitosis pulse readback (validation/probe; GPU must be idle).
+    var pulsePointer: UnsafeMutablePointer<Float> {
+        pulseBuffer.contents().assumingMemoryBound(to: Float.self)
+    }
     var radiiPointer: UnsafeMutablePointer<Float> {
         radiiBuffer.contents().assumingMemoryBound(to: Float.self)
     }
@@ -1269,6 +1375,9 @@ final class CellSim {
     }
     func readChemV() -> [Float] {
         Array(UnsafeBufferPointer(start: chemVPointer, count: cellCount))
+    }
+    func readPulse() -> [Float] {
+        Array(UnsafeBufferPointer(start: pulsePointer, count: cellCount))
     }
 
     // MARK: - State snapshots (CGST; M6 unification)
@@ -1286,9 +1395,15 @@ final class CellSim {
     //            the sim needs to CONTINUE exactly where it left off:
     //              food (N x f32) | nutrient (N x f32) | chemU (N x f32)
     //            | chemV (N x f32) | tint (N x 16 B) | rngState (N x u64)
+    //            | [V2.2: pulse (N x f32) — division pulses are LIVE state;
+    //            |   persisted so pulse-tinted renders replay byte-exact
+    //            |   (division ORDER is GPU-schedule-dependent, the pulse
+    //            |   VALUES are part of the snapshot); legacy files load
+    //            |   with pulse = 0]
     //            | SimParams (raw, appended-only: 128 B comment from v3's first
-    //            |   draft was wrong — M6 files carry 144 B, V2.1+ files 148 B;
-    //            |   the reader accepts both and prefixes into the struct)
+    //            |   draft was wrong — M6 files carry 144 B, V2.1 files 148 B,
+    //            |   V2.2 files 160 B; the reader accepts every prefix length
+    //            |   and prefixes into the struct)
     //            Loaded WITHOUT reset(): buffers installed directly, normals/
     //            radii/tint recomputed (deterministic functions of the state).
     //
@@ -1309,7 +1424,8 @@ final class CellSim {
                                              + CellSim.maxValence * MemoryLayout<UInt32>.stride
                                              + 4 * MemoryLayout<UInt32>.stride
                                              + MemoryLayout<Float>.stride * 4
-                                             + MemoryLayout<UInt64>.stride)
+                                             + MemoryLayout<UInt64>.stride
+                                             + MemoryLayout<Float>.stride)   // V2.2 pulse
                               + MemoryLayout<SimParams>.size)
         func append(_ v: UInt32) {
             var x = v.littleEndian
@@ -1358,6 +1474,9 @@ final class CellSim {
         let rng = UnsafeBufferPointer(start: rngBuffer.contents()
             .assumingMemoryBound(to: UInt64.self), count: count)
         for r in rng { append(r) }
+        // --- V2.2: pulse block (N x f32), BEFORE the raw SimParams. See the
+        // format comment above (division pulses are live state).
+        for f in UnsafeBufferPointer(start: pulsePointer, count: count) { append(f) }
         // Raw SimParams (the simulation contract; appended-only layout).
         withUnsafeBytes(of: &params) { src in
             bytes.append(contentsOf: src.prefix(MemoryLayout<SimParams>.size))
@@ -1397,18 +1516,24 @@ final class CellSim {
         let baseSize = 16 + count * (MemoryLayout<SIMD3<Float>>.stride + maxValence * 4 + 4)
         let v3Payload = count * (4 * 4 + MemoryLayout<Float>.stride * 4
                                  + MemoryLayout<UInt64>.stride)
-        let v3Size = baseSize + v3Payload + MemoryLayout<SimParams>.size
-        // V2.1: SimParams grew 144 -> 148 bytes (lightSoft appended). M6-era
-        // v3 files carry a 144-byte raw SimParams block; the appended-only
-        // layout makes the prefix compatible, so the reader accepts both and
-        // leaves fields the file predates at their struct defaults (the read
-        // below copies only the bytes present).
-        let v3SizeLegacy = baseSize + v3Payload + 144
-        let expected = version == 2 ? baseSize + 56      // v2 block: 1 uint + 13 floats
-                     : version == 3 ? v3Size
-                     : baseSize
-        guard data.count == expected || (version == 3 && data.count == v3SizeLegacy) else {
-            throw StateSnapshotError.sizeMismatch(path: path, got: data.count, expected: expected)
+        // Raw SimParams block lengths by writer era: 144 B (M6), 148 B (V2.1,
+        // lightSoft), 160 B (V2.2: tintMode + heatScale + pulseDecay). The
+        // appended-only layout makes every shorter block a compatible prefix
+        // of the current struct — the read below copies only the bytes
+        // present, leaving fields the file predates at their struct defaults.
+        // V2.2 writers ALSO append a pulse block (N x f32) before the params.
+        // count >= 12 for every real state (icosphere minimum), so 4N > 16:
+        // the pulse-bearing tail (>= 4N + 144) can never collide with a bare
+        // params length (<= 160).
+        let paramSizes: [Int] = [144, 148, MemoryLayout<SimParams>.size]
+        let v3Sizes = paramSizes.flatMap { [baseSize + v3Payload + $0,
+                                           baseSize + v3Payload + 4 * count + $0] }
+        let expected = version == 2 ? [baseSize + 56]      // v2 block: 1 uint + 13 floats
+                     : version == 3 ? v3Sizes
+                     : [baseSize]
+        guard expected.contains(data.count) else {
+            throw StateSnapshotError.sizeMismatch(path: path, got: data.count,
+                                                  expected: expected.min() ?? 0)
         }
 
         if version == 2 {
@@ -1492,6 +1617,13 @@ final class CellSim {
             }
         }
         off += count * MemoryLayout<UInt64>.stride
+        // V2.2: optional pulse block (N x f32) between the RNG state and the
+        // raw SimParams — present iff the remaining bytes exceed the largest
+        // bare params block (see the size check above).
+        var pulse = [Float](repeating: 0, count: count)
+        if data.count - off > 160 {
+            pulse = readFloats(count)
+        }
         // Raw SimParams.
         var restored = SimParams()
         data.withUnsafeBytes { src in
@@ -1507,7 +1639,7 @@ final class CellSim {
 
         installFullState(positions: positions, flatLinks: flatLinks, counts: counts,
                          food: food, nutrient: nutrient, chemU: chemU, chemV: chemV,
-                         tint: tint, rng: rng)
+                         tint: tint, rng: rng, pulse: pulse)
         return (version, params.growthMode)
     }
 
@@ -1527,7 +1659,7 @@ final class CellSim {
     private func installFullState(positions: [SIMD3<Float>], flatLinks: [UInt32],
                                   counts: [UInt32], food: [Float], nutrient: [Float],
                                   chemU: [Float], chemV: [Float], tint: [SIMD3<Float>],
-                                  rng: [UInt64]) {
+                                  rng: [UInt64], pulse: [Float]) {
         precondition(positions.count <= maxCells, "state exceeds maxCells")
         cellCount = positions.count
         params.cellCount = UInt32(cellCount)
@@ -1554,6 +1686,9 @@ final class CellSim {
         copy(chemV, to: chemVA)
         copy(tint, to: tintBuffer)
         copy(rng, to: rngBuffer)
+        // V2.2 pulse (legacy files pass zeros — no pulses recorded).
+        memset(pulseBuffer.contents(), 0, pulseBuffer.length)
+        copy(pulse, to: pulseBuffer)
         counterBuffer.contents().assumingMemoryBound(to: UInt32.self)[0] = UInt32(cellCount)
         memset(boundBuffer.contents(), 0, boundBuffer.length)
         fillLitFraction(1.0, count: cellCount)   // neutral until encodeIlluminationRefresh

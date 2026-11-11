@@ -13,8 +13,11 @@ enum Shaders {
     #include <metal_stdlib>
     using namespace metal;
 
-    // NOTE: layout must mirror Swift struct SimParams exactly (36 x 4 bytes = 144).
-    // New fields are APPENDED at the end on both sides (AGENTS.md SimParams rule).
+    // NOTE: layout must mirror Swift struct SimParams exactly (40 x 4 bytes =
+    // 160). New fields are APPENDED at the end on both sides (AGENTS.md
+    // SimParams rule). Size history: 144 B through M6, 148 B in V2.1
+    // (lightSoft), 160 B from V2.2 (tintMode + heatScale + pulseDecay) —
+    // the CGST v3 reader accepts every prefix length.
     struct SimParams {
         float linkRestLength;
         float springFactor;
@@ -65,9 +68,18 @@ enum Shaders {
                                  // > 0 = fractional visibility (see lightVisibility).
                                  // Shared by the growth illumination AND the ray
                                  // tracer's shadow-ray cone (one physical light).
+        // --- V2.2 (appended; struct grows 148 -> 160 bytes) ---
+        uint  tintMode;          // cellTint colour mode: 0 auto (chemical iff
+                                 // growthMode == rde — the pre-V2.2 behaviour),
+                                 // 1 none (neutral), 2 chemical (rde u/v map in
+                                 // every mode), 3 food/nutrient heatmap,
+                                 // 4 mitosis pulse
+        float heatScale;         // food-heatmap normalization scale;
+                                 // <= 1e-6 selects the shader-side auto default
+                                 // (see the cellTint comment)
+        float pulseDecay;        // per-step multiplier on the division pulse
+                                 // (0.95 default; division writes 1.0)
     };
-
-    // Positions/normals use float3 (16-byte stride), matching Swift SIMD3<Float>
     // (alignment 16!). Links are stored strided per cell (cell * maxValence + k)
     // in CYCLIC RING ORDER (neighbors consecutive around the vertex), so the
     // area-weighted vertex normal is the sum of cross products of consecutive
@@ -1027,14 +1039,26 @@ enum Shaders {
         chemVNext[gid] = clamp(v + dv, 0.0f, 2.0f);
     }
 
-    // M5: per-cell RENDER colour. In rde mode the chemicals tint the cells:
-    // base GREEN, shifted toward BLUE proportional to u and toward RED
-    // proportional to v (documented mapping below); in uniform/light mode the
-    // neutral albedo is written — bit-identical to the pre-M5 hardcoded
-    // colours (the impostor fragment's float3(0.87, 0.85, 0.82) and
-    // RayRenderSettings.albedo), so the M3/M4 goldens are unaffected.
+    // M5/V2.2: per-cell RENDER colour. Tint modes (params.tintMode, V2.2 —
+    // appended enum; 0 reproduces the pre-V2.2 behaviour exactly, so every
+    // existing golden stays byte-identical):
+    //   0 auto     — chemical colours iff growthMode == 2 (rde), else the
+    //                neutral albedo
+    //   1 none     — neutral albedo always
+    //   2 chemical — the rde u/v mapping in EVERY growth mode (chemicals are
+    //                seeded at reset in all modes; only rde evolves them)
+    //   3 food     — growth-substance heatmap (mapping below)
+    //   4 pulse    — base tint (auto rule) blended with the magenta division
+    //                pulse (see pulseDecayStep / divisionExecute)
     //
-    // Mapping (linear blend of three base colours):
+    // In rde mode the chemicals tint the cells: base GREEN, shifted toward
+    // BLUE proportional to u and toward RED proportional to v (documented
+    // mapping below); in uniform/light mode the neutral albedo is written —
+    // bit-identical to the pre-M5 hardcoded colours (the impostor fragment's
+    // float3(0.87, 0.85, 0.82) and RayRenderSettings.albedo), so the M3/M4
+    // goldens are unaffected.
+    //
+    // RDE mapping (linear blend of three base colours):
     //   green (0.15, 0.65, 0.20), blue (0.15, 0.25, 0.85), red (0.85, 0.15, 0.15)
     //   wBlue = 0.30 * clamp(u, 0, 1)   — u's background is 1, so the field
     //                                     carries a teal-green cast; u-depleted
@@ -1044,23 +1068,65 @@ enum Shaders {
     //                                     (v ≈ 0.35–0.45) read as clear red
     //                                     patches (wRed ≈ 0.56–0.72)
     //   wGreen = max(1 − wBlue − wRed, 0) — low-concentration cells stay green
+    //
+    // V2.2 food-heatmap mapping (the documented "ONE clear mapping"): ONE
+    // scalar — the cell's growth substance, normalized by heatScale — over a
+    // cool-to-warm ramp:
+    //   value = food + nutrient   in light mode: nutrient IS the light-made
+    //                             growth substance and food the accumulated
+    //                             driver; their sum is the cell's growth
+    //                             potential (nutrient is 0 in the other modes)
+    //   value = food              otherwise
+    //   heatScale <= 1e-6 (the default) selects the AUTO normalization:
+    //     light mode: splitThreshold + lightNutrient/lightDecay — food
+    //       oscillates up to ~splitThreshold before division resets it, and
+    //       the lit nutrient steady state is lightNutrient/lightDecay, so
+    //       the sum spans exactly this range;
+    //     otherwise:  splitThreshold (division keeps food below
+    //       ~threshold + one increment).
+    //   Ramp (4 linear stops — deep blue -> green -> yellow -> red):
+    //     0.0 (0.05, 0.08, 0.55)   1/3 (0.15, 0.70, 0.25)
+    //     2/3 (0.95, 0.80, 0.20)   1.0 (0.90, 0.15, 0.10)
+    //
+    // V2.2 mitosis pulse: divisionExecute writes pulse = 1.0 for the parent
+    // and the daughter; pulseDecayStep multiplies it by params.pulseDecay
+    // every step (default 0.95 — half-life ln(0.5)/ln(0.95) ≈ 13.5 steps,
+    // weight > 0.1 for ~45 steps). The pulse hue is MAGENTA (0.95, 0.15,
+    // 0.85) — roughly the complement of both the neutral green-ish albedo
+    // and the rde green field, so the flash reads against either base:
+    //   col = mix(base, pulseHue, min(pulse, 1))
+    // In light mode divisions concentrate in the lit band, so the decaying
+    // pulses trace the growth wavefront propagating across the surface (the
+    // paper §7 "rhythmic pulses and waves of growth"); in uniform mode they
+    // speckle everywhere. Validated in the V2.2 report (screenshots + the
+    // pulse ring-R² checkpoint stats).
+    //
     // Runs every step, AFTER the division block (M6: the daughters born this
     // step inherit the parent's u/v inside divisionExecute, so tint must be
     // recomputed from the post-division chemicals or last-step daughters
-    // render with a stale/zero tint).
+    // render with a stale/zero tint). The pre-integrate call (division off)
+    // keeps tints fresh from the chemical passes.
     //
     // Buffer table:
-    //   0 chemU (const)   1 chemV (const)   2 tint (write)   3 cellCounter   4 params
+    //   0 chemU (const)   1 chemV (const)   2 tint (write)   3 cellCounter
+    //   4 params
+    //   5 food (const; V2.2 food heatmap)  6 nutrient (const; V2.2)
+    //   7 pulse (const; V2.2 mitosis pulse)
     kernel void cellTint(device const float* chemU    [[buffer(0)]],
                          device const float* chemV    [[buffer(1)]],
                          device float3*      tint     [[buffer(2)]],
                          device const uint*  cellCounter [[buffer(3)]],
                          constant SimParams& params   [[buffer(4)]],
+                         device const float* food     [[buffer(5)]],
+                         device const float* nutrient [[buffer(6)]],
+                         device const float* pulse    [[buffer(7)]],
                          uint gid [[thread_position_in_grid]])
     {
         if (gid >= cellCounter[0]) return;
+        const uint mode = params.tintMode;
         float3 col = float3(0.87, 0.85, 0.82);   // neutral albedo (pre-M5 value)
-        if (params.growthMode == 2u) {
+        const bool chemical = (mode == 2u) || (mode == 0u && params.growthMode == 2u);
+        if (chemical) {
             float uC = clamp(chemU[gid], 0.0f, 1.0f);
             float vC = clamp(chemV[gid], 0.0f, 1.0f);
             float wBlue = 0.30f * uC;
@@ -1069,8 +1135,53 @@ enum Shaders {
             col = wGreen * float3(0.15, 0.65, 0.20)
                 + wBlue  * float3(0.15, 0.25, 0.85)
                 + wRed   * float3(0.85, 0.15, 0.15);
+        } else if (mode == 3u) {
+            // Food/nutrient heatmap (mapping documented above).
+            float scale = params.heatScale;
+            if (scale <= 1e-6f) {
+                scale = (params.growthMode == 1u)
+                    ? (params.splitThreshold
+                       + params.lightNutrient / max(params.lightDecay, 1e-3f))
+                    : params.splitThreshold;
+            }
+            float value = (params.growthMode == 1u)
+                        ? (food[gid] + nutrient[gid])
+                        : food[gid];
+            float h = clamp(value / max(scale, 1e-6f), 0.0f, 1.0f);
+            const float3 c0 = float3(0.05, 0.08, 0.55);   // deep blue (cold)
+            const float3 c1 = float3(0.15, 0.70, 0.25);   // green
+            const float3 c2 = float3(0.95, 0.80, 0.20);   // yellow
+            const float3 c3 = float3(0.90, 0.15, 0.10);   // red (hot)
+            if (h < 1.0f / 3.0f)      col = mix(c0, c1, h * 3.0f);
+            else if (h < 2.0f / 3.0f) col = mix(c1, c2, (h - 1.0f / 3.0f) * 3.0f);
+            else                      col = mix(c2, c3, (h - 2.0f / 3.0f) * 3.0f);
+        }
+        // V2.2 pulse blend (over the base tint of every mode).
+        if (mode == 4u) {
+            float p = clamp(pulse[gid], 0.0f, 1.0f);
+            col = mix(col, float3(0.95, 0.15, 0.85), p);
         }
         tint[gid] = col;
+    }
+
+    // V2.2 mitosis pulse decay: pulse *= pulseDecay every step, flushed to
+    // zero below 1e-4 (the tint weight there is < 0.01% — invisible; the
+    // flush keeps the buffer free of denormal clutter). Runs BEFORE the
+    // division block, so a division THIS step flashes at pulse = 1.0 and the
+    // decay starts on the NEXT step. Encoded every step regardless of the
+    // tint mode (one FMA per cell — benchlog V2.2: ~nil cost), so switching
+    // tint modes mid-run never shows stale pulses.
+    //
+    // Buffer table:
+    //   0 pulse (read + write)   1 cellCounter   2 params
+    kernel void pulseDecayStep(device float*        pulse [[buffer(0)]],
+                               device const uint*   cellCounter [[buffer(1)]],
+                               constant SimParams&  params [[buffer(2)]],
+                               uint gid [[thread_position_in_grid]])
+    {
+        if (gid >= cellCounter[0]) return;
+        float p = pulse[gid] * params.pulseDecay;
+        pulse[gid] = p < 1e-4f ? 0.0f : p;
     }
 
     // ---- cell division, pass 1: claim (paper §4, Figure 7) ----
@@ -1237,6 +1348,7 @@ enum Shaders {
     //   8 nutrient (read + write; M5: cytoplasm split between parent/daughter)
     //   9 chemU (read parent, write daughter; M5 rde inheritance)
     //  10 chemV (read parent, write daughter; M5 rde inheritance)
+    //  11 pulse (write; V2.2: parent + daughter flash at 1.0)
     kernel void divisionExecute(device float3* positions    [[buffer(0)]],
                                 device uint*   links        [[buffer(1)]],
                                 device uint*   linkCounts   [[buffer(2)]],
@@ -1248,6 +1360,7 @@ enum Shaders {
                                 device float*  nutrient     [[buffer(8)]],
                                 device float*  chemU        [[buffer(9)]],
                                 device float*  chemV        [[buffer(10)]],
+                                device float*  pulse        [[buffer(11)]],
                                 uint gid [[thread_position_in_grid]])
     {
         if (gid >= atomic_load_explicit(&cellCounter[0], memory_order_relaxed)) return;
@@ -1404,6 +1517,13 @@ enum Shaders {
         nutrient[gid] = 0.5f * nutrient[gid];
         chemU[d] = chemU[gid];
         chemV[d] = chemV[gid];
+        // V2.2 mitosis pulse: both cells flash at FULL pulse on the step of
+        // the division (pulseDecayStep next step starts the decay). Write
+        // sets stay disjoint — claims are ring-distance >= 3 apart and the
+        // daughter slot is fresh (same race-freedom argument as the chemical
+        // writes above).
+        pulse[gid] = 1.0f;
+        pulse[d] = 1.0f;
         rngState[d] = rngState[gid] * kRngMul + kRngInc;   // fresh stream off the parent's
         splitFlags[d] = 0u;
         uint dbase = d * params.maxValence;
@@ -1679,6 +1799,10 @@ enum Shaders {
         uint  lightCoarseSkip;
         // --- V2.1 (appended; must mirror Shaders.sim exactly) ---
         float lightSoft;
+        // --- V2.2 (appended; must mirror Shaders.sim exactly) ---
+        uint  tintMode;      // cellTint mode (render paths read the precomputed tint buffer)
+        float heatScale;     // food-heatmap normalization (<= 1e-6 = auto)
+        float pulseDecay;    // mitosis pulse per-step decay
     };
 
     struct VOut {
@@ -2031,6 +2155,10 @@ enum Shaders {
         uint  lightCoarseSkip;
         // --- V2.1 (appended; must mirror Shaders.sim exactly) ---
         float lightSoft;
+        // --- V2.2 (appended; must mirror Shaders.sim exactly) ---
+        uint  tintMode;      // cellTint mode (render paths read the precomputed tint buffer)
+        float heatScale;     // food-heatmap normalization (<= 1e-6 = auto)
+        float pulseDecay;    // mitosis pulse per-step decay
     };
 
     // Bit-packed bin hash — IDENTICAL to Shaders.sim binHash (same grid).
