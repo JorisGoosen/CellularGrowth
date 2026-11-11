@@ -242,3 +242,72 @@ table.
 - Static --bench (uniform, division off) this session measured ~3x the M3
   numbers at 655k (31.9 vs 9.9 ms/step) — session/thermal variance, consistent
   with the M5 observation; the interleaved A/B above is the trusted comparison.
+
+## V2.1 render costs (release, 1600x1200, samples 1, --state-load replays; one session) — 2026-11-11 — Apple M1 Pro
+
+Edge layer / coloured X-ray / per-pixel shadow costs, GPU seconds per render
+(`commandBuffer.gpuStartTime/gpuEndTime` summed over tiles):
+
+| cells | solid | solid + edges 1 | xray | xray + color | dir. shadows 0 | dir. shadows 1 (4 rays) |
+|---|---|---|---|---|---|---|
+| 100 000 (m4 grown, folded) | 0.21 | 0.20 | 0.53 | 0.54 | 0.19 | 0.41 |
+| 655 362 (settled ball) | 0.62 | 0.62 | 2.14 | 2.15 | 0.61 | 1.77 |
+
+- **Edge layer**: no measurable cost (within run-to-run noise, <= 5%). The
+  per-hit 27-bin nearest-centre query is dwarfed by the primary DDA
+  traversal (one extra neighbourhood scan per hit pixel vs ~10-50 for the
+  ray itself). In the X-ray the per-CONTRIBUTING-SPHERE query (10-50 per
+  ray) is likewise invisible against the traversal's own neighbourhood
+  scans. The edge layer is effectively free in both styles.
+- **Coloured X-ray**: free — the per-channel tint multiply replaces the
+  scalar accumulation 1:1 (no extra queries or marches); tone map is 3x
+  exp/pow instead of 1x.
+- **Per-pixel shadow rays**: +0.22 s (100k) / +1.16 s (650k) for 4 jittered
+  cone marches per HIT pixel (~55% of the frame at this framing) => ~60 ns
+  per shadow march per pixel at 100k cells, ~300 ns at 655k (longer segments
+  through the larger structure; the M6 coarse-occupancy skip applies to
+  these marches too). Directional solid total cost ~2.1x (100k) to ~2.9x
+  (650k) over shadows-off. `--shadows 0` restores the per-cell-fraction-only
+  shading (same cost as the unbiased path + the litFraction read).
+
+## V2.1 fractional light cost (light mode, division OFF, interleaved A/B, 2 passes each; interval-1 sweep and interval-8 sweep) — 2026-11-11 — Apple M1 Pro
+
+Fractional per-cell illumination (lightSoft 0.35) vs the legacy binary
+verdict (lightSoft 0). The cost is the LOST EARLY EXIT: the binary march
+stops at the first blocker; the fractional march continues until the
+visibility product drops below 1e-3 (full-coverage blockers still exit
+immediately). Interleaved passes agree tightly (thermal noise shows between
+sweeps, not within):
+
+| cells | ms/step interval 1 binary | interval 1 fractional | ratio | ms/step interval 8 binary | interval 8 fractional | ratio |
+|---|---|---|---|---|---|---|
+| 2 562 | 1.09 / 1.05 | 1.23 / 1.16 | 1.13x | 0.42 | 0.60 | 1.4x |
+| 10 242 | 1.35 / 1.35 | 1.87 / 1.87 | 1.39x | 0.56 | 0.58 | 1.0x |
+| 40 962 | 4.42 / 4.25 | 8.82 / 8.73 | 2.06x | 1.27 | 1.94 | 1.5x |
+| 163 842 | 13.42 / 12.73 | 30.29 / 30.25 | 2.34x | 4.08 / 4.10 | 6.56 / 6.49 | 1.59x |
+| 655 362 | 62.0 / 62.3 | 140.2 / 140.6 | 2.26x | 18.0 / 18.2 | 28.2 / 41.6* | ~1.6x |
+
+*the 655k interval-8 fractional pass 2 drifted (thermal); pass 1 (28.2) with
+the interleaved binary passes gives ~1.6x, consistent with the 164k level.
+At the SHIPPED default (interval 8) the fractional light costs ~1.5-1.6x in
+light mode; at interval 1 it is ~2.3x. Non-light modes are untouched (the
+march does not run).
+
+## V2.1 light-gradient A/B (growth coupling, 1500 steps, subdiv 4, jitter 0.25, light mode) — 2026-11-11 — Apple M1 Pro
+
+Facing (N.L > 0.3) vs away (N.L < -0.3) mean nutrient after 1500 steps:
+
+| lightSoft | facing | away | ratio |
+|---|---|---|---|
+| 0 (binary, legacy) | 0.502 | 0.047 | 10.7 |
+| 0.35 (V2.1 default) | 0.895 | 0.416 | 2.15 |
+
+The fractional light compresses the gradient BY DESIGN: partially shaded
+cells receive a partial nutrient flux instead of a hard 0 (and the lit-side
+mean rises because marginally-blocked cells now count as partially lit).
+Selftest phase C measures the same field at 2.07-2.09. The phase C gate was
+therefore RECALIBRATED (raised, not lowered): > 1.2 -> > 1.5 — the old gate
+was calibrated for the binary ~10x ratio and would pass a badly degraded
+gradient at the new operating point; 1.5 keeps a ~30% margin under the
+measured 2.07-2.15 while still asserting the gradient exists. Documented in
+the selftest source next to the gate.

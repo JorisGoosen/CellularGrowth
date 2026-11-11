@@ -8,9 +8,9 @@ including the `bulgeDist` typo analysis) lives in
 [`docs/reference/lomas_cellular_forms_extraction.md`](docs/reference/lomas_cellular_forms_extraction.md),
 with page screenshots in `docs/reference/pages/`.
 
-## Status — M6 complete: app polish (all milestones ✅)
+## Status — V2.1 complete: edge layer, coloured X-ray, soft shadows + fractional light
 
-**M1–M5 base** (details in git history / docs/benchlog.md): over-damped
+**M1–M6 base** (details in git history / docs/benchlog.md): over-damped
 spring/planar/bulge forces (paper §4, Fig. 3); food + cell division with
 race-free claim/execute topology change; hashed sparse-grid repulsion
 (`--roi`, `--repulsion`; without it forms degenerate — paper Fig. 5 vs 6);
@@ -22,56 +22,47 @@ diffusion grows plant-like forms toward the light, high diffusion organ-like /
 Gray-Scott RDE on the cell graph driving patterned growth, `--rde-probe`
 validates pattern formation); ONE unified light direction shared by growth
 illumination and rendering (`--render-light auto|growth|unbiased`); RDE
-chemical tinting in both render paths.
+chemical tinting in both render paths; interactive X-ray, CGST v3 state
+save/load, animation export, stereo pairs, presets, light-march occupancy
+skip.
 
-M6 additions:
-- **Interactive X-ray** (paper §6 style 2, realtime): the GUI gains a
-  Solid / X-ray render-style switch. X-ray renders every cell as an additive
-  density sprite (same radial profile as the offline accumulation,
-  `rad·(1−(d/(rad·S))²)²` with S = 2) with additive blending and no depth —
-  dense knots glow on a black background, chemical tint included. Documented
-  approximation: the film curve is nonlinear in the *accumulated* density;
-  fixed-function additive blending sums per-sprite terms in 8-bit sRGB and the
-  clamp is the tone map (`xrayGain` slider, default 0.3). The default Solid
-  path is pixel-identical to M5 (all goldens pass without recapture).
-- **State save/load unified (CGST v3)**: one writer/reader for CLI, goldens
-  and GUI. v3 persists EVERYTHING — positions, links, linkCounts, food,
-  nutrient, u, v, tint, rngState + the full SimParams — so a saved state
-  *continues* exactly where it left off. v1 (M4) and v2 (M5) files still load
-  (v2 restores the growth config and reseeds chemicals; v1 keeps current
-  params). Round-trip validation: grow → save → load → render is
-  byte-identical to the pre-save render, and save→load→save reproduces the
-  file bit-for-bit. GUI: Save State…/Load State… (NSSavePanel/NSOpenPanel,
-  default directory ~/Documents); CLI `--state-save`/`--state-load` now
-  round-trip chemicals everywhere (including `--screenshot`).
-- **Animation export** (paper §6): `--anim DIR --anim-steps N --anim-frames M`
-  renders equally spaced frames with the offline ray tracer (style/size/
-  samples/`--render-light` configurable) into numbered PNGs and assembles an
-  H.264 .mov via AVFoundation (30 fps; if the encoder fails the PNG sequence
-  is still written and an ffmpeg one-liner is printed). Camera re-frames per
-  frame so the growing structure stays in view.
-- **Stereo pairs** (paper §6): `--stereo` renders left/right eyes with the
-  camera shifted ±interocular/2 along the camera right axis (parallel-axis
-  stereo, no toe-in) and composites a side-by-side PNG; separation is a
-  fraction of the scene scale (`--interocular F`, default 0.03).
-- **Presets**: `ball`, `brain`, `plant`, `coral`, `degenerate-demo` — full
-  parameter bundles (Core/Presets.swift, one source of truth) with documented
-  values; GUI dropdown and CLI `--preset NAME` (explicit flags still win).
-- **Light-march occupancy skip** (M5 open issue): coarse 8³-bin occupancy
-  bitfield + DDA block jumps make light mode ~4x faster at interval 1 and
-  ~2.5x at the default interval 8 (655k cells; interleaved A/B in
-  docs/benchlog.md). Skip proven trajectory-exact by a byte-identical A/B.
-- **Determinism fix (found by the M6 A/B)**: Icosphere ring ordering used
-  Swift `Set` iteration order (randomized per process) as the angle-sort
-  reference — every ring's cyclic rotation differed run to run. Now
-  deterministic (min-index reference); the M3 goldens still pass within their
-  recorded tolerance, no recapture needed.
-- **Division/tint fix (found by the round-trip validation)**: `cellTint` now
-  runs after the division block, so same-step daughters no longer render with
-  a stale (zeroed = black) tint.
-- **Validation**: `--selftest` (4 phases) PASS, `--lockstep` PASS, all six
-  goldens PASS (m3 ×2 unchanged, m4 ×2 unchanged, m6 impostor-X-ray ball +
-  grown added), `--headless` sane.
+V2.1 additions:
+- **Edge layer** (`--edges F`, `--edge-width F`, default off): a wall-darkening
+  blend parameter (NOT a separate style) in all three render paths. At every
+  query point the darkening ramps over `edgeWidth × radius` from the wall
+  plane (nearest other cell centre == own centre distance) into the cell
+  interior: ray-tracer solid = grid nearest-centre query at the primary hit;
+  ray-tracer X-ray = per contributing sphere at the density-profile foot
+  (faint cell outlines woven into the density cloud — the microscopy look);
+  interactive impostors = the cell's own ring neighbours (≤ 16 fragment
+  reads). `solid + edges 1` gives the Voronoi-wall look the paper mentions
+  as an early experiment (§8: "a variation on Voronoi cells"); `X-ray +
+  edges` reads like stained microscopy.
+- **Coloured X-ray** (`--xray-color`, ray tracer): per-channel tinted density
+  accumulation — contribution = the cell's tint (cellTint: RDE chemistry
+  colours) × its density term, tone mapped per channel. RDE spots glow warm
+  through the teal u-field. The grayscale path is bit-identical to M4.
+- **Soft shadows + fractional light**: the growth illumination is now a
+  FRACTION per cell — the visible fraction of a soft light disk (angular
+  radius `--light-soft F` radians, default 0.35 ≈ 20°; 0 = the legacy binary
+  verdict) instead of a lit/unlit flag. One DDA march, same candidate set:
+  each centerline-crossing blocker occludes a linear-ramp fraction of the
+  disk; independent blockers multiply. Consumers: the growth coupling
+  (smoother lit/dark gradient), the impostor fragment (per-cell shadow
+  factor), and the ray tracer's directional solid style, where per-pixel
+  shadow rays (`--shadows F`, 4 jittered cone samples, `--shadows 0` restores
+  the per-cell-only shading) refine it into a penumbra. Shadows exist ONLY
+  under the directional light — unbiased renders never trace shadow rays
+  (all M3/M4/M6 goldens byte-identical, verified). AO stays the
+  omnidirectional term: `col = tint·(aoFloor + (1−aoFloor)·ao)·(0.2 +
+  0.8·N·L·vis)`. The selftest phase C gradient gate was recalibrated for the
+  softer gradient (raised 1.2 → 1.5; measured ratio 2.07–2.15, binary was
+  ~10.7 — see the selftest comment).
+- **Validation**: `swift build` (debug+release), `--selftest` (4 phases,
+  recalibrated C gate) PASS, `--lockstep` PASS, all 6 previous goldens PASS
+  byte-identical (no recapture), 3 new goldens (directional solid with
+  shadows, coloured X-ray of a grown RDE state, solid with edges=1) capture +
+  check PASS.
 
 ## Build & run
 
@@ -110,9 +101,15 @@ Flags: `--steps N`, `--subdiv N`, `--jitter F`, `--spring F`, `--planar F`,
 `--rde-probe`, `--rde-dump DIR`, `--render-light auto|growth|unbiased`.
 M6: `--preset ball|brain|plant|coral|degenerate-demo`, `--anim DIR
 --anim-steps N --anim-frames M`, `--stereo`, `--interocular F`,
-`--screenshot-style solid|xray`. Diagnostic: `--div-stop N` (disable division
-after step N); env `CG_NO_COARSE_SKIP=1` disables the light-march occupancy
-skip (A/B kill switch).
+`--screenshot-style solid|xray`. V2.1: `--edges F` (edge-layer strength,
+0 = off), `--edge-width F` (wall width in cell radii, default 0.12),
+`--shadows F` (per-pixel shadow strength, directional solid only, default 1),
+`--xray-color` (per-channel tinted X-ray), `--light-soft F` (light angular
+radius in radians, default 0.35, 0 = legacy binary illumination). Diagnostic:
+`--div-stop N` (disable division after step N); env `CG_NO_COARSE_SKIP=1`
+disables the light-march occupancy skip (A/B kill switch); env
+`CG_SHADOW_SAMPLES=N` overrides the 4 default shadow rays per pixel (bench
+knob — goldens record 4).
 
 ```bash
 # M4: ray-traced renders of the grown state (paper Fig. 8 / Fig. 9 styles)
@@ -139,3 +136,4 @@ repulsion, forces, run controls. Jitter and subdivision apply on Reset.
 | M4 ✅ | offline ray tracer: solid + analytic AO, X-ray density accumulation | CPU brute-force pixel verification (CGDBG), grown-state snapshot goldens (pixel-exact replay), paper-gate comparison vs Fig. 8/9, 8600² tiled render |
 | M5 ✅ | growth modes: light-based nutrient (+ diffusion), Gray-Scott RDE; unified light + chemical tinting | `--rde-probe` pattern-formation gates (variance/R²/stability), `--selftest` phases C/D, directional-vs-unbiased render side-by-side, per-mode bench |
 | M6 ✅ | app polish: interactive X-ray, CGST v3 state save/load, animation export, stereo pairs, presets, light-march occupancy skip (~4x) | `--selftest` 4 phases, `--lockstep`, 6/6 goldens (no recapture), state round-trip byte-identical, 20-frame animation + H.264, stereo parallax check, interleaved occupancy A/B (benchlog) |
+| V2.1 ✅ | render v2: edge-blend layer in all three paths (`--edges`), coloured X-ray (`--xray-color`), soft shadows + fractional per-cell light (`--shadows`, `--light-soft`) | `--selftest` 4 phases (recalibrated C gate), `--lockstep`, 6/6 legacy goldens byte-identical (no recapture), 3 new goldens capture+check, render-cost bench (edges ~free, shadows ~2–3x directional solid, coloured X-ray ~free), fractional-light A/B (benchlog) |

@@ -59,6 +59,12 @@ enum Shaders {
         uint  gridCoarseBitsY;   // a bit per 8^3-fine-bin block for the light-march
         uint  gridCoarseBitsZ;   // empty-interior skip (collisions conservative)
         uint  lightCoarseSkip;   // 1 = coarse skip enabled (kill switch for A/B)
+        // --- V2.1 (appended; struct grows 144 -> 148 bytes) ---
+        float lightSoft;         // light angular radius (radians) of the soft light
+                                 // disk: 0 = the legacy binary lit/unlit verdict,
+                                 // > 0 = fractional visibility (see lightVisibility).
+                                 // Shared by the growth illumination AND the ray
+                                 // tracer's shadow-ray cone (one physical light).
     };
 
     // Positions/normals use float3 (16-byte stride), matching Swift SIMD3<Float>
@@ -668,36 +674,43 @@ enum Shaders {
         atomic_store_explicit(&bound2[0], 0u, memory_order_relaxed);
     }
 
-    // Segment [t0, t1] occlusion test through the spatial hash (Amanatides–Woo
-    // 3D-DDA — the M4 renderer's traverseGrid pattern, reduced to a boolean).
-    // Correctness (same argument as the renderer): a sphere the segment crosses
-    // inside a centerline bin has its centre within rad < h of that crossing,
-    // so it lies in the bin's 27-bin packed-hash neighbourhood. Occlusion
-    // radius = the renderer's per-cell radius (mean link distance x
-    // radiusScale), CLAMPED below roi to stay inside the grid path's proof
-    // (radii >= roi exist only on stretched cells, typically << 1% of a grown
-    // state — they under-shadow slightly; documented in the M5 report).
+    // Fractional light visibility (V2.1): the fraction of the light DISK
+    // (angular radius lightSoft, radians — a physical soft light) visible
+    // from ro along direction rd. Blockers are the SAME centerline-crossing
+    // spheres the legacy binary march tested (dLine2 <= rad^2 — the DDA
+    // candidate set and bin walk are UNCHANGED); each blocker occludes
+    //   coverage = clamp((lightSoft + alpha - phi) / (2*lightSoft), 0, 1)
+    // of the disk, where phi = angle(rd, blocker centre) and
+    // alpha = asin(rad/d) is its angular radius as seen from ro (linear
+    // ramp: full coverage once the blocker disk contains the light disk,
+    // zero beyond its rim). The product over blockers assumes independent
+    // occluders. lightSoft = 0 reduces coverage to the binary (phi < alpha)
+    // verdict — bit-identical to the pre-V2.1 lightOccluded, including the
+    // early exit at the same candidate the boolean `return true` fired at.
+    // Penumbra approximation (documented): blockers that do NOT cross the
+    // centerline (the penumbra cone skirt) are not in the DDA candidate set
+    // and contribute nothing — the softness comes from the angular size of
+    // centerline-crossing blockers, which carries nearly all of the
+    // occlusion energy. A cone-widened march would need wider bin
+    // neighbourhoods per DDA step; not worth it (measured in the V2.1
+    // bench: the fraction cost is dominated by the LOST early exit, not by
+    // the coverage arithmetic).
     //
-    // M6 coarse occupancy skip (the M5 report's two-level fix): rays from the
-    // dark hemisphere cross the structure's EMPTY interior bin by bin, and
-    // each empty bin costs 27 binStarts lookups into the 16 MB table. Before
-    // the fine walk, the 27 coarse occupancy bits around the current 8³-bin
-    // block are tested; if all clear, nothing can block inside that block
-    // (proof in coarseNeighbourhoodClear) and the DDA jumps straight to the
-    // block's exit — ~500 binStarts lookups collapse to 27 bit tests on a
-    // 1 KB bitfield (L1/L2-resident). Skips are only ever taken over regions
-    // provably free of cells, so the occlusion verdict is bit-identical to
-    // the fine-only walk.
-    static bool lightOccluded(float3 ro, float3 rd, float t0, float t1, uint selfIdx,
-                              device const float3* positions,
-                              device const float* radii,
-                              device const uint* binStarts,
-                              device const uint* particleIndices,
-                              device const uint* occupancy,
-                              constant SimParams& sp)
+    // M6 coarse occupancy skip unchanged (only ever skipped over regions
+    // proven free of cells — verdict-identical for any lightSoft).
+    static float lightVisibility(float3 ro, float3 rd, float t0, float t1, uint selfIdx,
+                                 float lightSoft,
+                                 device const float3* positions,
+                                 device const float* radii,
+                                 device const uint* binStarts,
+                                 device const uint* particleIndices,
+                                 device const uint* occupancy,
+                                 constant SimParams& sp)
     {
-        if (!(t1 > t0)) return false;
+        if (!(t1 > t0)) return 1.0f;
+        const bool binary = (lightSoft <= 1e-6f);
         const float h = sp.roi;
+        float vis = 1.0f;
         float3 p0 = ro + rd * t0;
         int3 c = int3((int)floor(p0.x / h), (int)floor(p0.y / h), (int)floor(p0.z / h));
         int3 st = int3(rd.x > 0.0f ? 1 : -1, rd.y > 0.0f ? 1 : -1, rd.z > 0.0f ? 1 : -1);
@@ -728,7 +741,7 @@ enum Shaders {
                 else if (rd.y < 0.0f) tExitB = min(tExitB, (blockLo.y - ro.y) / rd.y);
                 if (rd.z > 0.0f)      tExitB = min(tExitB, (blockHi.z - ro.z) / rd.z);
                 else if (rd.z < 0.0f) tExitB = min(tExitB, (blockLo.z - ro.z) / rd.z);
-                if (tExitB >= t1) return false;   // segment ends inside the clear block
+                if (tExitB >= t1) return 1.0f;   // segment ends inside the clear block
                 if (tExitB > tCur + 1e-4f) {
                     // Jump: reinitialize the DDA state at the block exit
                     // (same formulas as the loop head; tDelta/st unchanged).
@@ -752,6 +765,12 @@ enum Shaders {
                         for (uint idx = s; idx < e; ++idx) {
                             uint r = particleIndices[idx];
                             if (r == selfIdx) continue;
+                            // Occlusion radius = the renderer's per-cell radius
+                            // (mean link distance x radiusScale), CLAMPED below
+                            // roi to stay inside the grid path's proof (radii
+                            // >= roi exist only on stretched cells, typically
+                            // << 1% of a grown state — they under-shadow
+                            // slightly; documented in the M5 report).
                             float rad = min(radii[r], 0.99f * h);
                             if (rad <= 0.0f) continue;
                             float3 C = float3(positions[r]);
@@ -762,7 +781,24 @@ enum Shaders {
                             float thc = sqrt(max(rad * rad - dLine2, 0.0f));
                             float ta = tc - thc;
                             float tb = tc + thc;
-                            if (tb > t0 && ta < t1) return true;   // blocks the light
+                            if (tb > t0 && ta < t1) {
+                                // Blocker crosses the segment: angular coverage
+                                // of the light disk. d > rad here unless the
+                                // start point itself lies INSIDE the blocker
+                                // (tb > t0 with the centre behind ro forces
+                                // d < rad) — full coverage either way.
+                                float d = sqrt(dLine2 + tc * tc);
+                                float coverage;
+                                if (binary || d <= rad) {
+                                    coverage = 1.0f;
+                                } else {
+                                    float phi = acos(clamp(tc / d, -1.0f, 1.0f));
+                                    float alpha = asin(min(rad / d, 1.0f));
+                                    coverage = clamp((lightSoft + alpha - phi) / (2.0f * lightSoft), 0.0f, 1.0f);
+                                }
+                                vis *= 1.0f - coverage;
+                                if (vis < 1e-3f) return 0.0f;   // fully blocked; stop marching
+                            }
                         }
                     }
                 }
@@ -780,7 +816,7 @@ enum Shaders {
                 c.z += st.z; tCur = tMax.z; tMax.z += tDelta.z;
             }
         }
-        return false;
+        return clamp(vis, 0.0f, 1.0f);
     }
 
     // One thread per cell: illumination march + nutrient production. Runs on
@@ -791,15 +827,21 @@ enum Shaders {
     // (host-side; production is pulsed lightInterval× so the average
     // production rate — and hence the nutrient steady state — is unchanged);
     // decay + diffusion run EVERY step in nutrientDiffuse.
-    // M5 unified light: the per-cell lit/unlit verdict is also STORED
-    // (litFlags) — the ray tracer's directional solid style shades with the
-    // SAME per-cell illumination the growth used (CellSim.
-    // encodeIlluminationRefresh recomputes it for a loaded state).
+    // M5 unified light: the per-cell illumination verdict is also STORED —
+    // V2.1: the FRACTIONAL visible fraction of the soft light disk
+    // (lightVisibility; 0 = fully shaded, 1 = fully lit). Consumers: the
+    // growth coupling (smoother lit/dark gradient than the binary verdict),
+    // the impostor fragment's per-cell shadow factor, and the ray tracer's
+    // directional solid style (per-pixel shadow rays refine it).
+    // (CellSim.encodeIlluminationRefresh recomputes it for a loaded state.)
+    // Production scales with the fraction: nutrient += lightNutrient *
+    // lightInterval * vis — the binary verdict is the lightSoft = 0 special
+    // case (vis in {0, 1}).
     //
     // Buffer table:
     //   0 positions (const)       1 radii (const)        2 binStarts (const)
     //   3 particleIndices (const) 4 nutrient (read+write) 5 bound2 (const)
-    //   6 cellCounter             7 params               8 litFlags (write)
+    //   6 cellCounter             7 params               8 litFraction (write)
     //   9 occupancy (const; M6 coarse skip map — written by gridCount in the
     //     SAME rebuild this step, cleared by the blit fill before it)
     kernel void illuminate(device const float3* positions [[buffer(0)]],
@@ -810,7 +852,7 @@ enum Shaders {
                            device const uint*    bound2   [[buffer(5)]],
                            device const uint*    cellCounter [[buffer(6)]],
                            constant SimParams&   params   [[buffer(7)]],
-                           device uint*          litFlags [[buffer(8)]],
+                           device float*         litFraction [[buffer(8)]],
                            device const uint*    occupancy [[buffer(9)]],
                            uint gid [[thread_position_in_grid]])
     {
@@ -826,12 +868,13 @@ enum Shaders {
         float sceneR = sqrt(as_type<float>(bound2[0]));
         float t1 = sceneR + length(P) + 2.0f * params.roi;
 
-        bool blocked = lightOccluded(P, L, 1e-3f, t1, gid, positions, radii,
-                                     binStarts, particleIndices, occupancy, params);
-        if (!blocked) {
-            n += params.lightNutrient * (float)params.lightInterval;   // pulsed production
+        float vis = lightVisibility(P, L, 1e-3f, t1, gid, params.lightSoft,
+                                    positions, radii, binStarts, particleIndices,
+                                    occupancy, params);
+        if (vis > 0.0f) {
+            n += params.lightNutrient * (float)params.lightInterval * vis;   // pulsed production
         }
-        litFlags[gid] = blocked ? 0u : 1u;
+        litFraction[gid] = vis;
         nutrient[gid] = clamp(n, 0.0f, kNutrientMax);
     }
 
@@ -1589,6 +1632,53 @@ enum Shaders {
         float4 negFwd;   // world-space direction from target toward the camera
         float4 lightDir; // world-space unit vector pointing TOWARD the light
         float4 xrayPad;  // M6: .x = interactive X-ray exposure gain (solid path never reads it)
+        float4 edgePad;  // V2.1: .x = edge strength (0 = off), .y = edge width (x cell radius)
+    };
+
+    // Same struct layout as Shaders.sim SimParams — bound to the SAME params
+    // buffer (the cellFragment edge layer reads maxValence for the link
+    // stride). Keep in sync; appended-only per AGENTS.md.
+    struct SimParams {
+        float linkRestLength;
+        float springFactor;
+        float planarFactor;
+        float bulgeFactor;
+        float radiusScale;
+        uint  cellCount;
+        uint  maxValence;
+        float foodIncrement;
+        float splitThreshold;
+        uint  divisionEnabled;
+        uint  rngSeed;
+        uint  maxCells;
+        float roi;
+        float repulsionStrength;
+        uint  gridBitsX;
+        uint  gridBitsY;
+        uint  gridBitsZ;
+        // --- M5 (appended; must mirror Shaders.sim exactly) ---
+        uint  growthMode;
+        float lightDirX;
+        float lightDirY;
+        float lightDirZ;
+        float lightDiffusionRate;
+        float lightNutrient;
+        float lightDecay;
+        float lightBase;
+        uint  lightInterval;
+        float rdeF;
+        float rdeK;
+        float rdeDu;
+        float rdeDv;
+        float rdeBase;
+        float rdeGain;
+        // --- M6 (appended; must mirror Shaders.sim exactly) ---
+        uint  gridCoarseBitsX;
+        uint  gridCoarseBitsY;
+        uint  gridCoarseBitsZ;
+        uint  lightCoarseSkip;
+        // --- V2.1 (appended; must mirror Shaders.sim exactly) ---
+        float lightSoft;
     };
 
     struct VOut {
@@ -1600,6 +1690,7 @@ enum Shaders {
         float3 negFwd;
         float  radius;
         float3 tint;     // M5: per-cell base colour (cellTint kernel; neutral albedo unless rde mode)
+        uint  cellId;    // V2.1: instance index (flat) — the fragment reads the cell's ring
     };
 
     // One camera-facing quad per cell; the fragment shader shades it as a sphere.
@@ -1626,6 +1717,7 @@ enum Shaders {
         o.up      = cam.up.xyz;
         o.negFwd  = cam.negFwd.xyz;
         o.tint    = float3(tint[iid]);
+        o.cellId  = iid;
         o.clip    = cam.proj * float4(cV + float3(uv * r, 0.0), 1.0);
         return o;
     }
@@ -1676,6 +1768,7 @@ enum Shaders {
         o.up      = cam.up.xyz;
         o.negFwd  = cam.negFwd.xyz;
         o.tint    = float3(tint[iid]);
+        o.cellId  = iid;
         o.clip    = cam.proj * float4(cV + float3(uv * r * support, 0.0), 1.0);
         return o;
     }
@@ -1701,8 +1794,32 @@ enum Shaders {
         float  depth [[depth(any)]];
     };
 
+    // Solid impostor fragment. V2.1 additions (both no-ops at their defaults,
+    // so the M3 raster goldens are byte-identical):
+    //   - Per-cell FRACTIONAL illumination (litFraction, written by the
+    //     illuminate kernel): the shadow factor scales the shaded colour.
+    //     Neutral 1.0 outside light mode / before the first march (the host
+    //     fills the buffer with 1.0 on reset), so uniform-mode runs — and the
+    //     M3 goldens — are unchanged. 0.25 keeps fully shaded cells readable.
+    //   - Edge layer over the cell's OWN ring neighbours (<= 16 links, cheap
+    //     fragment loop; same --edges strength as the ray tracer): at the
+    //     pixel's sphere-surface point, F1 = the cell radius (the surface
+    //     point is exactly centre + radius*normal) and F2 = the nearest ring
+    //     neighbour's centre distance; the darkening ramps down over
+    //     edgeWidth * radius — walls between neighbouring cells darken, cell
+    //     interiors stay bright (the "voronoi" look as a blend parameter,
+    //     not a separate style). Guarded by edges > 0 so no NaN can leak
+    //     into the golden path.
+    // Fragment buffer table:
+    //   0 camera (constant)   1 positions (const)   2 links (const)
+    //   3 linkCounts (const)  4 litFraction (const)  5 SimParams (maxValence stride)
     fragment FOut cellFragment(VOut in [[stage_in]],
-                               constant Camera& cam [[buffer(0)]])
+                               constant Camera& cam [[buffer(0)]],
+                               device const float3* positions [[buffer(1)]],
+                               device const uint*   links [[buffer(2)]],
+                               device const uint*   linkCounts [[buffer(3)]],
+                               device const float*  litFraction [[buffer(4)]],
+                               constant SimParams&  params [[buffer(5)]])
     {
         float z2 = 1.0 - dot(in.uv, in.uv);
         if (z2 < 0.0) { discard_fragment(); }   // outside the sphere disc
@@ -1720,7 +1837,30 @@ enum Shaders {
         // direction is the SHARED growth light (Renderer fills cam.lightDir
         // from SimParams.lightDirX/Y/Z).
         float3 col = in.tint * (0.24 + 0.76 * diff);
+        // V2.1: per-cell fractional illumination as the shadow factor
+        // (exactly 1.0 when litFraction == 1.0 — the neutral fill).
+        col *= (0.25 + 0.75 * litFraction[in.cellId]);
         col *= 1.0 - 0.35 * rim;
+
+        // V2.1 edge layer over the cell's own ring neighbours.
+        if (cam.edgePad.x > 0.0) {
+            float3 Cw = float3(positions[in.cellId]);
+            float3 PhW = Cw + in.radius * nW;   // exact sphere-surface point
+            float f1 = in.radius;
+            float f2 = INFINITY;
+            uint n = linkCounts[in.cellId];
+            uint base = in.cellId * params.maxValence;
+            for (uint k = 0; k < n; ++k) {
+                float d = distance(float3(positions[links[base + k]]), PhW);
+                f2 = min(f2, d);
+            }
+            // Wall width in world units, scaled by the cell's own radius so
+            // the band is size-invariant across a grown structure.
+            float w = max(cam.edgePad.y * f1, 1e-6);
+            float t = clamp((f2 - f1) / w, 0.0, 1.0);
+            float edge = 1.0 - t * t * (3.0 - 2.0 * t);   // 1 - smoothstep(0,1,t)
+            col *= 1.0 - cam.edgePad.x * edge;
+        }
 
         // True sphere-surface point (view space) -> exact fragment depth.
         float4 clip = cam.proj * float4(in.centerV + in.radius * nV, 1.0);
@@ -1838,6 +1978,13 @@ enum Shaders {
         float4 lightDir;    // M5: shared growth light direction (unit, toward the light)
         uint  directionalLight;  // M5: 0 = unbiased omnidirectional (default), 1 = shared directional light
         uint  pad3;
+        // --- V2.1 (appended; struct grows 216 -> 240 bytes) ---
+        float edges;             // edge-layer strength (0 = off, default)
+        float edgeWidth;         // wall width in cell RADII (band fades over edgeWidth*radius)
+        float shadows;           // per-pixel shadow strength in directional mode (0 = per-cell fraction only)
+        uint  shadowSamples;     // jittered shadow rays per hit pixel (4-8; cost ~ linear)
+        uint  xrayColored;       // 0 = legacy grayscale density (bit-identical), 1 = per-channel tinted density
+        uint  pad4;
     };
 
     // Same struct layout as Shaders.sim SimParams — bound to the SAME params
@@ -1882,6 +2029,8 @@ enum Shaders {
         uint  gridCoarseBitsY;
         uint  gridCoarseBitsZ;
         uint  lightCoarseSkip;
+        // --- V2.1 (appended; must mirror Shaders.sim exactly) ---
+        float lightSoft;
     };
 
     // Bit-packed bin hash — IDENTICAL to Shaders.sim binHash (same grid).
@@ -1892,6 +2041,134 @@ enum Shaders {
         return ((uint)c.x & maskX)
              | (((uint)c.y & maskY) << p.gridBitsX)
              | (((uint)c.z & maskZ) << (p.gridBitsX + p.gridBitsY));
+    }
+
+    // V2.1: coarse occupancy hash + neighbourhood test + fractional light
+    // visibility — VERBATIM copies of the Shaders.sim versions (the per-pixel
+    // shadow rays march the SAME grid with the SAME skip map; keeping the
+    // code identical is the drift-prevention rule). SimParams is bound as the
+    // sim's own params buffer, so gridBits*/gridCoarseBits*/roi/lightSoft all
+    // match by construction.
+    static inline uint coarseHash(int3 c, constant SimParams& p) {
+        uint maskX = (1u << p.gridCoarseBitsX) - 1u;
+        uint maskY = (1u << p.gridCoarseBitsY) - 1u;
+        uint maskZ = (1u << p.gridCoarseBitsZ) - 1u;
+        return ((uint)c.x & maskX)
+             | (((uint)c.y & maskY) << p.gridCoarseBitsX)
+             | (((uint)c.z & maskZ) << (p.gridCoarseBitsX + p.gridCoarseBitsY));
+    }
+
+    static bool coarseNeighbourhoodClear(int3 c, device const uint* occupancy,
+                                         constant SimParams& p) {
+        int3 cc = int3(floor(float3(c) * 0.125f));   // floor block coord (exact, see gridCount)
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    uint h = coarseHash(cc + int3(dx, dy, dz), p);
+                    if (occupancy[h >> 5] & (1u << (h & 31u))) return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // Fractional light visibility — see Shaders.sim lightVisibility for the
+    // full derivation. The per-pixel shadow rays call it with lightSoft = 0
+    // (hard per-sample occlusion); the cone jitter provides the penumbra.
+    static float lightVisibility(float3 ro, float3 rd, float t0, float t1, uint selfIdx,
+                                 float lightSoft,
+                                 device const float3* positions,
+                                 device const float* radii,
+                                 device const uint* binStarts,
+                                 device const uint* particleIndices,
+                                 device const uint* occupancy,
+                                 constant SimParams& sp)
+    {
+        if (!(t1 > t0)) return 1.0f;
+        const bool binary = (lightSoft <= 1e-6f);
+        const float h = sp.roi;
+        float vis = 1.0f;
+        float3 p0 = ro + rd * t0;
+        int3 c = int3((int)floor(p0.x / h), (int)floor(p0.y / h), (int)floor(p0.z / h));
+        int3 st = int3(rd.x > 0.0f ? 1 : -1, rd.y > 0.0f ? 1 : -1, rd.z > 0.0f ? 1 : -1);
+        float3 tDelta = fabs(float3(h) / rd);
+        float3 tMax;
+        tMax.x = rd.x != 0.0f ? t0 + ((rd.x > 0.0f ? (float)(c.x + 1) * h : (float)c.x * h) - p0.x) / rd.x : INFINITY;
+        tMax.y = rd.y != 0.0f ? t0 + ((rd.y > 0.0f ? (float)(c.y + 1) * h : (float)c.y * h) - p0.y) / rd.y : INFINITY;
+        tMax.z = rd.z != 0.0f ? t0 + ((rd.z > 0.0f ? (float)(c.z + 1) * h : (float)c.z * h) - p0.z) / rd.z : INFINITY;
+
+        float tCur = t0;
+        for (uint iter = 0; iter < 8192u && tCur < t1; ++iter) {
+            if (sp.lightCoarseSkip != 0u && coarseNeighbourhoodClear(c, occupancy, sp)) {
+                int3 bc0 = int3(floor(float3(c) * 0.125f));
+                float3 blockLo = float3(bc0 * 8) * h;
+                float3 blockHi = float3((bc0 + int3(1)) * 8) * h;
+                float tExitB = INFINITY;
+                if (rd.x > 0.0f)      tExitB = min(tExitB, (blockHi.x - ro.x) / rd.x);
+                else if (rd.x < 0.0f) tExitB = min(tExitB, (blockLo.x - ro.x) / rd.x);
+                if (rd.y > 0.0f)      tExitB = min(tExitB, (blockHi.y - ro.y) / rd.y);
+                else if (rd.y < 0.0f) tExitB = min(tExitB, (blockLo.y - ro.y) / rd.y);
+                if (rd.z > 0.0f)      tExitB = min(tExitB, (blockHi.z - ro.z) / rd.z);
+                else if (rd.z < 0.0f) tExitB = min(tExitB, (blockLo.z - ro.z) / rd.z);
+                if (tExitB >= t1) return 1.0f;
+                if (tExitB > tCur + 1e-4f) {
+                    tCur = tExitB;
+                    p0 = ro + rd * tCur;
+                    c = int3((int)floor(p0.x / h), (int)floor(p0.y / h), (int)floor(p0.z / h));
+                    tMax.x = rd.x != 0.0f ? tCur + ((rd.x > 0.0f ? (float)(c.x + 1) * h : (float)c.x * h) - p0.x) / rd.x : INFINITY;
+                    tMax.y = rd.y != 0.0f ? tCur + ((rd.y > 0.0f ? (float)(c.y + 1) * h : (float)c.y * h) - p0.y) / rd.y : INFINITY;
+                    tMax.z = rd.z != 0.0f ? tCur + ((rd.z > 0.0f ? (float)(c.z + 1) * h : (float)c.z * h) - p0.z) / rd.z : INFINITY;
+                    continue;
+                }
+            }
+            for (int dz = -1; dz <= 1; ++dz) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        uint hh = binHash(c + int3(dx, dy, dz), sp);
+                        uint s = binStarts[hh];
+                        uint e = binStarts[hh + 1];
+                        for (uint idx = s; idx < e; ++idx) {
+                            uint r = particleIndices[idx];
+                            if (r == selfIdx) continue;
+                            float rad = min(radii[r], 0.99f * h);
+                            if (rad <= 0.0f) continue;
+                            float3 C = float3(positions[r]);
+                            float3 toC = C - ro;
+                            float tc = dot(toC, rd);
+                            float dLine2 = dot(toC, toC) - tc * tc;
+                            if (dLine2 > rad * rad) continue;
+                            float thc = sqrt(max(rad * rad - dLine2, 0.0f));
+                            float ta = tc - thc;
+                            float tb = tc + thc;
+                            if (tb > t0 && ta < t1) {
+                                float d = sqrt(dLine2 + tc * tc);
+                                float coverage;
+                                if (binary || d <= rad) {
+                                    coverage = 1.0f;
+                                } else {
+                                    float phi = acos(clamp(tc / d, -1.0f, 1.0f));
+                                    float alpha = asin(min(rad / d, 1.0f));
+                                    coverage = clamp((lightSoft + alpha - phi) / (2.0f * lightSoft), 0.0f, 1.0f);
+                                }
+                                vis *= 1.0f - coverage;
+                                if (vis < 1e-3f) return 0.0f;
+                            }
+                        }
+                    }
+                }
+            }
+            if (tCur >= t1) break;
+            float tExit = min(min(tMax.x, tMax.y), tMax.z);
+            if (tExit >= t1) break;
+            if (tMax.x <= tMax.y && tMax.x <= tMax.z) {
+                c.x += st.x; tCur = tMax.x; tMax.x += tDelta.x;
+            } else if (tMax.y <= tMax.z) {
+                c.y += st.y; tCur = tMax.y; tMax.y += tDelta.y;
+            } else {
+                c.z += st.z; tCur = tMax.z; tMax.z += tDelta.z;
+            }
+        }
+        return clamp(vis, 0.0f, 1.0f);
     }
 
     // Deterministic per-pixel/per-sample AA jitter (PCG-style integer hash).
@@ -1923,6 +2200,64 @@ enum Shaders {
     //   neighbourhood: the closest segment point can be support away from
     //   the centre, i.e. profileSupport bins per axis for rad < h — the
     //   caller passes nbhdK = wantDensity ? ceil(profileSupport) : 1.
+    // V2.1 edge-layer helper: 1 - smoothstep over the wall band. dNearest =
+    // (nearest other centre distance - own centre distance) at the query
+    // point; the darkening ramps from full at dNearest <= 0 (on/inside the
+    // wall plane) to zero at dNearest = edgeWidth * radius (wall width
+    // scaled by the cell's own radius — size-invariant across grown
+    // structures).
+    static inline float edgeFactor(float dNearest, float rad, float edgeWidth) {
+        float w = max(edgeWidth * rad, 1e-6f);
+        float t = clamp(dNearest / w, 0.0f, 1.0f);
+        return 1.0f - t * t * (3.0f - 2.0f * t);
+    }
+
+    // V2.1 edge-layer query: nearest OTHER cell-centre distance from point X.
+    // Scans the 27-bin neighbourhood of X's bin — guaranteed to contain every
+    // centre within roi of X (the h >= roi rule; ALL cells are scattered into
+    // the grid, including the big-cell supplement's). Approximation
+    // (documented): an edge factor > 0 needs a centre within
+    // rad*(1 + edgeWidth) of X; for typical cells (rad ~ 0.3 roi) that is
+    // well inside roi and fully covered. Stretched near-roi cells may find
+    // their edge band slightly thinner than the true Voronoi wall.
+    static float nearestCentreDistance(float3 X, uint selfIdx,
+                                       device const float3* positions,
+                                       device const uint* binStarts,
+                                       device const uint* particleIndices,
+                                       constant SimParams& sp)
+    {
+        const float h = sp.roi;
+        float best = INFINITY;
+        int3 c = int3((int)floor(X.x / h), (int)floor(X.y / h), (int)floor(X.z / h));
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    uint hh = binHash(c + int3(dx, dy, dz), sp);
+                    uint s = binStarts[hh];
+                    uint e = binStarts[hh + 1];
+                    for (uint idx = s; idx < e; ++idx) {
+                        uint r = particleIndices[idx];
+                        if (r == selfIdx) continue;
+                        float d = distance(float3(positions[r]), X);
+                        best = min(best, d);
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    // V2.1: jittered direction inside the cone of half-angle `soft` around
+    // the light direction L (small-angle: sin ~ tan ~ soft). soft = 0 gives
+    // L exactly. u = 2 uniform samples in [0, 1).
+    static inline float3 coneJitter(float3 L, float soft, float2 u) {
+        if (soft <= 1e-6f) return L;
+        float3 helper = (fabs(L.y) < 0.99f) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
+        float3 t1 = normalize(cross(L, helper));
+        float3 t2 = cross(L, t1);
+        return normalize(L + soft * (u.x * t1 + u.y * t2));
+    }
+
     static void traverseGrid(float3 ro, float3 rd, float t0, float t1, uint count,
                              device const float3* positions,
                              device const float* radii,
@@ -1930,8 +2265,10 @@ enum Shaders {
                              device const uint* particleIndices,
                              constant SimParams& sp,
                              float profileSupport, uint nbhdK,
+                             constant RenderParams& rp,
+                             device const float3* tint,
                              bool wantNearest, thread float* nearest, thread uint* nearestIdx,
-                             bool wantDensity, thread float* density)
+                             bool wantDensity, thread float3* density)
     {
         if (count == 0u || !(t1 > t0)) return;
         const float h = sp.roi;
@@ -2002,7 +2339,23 @@ enum Shaders {
                                     float d2 = dot(dv, dv);
                                     if (d2 < support * support) {
                                         float q = 1.0f - d2 / (support * support);
-                                        *density += rad * q * q;
+                                        float contrib = rad * q * q;
+                                        // V2.1 edge layer: darken the sphere's
+                                        // density where its foot point sits
+                                        // near a wall with a neighbouring cell
+                                        // (faint cell outlines woven into the
+                                        // density cloud). Skipped entirely at
+                                        // edges = 0 (bit-identical accumulation).
+                                        if (rp.edges > 0.0f) {
+                                            float f2 = nearestCentreDistance(ro + rd * tf, r, positions, binStarts, particleIndices, sp);
+                                            contrib *= 1.0f - rp.edges * edgeFactor(f2 - sqrt(d2), rad, rp.edgeWidth);
+                                        }
+                                        // V2.1 coloured X-ray: per-channel
+                                        // tinted density. Grayscale (0) keeps
+                                        // the M4 accumulation bit-identical
+                                        // (multiply by exactly (1,1,1)).
+                                        float3 w3 = (rp.xrayColored != 0u) ? float3(tint[r]) : float3(1.0f, 1.0f, 1.0f);
+                                        *density += w3 * contrib;
                                     }
                                 }
                             }
@@ -2033,9 +2386,14 @@ enum Shaders {
                             device const uint* bigCells, uint bigCount,
                             device const float3* positions,
                             device const float* radii,
+                            device const uint* binStarts,
+                            device const uint* particleIndices,
+                            constant SimParams& sp,
                             float profileSupport,
+                            constant RenderParams& rp,
+                            device const float3* tint,
                             bool wantNearest, thread float* nearest, thread uint* nearestIdx,
-                            bool wantDensity, thread float* density)
+                            bool wantDensity, thread float3* density)
     {
         for (uint bi = 0; bi < bigCount; ++bi) {
             uint r = bigCells[bi];
@@ -2065,7 +2423,13 @@ enum Shaders {
                 float d2 = dot(dv, dv);
                 if (d2 < support * support) {
                     float q = 1.0f - d2 / (support * support);
-                    *density += rad * q * q;
+                    float contrib = rad * q * q;
+                    if (rp.edges > 0.0f) {
+                        float f2 = nearestCentreDistance(ro + rd * tf, r, positions, binStarts, particleIndices, sp);
+                        contrib *= 1.0f - rp.edges * edgeFactor(f2 - sqrt(d2), rad, rp.edgeWidth);
+                    }
+                    float3 w3 = (rp.xrayColored != 0u) ? float3(tint[r]) : float3(1.0f, 1.0f, 1.0f);
+                    *density += w3 * contrib;
                 }
             }
         }
@@ -2122,10 +2486,11 @@ enum Shaders {
     //   0 positions (const)        1 radii (const)
     //   2 binStarts (const)        3 particleIndices (const)
     //   4 cellCounter (const)      5 RenderParams
-    //   6 SimParams (roi + grid hash bits; the sim's own params buffer)
+    //   6 SimParams (roi + grid hash bits + lightSoft; the sim's own params buffer)
     //   7 bigCells (const; supplement indices, rad >= roi)
     //   8 tint (const; M5 per-cell albedo from the cellTint kernel)
-    //   9 litFlags (const; M5 per-cell illumination verdict from illuminate)
+    //   9 litFraction (const; V2.1 per-cell illumination fraction from illuminate)
+    //  10 occupancy (const; M6 coarse skip map — the shadow marches skip on it)
     kernel void raytraceTile(texture2d<float, access::write> outTex [[texture(0)]],
                              device const float3* positions [[buffer(0)]],
                              device const float*   radii [[buffer(1)]],
@@ -2136,7 +2501,8 @@ enum Shaders {
                              constant SimParams& sp [[buffer(6)]],
                              device const uint*   bigCells [[buffer(7)]],
                              device const float3* tint [[buffer(8)]],
-                             device const uint*   litFlags [[buffer(9)]],
+                             device const float*  litFraction [[buffer(9)]],
+                             device const uint*   occupancy [[buffer(10)]],
                              uint2 gid [[thread_position_in_grid]])
     {
         if (gid.x >= rp.tileW || gid.y >= rp.tileH) return;
@@ -2147,8 +2513,9 @@ enum Shaders {
         const bool solid = (rp.style == 0u);
 
         float3 accum = float3(0.0);
-        float densAccum = 0.0f;
-        float dummyF = 0.0f;
+        float3 densAccum = float3(0.0);
+        float dummyF = 0.0f;      // wantNearest dummy (float*, traverseGrid contract)
+        float3 dummyF3 = float3(0.0);   // wantDensity dummy
         uint  dummyU = 0u;
 
         for (uint s = 0; s < rp.samples; ++s) {
@@ -2183,11 +2550,12 @@ enum Shaders {
                 float nearest = INFINITY;
                 uint hitIdx = 0u;
                 traverseGrid(ro, rd, t0, t1, count, positions, radii, binStarts,
-                             particleIndices, sp, rp.profileSupport, 1u,
+                             particleIndices, sp, rp.profileSupport, 1u, rp, tint,
                              true, &nearest, &hitIdx,
-                             false, &dummyF);
+                             false, &dummyF3);
                 bigCellPass(ro, rd, t0, t1, bigCells, rp.bigCount, positions, radii,
-                            rp.profileSupport, true, &nearest, &hitIdx, false, &dummyF);
+                            binStarts, particleIndices, sp, rp.profileSupport, rp, tint,
+                            true, &nearest, &hitIdx, false, &dummyF3);
                 if (nearest < INFINITY) {
                     float3 C = float3(positions[hitIdx]);
                     float rad = radii[hitIdx];
@@ -2198,30 +2566,72 @@ enum Shaders {
                                                 particleIndices, sp);
                     // M5 unified light: per-cell tint (neutral = the pre-M5
                     // albedo, so unbiased renders are byte-identical to M4).
-                    // Directional mode shades with the SAME per-cell
-                    // illumination verdict the growth used (litFlags — no
-                    // separate shadow march; the ambient floor keeps shaded
-                    // form readable while lit surfaces read bright).
+                    //
+                    // V2.1 directional shading: the per-cell illumination
+                    // FRACTION the growth used (litFraction — smooth per-cell
+                    // soft-light visibility), refined per pixel by jittered
+                    // shadow rays through the light's angular cone (the same
+                    // lightSoft radius — one physical light). Combination
+                    // (documented): vis = mix(per-cell fraction, per-pixel
+                    // ray average, shadow strength); shade = 0.2 + 0.8*ndl*vis
+                    // (the M5 ambient-floor form). AO stays the OMNIDIRECTIONAL
+                    // self-shadowing multiplier (paper §5/§6 style 1); the
+                    // shadow term is the DIRECTIONAL occlusion inside the
+                    // Lambertian response — the standard ambient+direct split:
+                    //   col = tint * (aoFloor + (1-aoFloor)*ao) * (0.2 + 0.8*ndl*vis)
+                    // Unbiased mode (directionalLight == 0) reads neither
+                    // litFraction nor shadow rays: shade = 1 exactly (M4
+                    // goldens byte-identical).
                     float shade = 1.0f;
                     if (rp.directionalLight != 0u) {
                         float3 L = normalize(rp.lightDir.xyz);
                         float ndl = max(dot(N, L), 0.0f);
-                        shade = 0.2f + 0.8f * ndl * (litFlags[hitIdx] != 0u ? 1.0f : 0.0f);
+                        float vis = litFraction[hitIdx];
+                        if (rp.shadows > 0.0f && rp.shadowSamples > 0u) {
+                            // Per-pixel penumbra: hard occlusion along
+                            // jittered directions inside the light's angular
+                            // cone. Sample stream starts BEYOND the AA sample
+                            // indices (s + rp.samples) so the two jitters are
+                            // decorrelated but both deterministic.
+                            float shadowT1 = length(Ph) + length(rp.boundingCentre.xyz)
+                                           + 2.0f * rp.boundingRadius + 2.0f * sp.roi;
+                            float visAccum = 0.0f;
+                            for (uint ss = 0; ss < rp.shadowSamples; ++ss) {
+                                float2 sj = sampleJitter(px, py, rp.samples + ss, rp.renderSeed);
+                                float3 srd = coneJitter(L, sp.lightSoft, sj);
+                                visAccum += (lightVisibility(Ph, srd, 1e-3f, shadowT1, hitIdx,
+                                                             0.0f, positions, radii,
+                                                             binStarts, particleIndices,
+                                                             occupancy, sp) > 0.0f) ? 1.0f : 0.0f;
+                            }
+                            float visPixel = visAccum / float(rp.shadowSamples);
+                            vis = mix(vis, visPixel, clamp(rp.shadows, 0.0f, 1.0f));
+                        }
+                        shade = 0.2f + 0.8f * ndl * vis;
                     }
-                    accum += float3(tint[hitIdx])
-                           * (rp.aoFloor + (1.0f - rp.aoFloor) * ao) * shade;
+                    float3 col = float3(tint[hitIdx])
+                               * (rp.aoFloor + (1.0f - rp.aoFloor) * ao) * shade;
+                    // V2.1 edge layer at the primary hit (F1 = own radius —
+                    // the hit point lies exactly on the sphere; F2 = nearest
+                    // other centre, grid query at the hit point).
+                    if (rp.edges > 0.0f) {
+                        float f2 = nearestCentreDistance(Ph, hitIdx, positions, binStarts, particleIndices, sp);
+                        col *= 1.0f - rp.edges * edgeFactor(f2 - rad, rad, rp.edgeWidth);
+                    }
+                    accum += col;
                 } else {
                     accum += rp.background.xyz;
                 }
             } else {
-                float dens = 0.0f;
+                float3 dens = float3(0.0);
                 traverseGrid(ro, rd, t0, t1, count, positions, radii, binStarts,
                              particleIndices, sp, rp.profileSupport,
-                             (uint)ceil(rp.profileSupport),
+                             (uint)ceil(rp.profileSupport), rp, tint,
                              false, &dummyF, &dummyU,
                              true, &dens);
                 bigCellPass(ro, rd, t0, t1, bigCells, rp.bigCount, positions, radii,
-                            rp.profileSupport, false, &dummyF, &dummyU, true, &dens);
+                            binStarts, particleIndices, sp, rp.profileSupport, rp, tint,
+                            false, &dummyF, &dummyU, true, &dens);
                 densAccum += dens;
             }
         }
@@ -2230,10 +2640,12 @@ enum Shaders {
         if (solid) {
             out = float4(accum / float(max(rp.samples, 1u)), 1.0f);
         } else {
-            float dens = densAccum / float(max(rp.samples, 1u)) * rp.densityScale;
-            float L = 1.0f - exp(-dens * rp.xrayExposure);
+            // V2.1: per-channel tone map (grayscale path accumulates the same
+            // scalar density in all three channels — bit-identical to M4).
+            float3 dens = densAccum / float(max(rp.samples, 1u)) * rp.densityScale;
+            float3 L = 1.0f - exp(-dens * rp.xrayExposure);
             L = pow(L, 1.0f / max(rp.xrayGamma, 1e-3f));
-            out = float4(L, L, L, 1.0f);
+            out = float4(L, 1.0f);
         }
         outTex.write(out, gid);
     }
@@ -2246,7 +2658,7 @@ enum Shaders {
     // Buffer table:
     //   0 out (write, 96 x float)   1 positions   2 radii   3 binStarts
     //   4 particleIndices   5 cellCounter   6 RenderParams   7 SimParams
-    //   8 bigCells (supplement)   9 probe pixel (2 x uint)
+    //   8 bigCells (supplement)   9 probe pixel (2 x uint)   10 tint (const)
     kernel void raytraceProbe(device float* out [[buffer(0)]],
                               device const float3* positions [[buffer(1)]],
                               device const float* radii [[buffer(2)]],
@@ -2257,6 +2669,7 @@ enum Shaders {
                               constant SimParams& sp [[buffer(7)]],
                               device const uint* bigCells [[buffer(8)]],
                               device const uint* probePixel [[buffer(9)]],
+                              device const float3* tint [[buffer(10)]],
                               uint gid [[thread_position_in_grid]])
     {
         if (gid != 0u) return;
@@ -2283,16 +2696,17 @@ enum Shaders {
 
         float nearest = INFINITY;
         uint hitIdx = 0u;
-        float dens = 0.0f;
+        float3 dens = float3(0.0);
         traverseGrid(ro, rd, t0, t1, count, positions, radii, binStarts,
                      particleIndices, sp, rp.profileSupport,
-                     (uint)ceil(rp.profileSupport),
+                     (uint)ceil(rp.profileSupport), rp, tint,
                      true, &nearest, &hitIdx, true, &dens);
         bigCellPass(ro, rd, t0, t1, bigCells, rp.bigCount, positions, radii,
-                    rp.profileSupport, true, &nearest, &hitIdx, true, &dens);
+                    binStarts, particleIndices, sp, rp.profileSupport, rp, tint,
+                    true, &nearest, &hitIdx, true, &dens);
         out[2] = nearest;
         out[3] = (float)hitIdx;
-        out[4] = dens;   // xray accumulation on the same ray (bonus diagnostic)
+        out[4] = dens.x;   // xray accumulation on the same ray (bonus diagnostic)
         if (nearest >= INFINITY) return;
         float3 C = float3(positions[hitIdx]);
         float rad = radii[hitIdx];

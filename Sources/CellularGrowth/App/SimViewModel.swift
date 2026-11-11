@@ -121,6 +121,12 @@ final class SimViewModel: ObservableObject, ViewInput {
     @Published var xrayGain: Double = 0.3 {
         didSet { renderer.xrayGain = Float(xrayGain) }
     }
+    /// V2.1 edge-layer strength (solid impostor path; 0 = off). Same value
+    /// the ray tracer's --edges uses — the wall blend is a render parameter,
+    /// not a style.
+    @Published var edges: Double = 0 {
+        didSet { renderer.edgeStrength = Float(edges) }
+    }
     // --- M6 presets (Core/Presets.swift) ---
     @Published var presetName: String? {
         didSet {

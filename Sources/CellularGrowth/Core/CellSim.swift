@@ -145,6 +145,14 @@ struct SimParams {
     /// (only ever taken over regions proven free of cells), and this flag is
     /// how that proof is checked in practice.
     var lightCoarseSkip: UInt32 = 1
+    // --- V2.1 (appended; struct grows 144 -> 148 bytes) ---
+    /// Light angular radius (radians) of the soft light disk: 0 = the legacy
+    /// binary lit/unlit verdict, > 0 = fractional per-cell visibility
+    /// (illuminate/lightVisibility). Shared by the growth illumination AND
+    /// the ray tracer's shadow-ray cone (one physical light). Default 0.35
+    /// (~20°): comparable to the angular radius of a typical blocking cell
+    /// one rest length away (~0.5 rad), so grazing blockers grade smoothly.
+    var lightSoft: Float = 0.35
 }
 
 enum ShaderError: Error {
@@ -169,8 +177,10 @@ final class CellSim {
     private let positionsA: MTLBuffer
     private let positionsB: MTLBuffer
     private let normalsBuffer: MTLBuffer
-    private let linksBuffer: MTLBuffer      // UInt32, [cell][maxValence]
-    private let linkCountsBuffer: MTLBuffer // UInt32 per cell
+    // links/linkCounts are internal (not private): the V2.1 impostor fragment
+    // reads the cell's ring for the edge layer (<= 16 neighbours per pixel).
+    let linksBuffer: MTLBuffer      // UInt32, [cell][maxValence]
+    let linkCountsBuffer: MTLBuffer // UInt32 per cell
     private let foodBuffer: MTLBuffer       // Float per cell
     private let rngBuffer: MTLBuffer        // UInt64 PCG32-style state per cell
     private let splitFlagsBuffer: MTLBuffer // UInt32 per cell (division claims)
@@ -203,10 +213,13 @@ final class CellSim {
     private let boundBuffer: MTLBuffer      // UInt32: atomic max |P|² accumulator
     /// M5 per-cell render colour (cellTint kernel; neutral albedo unless rde).
     let tintBuffer: MTLBuffer
-    /// M5 per-cell illumination verdict (illuminate kernel; 1 = lit). The ray
-    /// tracer's directional solid style shades with it — the render shows
-    /// exactly the cells the growth illuminated.
-    let litFlagsBuffer: MTLBuffer
+    /// V2.1 per-cell illumination FRACTION (illuminate kernel; 0 = fully
+    /// shaded, 1 = fully lit — the visible fraction of the soft light disk,
+    /// replacing the M5 binary litFlags). Consumers: the impostor fragment's
+    /// per-cell shadow factor and the ray tracer's directional solid style.
+    /// Filled with 1.0 (neutral) on reset/state-load so non-light runs render
+    /// exactly as before.
+    let litFractionBuffer: MTLBuffer
     // --- M6 light-march occupancy ---
     /// Coarse occupancy BITFIELD for the light march's empty-interior skip:
     /// one bit per hashed 8³-fine-bin coordinate block (FIXED 7-bit packed
@@ -317,8 +330,8 @@ final class CellSim {
 
         // Layout drift guard: the MSL SimParams mirror is appended-only; a
         // mismatch here corrupts every kernel silently.
-        precondition(MemoryLayout<SimParams>.size == 144,
-                     "SimParams layout drift: \(MemoryLayout<SimParams>.size) != 144 (see Shaders.swift)")
+        precondition(MemoryLayout<SimParams>.size == 148,
+                     "SimParams layout drift: \(MemoryLayout<SimParams>.size) != 148 (see Shaders.swift)")
 
         let f3 = MemoryLayout<SIMD3<Float>>.stride
         positionsA = device.makeBuffer(length: maxCells * f3, options: .storageModeShared)!
@@ -404,9 +417,9 @@ final class CellSim {
         tintBuffer = device.makeBuffer(length: maxCells * f3,
                                        options: .storageModeShared)!
         tintBuffer.label = "cellTint"
-        litFlagsBuffer = device.makeBuffer(length: maxCells * MemoryLayout<UInt32>.stride,
-                                           options: .storageModeShared)!
-        litFlagsBuffer.label = "litFlags"
+        litFractionBuffer = device.makeBuffer(length: maxCells * MemoryLayout<Float>.stride,
+                                              options: .storageModeShared)!
+        litFractionBuffer.label = "litFraction"
         // M6 coarse occupancy bitfield: 2^21 slots → 2^18 words = 256 KB.
         // Blit-cleared at every grid rebuild (256 KB ≈ microseconds).
         occupancyBuffer = device.makeBuffer(
@@ -417,8 +430,15 @@ final class CellSim {
         memset(nutrientA.contents(), 0, nutrientA.length)
         memset(nutrientB.contents(), 0, nutrientB.length)
         memset(boundBuffer.contents(), 0, boundBuffer.length)
-        memset(litFlagsBuffer.contents(), 0, litFlagsBuffer.length)
+        fillLitFraction(1.0, count: maxCells)   // neutral: no illumination verdict yet
         memset(occupancyBuffer.contents(), 0, occupancyBuffer.length)
+    }
+
+    /// Fill the first `count` entries of litFractionBuffer with `value`
+    /// (host-side; 1.0 = neutral/unshadowed — the non-light default).
+    private func fillLitFraction(_ value: Float, count: Int) {
+        let p = litFractionBuffer.contents().assumingMemoryBound(to: Float.self)
+        for i in 0..<count { p[i] = value }
     }
 
     // MARK: - Setup
@@ -502,7 +522,7 @@ final class CellSim {
         memset(nutrientA.contents(), 0, nutrientA.length)
         memset(nutrientB.contents(), 0, nutrientB.length)
         memset(boundBuffer.contents(), 0, boundBuffer.length)
-        memset(litFlagsBuffer.contents(), 0, litFlagsBuffer.length)
+        fillLitFraction(1.0, count: cellCount)   // neutral until the first light march
 
         guard let cb = queue.makeCommandBuffer() else { fatalError("no command buffer") }
         encodeNormals(cb, width: cellCount)
@@ -1010,7 +1030,7 @@ final class CellSim {
         enc.setBuffer(boundBuffer, offset: 0, index: 5)
         enc.setBuffer(counterBuffer, offset: 0, index: 6)
         enc.setBuffer(paramsBuffer, offset: 0, index: 7)
-        enc.setBuffer(litFlagsBuffer, offset: 0, index: 8)
+        enc.setBuffer(litFractionBuffer, offset: 0, index: 8)
         enc.setBuffer(occupancyBuffer, offset: 0, index: 9)   // M6 coarse occupancy skip
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
@@ -1085,15 +1105,15 @@ final class CellSim {
         cb.waitUntilCompleted()
     }
 
-    /// Recompute the per-cell illumination verdicts (litFlags) for the CURRENT
-    /// state — render-time use for loaded states (a state snapshot stores
-    /// geometry, not litFlags; the directional solid style needs the verdict
-    /// the growth's last step produced). Runs boundMax + illuminate + clearBound
-    /// at the exact cell count; host must be in sync (GPU idle). CONTRACT: the
-    /// caller must rebuild the grid (encodeGridRebuild — which also refreshes
-    /// the M6 coarse occupancy the march skips on) in the SAME or an earlier
-    /// command buffer. The nutrient side effect (one decay+production pass) is
-    /// harmless at render time.
+    /// Recompute the per-cell illumination FRACTIONS (litFraction) for the
+    /// CURRENT state — render-time use for loaded states (a state snapshot
+    /// stores geometry, not the illumination; the directional solid style
+    /// needs the fractions the growth's last step produced). Runs boundMax +
+    /// illuminate + clearBound at the exact cell count; host must be in sync
+    /// (GPU idle). CONTRACT: the caller must rebuild the grid
+    /// (encodeGridRebuild — which also refreshes the M6 coarse occupancy the
+    /// march skips on) in the SAME or an earlier command buffer. The nutrient
+    /// side effect (one decay+production pass) is harmless at render time.
     func encodeIlluminationRefresh(_ cb: MTLCommandBuffer) {
         guard cellCount > 0 else { return }
         encodeBoundMax(cb, width: cellCount)
@@ -1266,7 +1286,9 @@ final class CellSim {
     //            the sim needs to CONTINUE exactly where it left off:
     //              food (N x f32) | nutrient (N x f32) | chemU (N x f32)
     //            | chemV (N x f32) | tint (N x 16 B) | rngState (N x u64)
-    //            | SimParams (128 B raw)
+    //            | SimParams (raw, appended-only: 128 B comment from v3's first
+    //            |   draft was wrong — M6 files carry 144 B, V2.1+ files 148 B;
+    //            |   the reader accepts both and prefixes into the struct)
     //            Loaded WITHOUT reset(): buffers installed directly, normals/
     //            radii/tint recomputed (deterministic functions of the state).
     //
@@ -1373,13 +1395,19 @@ final class CellSim {
             throw StateSnapshotError.maxValenceMismatch(maxValence)
         }
         let baseSize = 16 + count * (MemoryLayout<SIMD3<Float>>.stride + maxValence * 4 + 4)
-        let v3Size = baseSize + count * (4 * 4 + MemoryLayout<Float>.stride * 4
-                                         + MemoryLayout<UInt64>.stride)
-                     + MemoryLayout<SimParams>.size
+        let v3Payload = count * (4 * 4 + MemoryLayout<Float>.stride * 4
+                                 + MemoryLayout<UInt64>.stride)
+        let v3Size = baseSize + v3Payload + MemoryLayout<SimParams>.size
+        // V2.1: SimParams grew 144 -> 148 bytes (lightSoft appended). M6-era
+        // v3 files carry a 144-byte raw SimParams block; the appended-only
+        // layout makes the prefix compatible, so the reader accepts both and
+        // leaves fields the file predates at their struct defaults (the read
+        // below copies only the bytes present).
+        let v3SizeLegacy = baseSize + v3Payload + 144
         let expected = version == 2 ? baseSize + 56      // v2 block: 1 uint + 13 floats
                      : version == 3 ? v3Size
                      : baseSize
-        guard data.count == expected else {
+        guard data.count == expected || (version == 3 && data.count == v3SizeLegacy) else {
             throw StateSnapshotError.sizeMismatch(path: path, got: data.count, expected: expected)
         }
 
@@ -1494,7 +1522,7 @@ final class CellSim {
     /// positions/links/counts/food/nutrient/u/v/tint/rng + params, then
     /// recompute the derived per-cell data (normals, radii, tint) in a waited
     /// command buffer. Derived state that only render paths consume
-    /// (litFlags) is zeroed — directional renders call
+    /// (litFraction) is neutralized to 1.0 — directional renders call
     /// encodeIlluminationRefresh, and the next light-mode step re-marches.
     private func installFullState(positions: [SIMD3<Float>], flatLinks: [UInt32],
                                   counts: [UInt32], food: [Float], nutrient: [Float],
@@ -1528,7 +1556,7 @@ final class CellSim {
         copy(rng, to: rngBuffer)
         counterBuffer.contents().assumingMemoryBound(to: UInt32.self)[0] = UInt32(cellCount)
         memset(boundBuffer.contents(), 0, boundBuffer.length)
-        memset(litFlagsBuffer.contents(), 0, litFlagsBuffer.length)
+        fillLitFraction(1.0, count: cellCount)   // neutral until encodeIlluminationRefresh
 
         // Derived per-cell data: normals + radii + tint (tint is a pure
         // function of u/v/growthMode, so recomputing it reproduces the saved

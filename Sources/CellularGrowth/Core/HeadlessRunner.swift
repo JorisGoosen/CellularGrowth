@@ -48,6 +48,10 @@ enum HeadlessRunner {
             || args.contains("--anim-frames")
             || args.contains("--stereo") || args.contains("--interocular")
             || args.contains("--screenshot-style")
+            // --- V2.1 (pitfall 10: every new flag routes to the headless path) ---
+            || args.contains("--edges") || args.contains("--edge-width")
+            || args.contains("--shadows") || args.contains("--xray-color")
+            || args.contains("--light-soft")
     }
 
     struct Options {
@@ -109,6 +113,12 @@ enum HeadlessRunner {
         var stereo = false         // ray tracer: side-by-side stereo pair
         var interocular: Float = 0.03  // eye separation as a fraction of the scene scale
         var screenshotStyle = "solid"  // raster screenshot style: solid | xray (impostor)
+        // --- V2.1 ---
+        var edges: Float = 0           // edge-layer strength (0 = off, default)
+        var edgeWidth: Float = 0.12    // wall width in cell radii
+        var shadows: Float = 1.0       // per-pixel shadow strength (directional solid)
+        var xrayColor = false          // coloured X-ray (per-channel tinted density)
+        var lightSoft: Float = 0.35    // light angular radius (rad); 0 = binary verdict
     }
 
     private static func parseOptions() -> Options {
@@ -226,6 +236,12 @@ enum HeadlessRunner {
             case "--interocular": o.interocular = Float(value("--interocular") ?? "") ?? o.interocular
             case "--screenshot-style":
                 o.screenshotStyle = (value("--screenshot-style") ?? "solid").lowercased()
+            // --- V2.1 ---
+            case "--edges": o.edges = Float(value("--edges") ?? "") ?? o.edges
+            case "--edge-width": o.edgeWidth = Float(value("--edge-width") ?? "") ?? o.edgeWidth
+            case "--shadows": o.shadows = Float(value("--shadows") ?? "") ?? o.shadows
+            case "--xray-color": o.xrayColor = true
+            case "--light-soft": o.lightSoft = Float(value("--light-soft") ?? "") ?? o.lightSoft
             default: break
             }
         }
@@ -300,6 +316,10 @@ enum HeadlessRunner {
         if ProcessInfo.processInfo.environment["CG_NO_COARSE_SKIP"] != nil {
             sim.params.lightCoarseSkip = 0
         }
+        // V2.1 fractional illumination softness (light angular radius in
+        // radians; 0 = the legacy binary verdict). Clamped to a sane range:
+        // the coverage ramp degenerates for lightSoft >= pi.
+        sim.params.lightSoft = min(max(o.lightSoft, 0), 1.5)
 
         if o.rdeProbe {
             runRdeProbe(queue: queue, sim: sim, o: o)   // exits
@@ -723,7 +743,8 @@ enum HeadlessRunner {
             if o.screenshotStyle != "solid" && o.screenshotStyle != "xray" {
                 print("--screenshot-style '\(o.screenshotStyle)' unknown; using solid")
             }
-            renderScreenshot(sim: sim, queue: queue, to: path, style: o.screenshotStyle)
+            renderScreenshot(sim: sim, queue: queue, to: path, style: o.screenshotStyle,
+                             edgeStrength: max(o.edges, 0), edgeWidth: max(o.edgeWidth, 1e-3))
         }
 
         exit(0)
@@ -754,9 +775,9 @@ enum HeadlessRunner {
         // Fresh radii (daughters from the final step) + one grid rebuild for
         // the final state, in a single waited command buffer. States rendered
         // with the DIRECTIONAL unified light additionally recompute the
-        // per-cell illumination verdicts (litFlags) — a state snapshot stores
-        // geometry, not lit flags. The light mode is decided BEFORE the prep
-        // CB so the refresh can be encoded into it.
+        // per-cell illumination fractions (litFraction) — a state snapshot
+        // stores geometry, not the illumination. The light mode is decided
+        // BEFORE the prep CB so the refresh can be encoded into it.
         let sharedLight = SIMD3<Float>(sim.params.lightDirX, sim.params.lightDirY, sim.params.lightDirZ)
         var directional: SIMD3<Float>? = nil
         switch o.renderLight {
@@ -790,12 +811,23 @@ enum HeadlessRunner {
         if o.style != "solid" && o.style != "xray" {
             print("--style '\(o.style)' unknown; using solid")
         }
-        // M5 unified light: decided above (before the prep CB, so litFlags can
-        // be refreshed in it). X-ray has no lighting — unaffected.
+        // M5 unified light: decided above (before the prep CB, so the
+        // illumination fractions can be refreshed in it). X-ray has no
+        // lighting — unaffected.
         settings.directionalLight = directional
         settings.width = o.width
         settings.height = o.height
         settings.samples = o.samples
+        // V2.1 render knobs (--edges/--edge-width/--shadows/--xray-color; the
+        // CG_* env overrides exist for look iteration and bench A/B without
+        // touching the CLI contract — goldens record their explicit values).
+        settings.edges = max(o.edges, 0)
+        settings.edgeWidth = max(o.edgeWidth, 1e-3)
+        settings.shadows = max(o.shadows, 0)
+        settings.xrayColored = o.xrayColor
+        if let es = ProcessInfo.processInfo.environment["CG_SHADOW_SAMPLES"], let n = Int(es) {
+            settings.shadowSamples = max(0, min(n, 64))
+        }
         if o.tiled {
             print("--tiled: tiling is always applied (RayRenderer.tileSize = \(RayRenderer.tileSize)²); the flag is an explicit marker")
         }
@@ -898,6 +930,11 @@ enum HeadlessRunner {
         settings.width = o.width
         settings.height = o.height
         settings.samples = o.samples
+        // V2.1: the animation honours the same render knobs as --render.
+        settings.edges = max(o.edges, 0)
+        settings.edgeWidth = max(o.edgeWidth, 1e-3)
+        settings.shadows = max(o.shadows, 0)
+        settings.xrayColored = o.xrayColor
         // M6: the animation honours --render-light exactly like --render
         // (auto = directional only in light-growth mode). For paper-style
         // artefacts pass --render-light unbiased.
@@ -1315,6 +1352,13 @@ enum HeadlessRunner {
                 + "xrayExposure=\(fmt(r.xrayExposure));xrayGamma=\(fmt(r.xrayGamma));densityScale=\(fmt(r.densityScale));"
                 + "profileSupport=\(fmt(r.profileSupport));snapshot=\(r.snapshot ? 1 : 0);"
                 + "aaSeed=\(r.seed)"
+                if let v = r.v21 {
+                    s += ";v21=1;growth=\(v.growth);food=\(fmt(v.food));threshold=\(fmt(v.threshold));"
+                    + "rdeF=\(fmt(v.rdeF));rdeK=\(fmt(v.rdeK));rdeDu=\(fmt(v.rdeDu));rdeDv=\(fmt(v.rdeDv));"
+                    + "rdeBase=\(fmt(v.rdeBase));rdeGain=\(fmt(v.rdeGain));renderLight=\(v.renderLight);"
+                    + "edges=\(fmt(v.edges));edgeWidth=\(fmt(v.edgeWidth));shadows=\(fmt(v.shadows));"
+                    + "shadowSamples=\(v.shadowSamples);xrayColor=\(v.xrayColor ? 1 : 0);lightSoft=\(fmt(v.lightSoft))"
+                }
             }
             return s
         }
@@ -1344,6 +1388,33 @@ enum HeadlessRunner {
         var profileSupport: Float
         var snapshot: Bool
         var seed: UInt32           // AA jitter seed (every pixel-affecting knob is recorded)
+        // --- V2.1 (nil for pre-V2.1 metas: their canonical string and hash
+        // must stay byte-identical, so the new keys are only appended when a
+        // V2.1 capture declares any non-default V2.1 knob) ---
+        var v21: RenderGoldenV21? = nil
+    }
+
+    /// V2.1 golden knobs: the new render flags + the growth config the
+    /// capture grew with. Snapshot replays make the growth keys pure
+    /// provenance (the CHECK loads the stored state); the render light and
+    /// lightSoft must be reproduced exactly (they shape the image).
+    struct RenderGoldenV21 {
+        var growth: String        // uniform | light | rde (capture-time growth mode)
+        var food: Float
+        var threshold: Float
+        var rdeF: Float
+        var rdeK: Float
+        var rdeDu: Float
+        var rdeDv: Float
+        var rdeBase: Float
+        var rdeGain: Float
+        var renderLight: String   // auto | growth | unbiased
+        var edges: Float
+        var edgeWidth: Float
+        var shadows: Float
+        var shadowSamples: Int
+        var xrayColor: Bool
+        var lightSoft: Float
     }
 
     /// FNV-1a 64-bit over the canonical config string (the meta's config hash).
@@ -1408,6 +1479,25 @@ enum HeadlessRunner {
             lines.append("profileSupport=\(f(r.profileSupport))")
             lines.append("snapshot=\(r.snapshot ? 1 : 0)")
             lines.append("aaSeed=\(r.seed)")
+            if let v = r.v21 {
+                lines.append("v21=1")
+                lines.append("growth=\(v.growth)")
+                lines.append("food=\(f(v.food))")
+                lines.append("threshold=\(f(v.threshold))")
+                lines.append("rdeF=\(f(v.rdeF))")
+                lines.append("rdeK=\(f(v.rdeK))")
+                lines.append("rdeDu=\(f(v.rdeDu))")
+                lines.append("rdeDv=\(f(v.rdeDv))")
+                lines.append("rdeBase=\(f(v.rdeBase))")
+                lines.append("rdeGain=\(f(v.rdeGain))")
+                lines.append("renderLight=\(v.renderLight)")
+                lines.append("edges=\(f(v.edges))")
+                lines.append("edgeWidth=\(f(v.edgeWidth))")
+                lines.append("shadows=\(f(v.shadows))")
+                lines.append("shadowSamples=\(v.shadowSamples)")
+                lines.append("xrayColor=\(v.xrayColor ? 1 : 0)")
+                lines.append("lightSoft=\(f(v.lightSoft))")
+            }
         }
         try lines.joined(separator: "\n").appending("\n").write(toFile: goldenMetaPath(name), atomically: true, encoding: .utf8)
     }
@@ -1449,6 +1539,27 @@ enum HeadlessRunner {
                                           xrayGamma: xrayGamma, densityScale: densityScale,
                                           profileSupport: profileSupport, snapshot: snapshot != 0,
                                           seed: UInt32(aaSeed))
+            // V2.1 block: present only when the meta carries the marker.
+            if kv["v21"] == "1" {
+                let v21 = RenderGoldenV21(
+                    growth: kv["growth"] ?? "uniform",
+                    food: f("food") ?? 0.01,
+                    threshold: f("threshold") ?? 1.0,
+                    rdeF: f("rdeF") ?? 0.037,
+                    rdeK: f("rdeK") ?? 0.06,
+                    rdeDu: f("rdeDu") ?? 0.35,
+                    rdeDv: f("rdeDv") ?? 0.15,
+                    rdeBase: f("rdeBase") ?? 0.25,
+                    rdeGain: f("rdeGain") ?? 2.5,
+                    renderLight: kv["renderLight"] ?? "auto",
+                    edges: f("edges") ?? 0,
+                    edgeWidth: f("edgeWidth") ?? 0.12,
+                    shadows: f("shadows") ?? 1.0,
+                    shadowSamples: i("shadowSamples") ?? 4,
+                    xrayColor: (i("xrayColor") ?? 0) != 0,
+                    lightSoft: f("lightSoft") ?? 0.35)
+                render!.v21 = v21
+            }
         }
         return GoldenConfig(steps: steps, subdiv: subdiv, jitter: jitter, spring: spring,
                             planar: planar, bulge: bulge, roi: roi, repulsion: repulsion,
@@ -1480,6 +1591,7 @@ enum HeadlessRunner {
         sim.params.lightDecay = 0.02
         sim.params.lightBase = 0.15
         sim.params.lightInterval = 8
+        sim.params.lightSoft = 0.35
         sim.params.rdeF = 0.037
         sim.params.rdeK = 0.06
         sim.params.rdeDu = 0.35
@@ -1526,6 +1638,19 @@ enum HeadlessRunner {
             sim.params.repulsionStrength = cfg.repulsion
             sim.params.rngSeed = cfg.seed
             sim.params.maxCells = UInt32(r.maxCells)
+            // V2.1 capture-time growth config (provenance keys from the meta;
+            // a snapshot replay ignores these — the state file carries it).
+            if let v = r.v21 {
+                sim.params.growthMode = ["uniform", "light", "rde"].firstIndex(of: v.growth).map(UInt32.init) ?? 0
+                sim.params.foodIncrement = v.food
+                sim.params.splitThreshold = v.threshold
+                sim.params.rdeF = v.rdeF
+                sim.params.rdeK = v.rdeK
+                sim.params.rdeDu = v.rdeDu
+                sim.params.rdeDv = v.rdeDv
+                sim.params.rdeBase = v.rdeBase
+                sim.params.rdeGain = v.rdeGain
+            }
             sim.syncParams()
 
             let (base, links) = Icosphere.generate(subdivisions: cfg.subdiv, spacing: sim.params.linkRestLength)
@@ -1536,9 +1661,25 @@ enum HeadlessRunner {
 
         // M4 ray-traced golden: fresh radii + ONE grid rebuild for the final
         // state (the renderer traverses the static hash), then the tile loop.
+        // V2.1: the render light for the new goldens (legacy goldens stay
+        // unbiased); directional renders refresh the per-cell illumination
+        // FRACTIONS in the same prep CB (after the grid rebuild — the march
+        // traverses it). lightSoft drives both the fractional illumination
+        // and the shadow-ray cone.
+        sim.params.lightSoft = r.v21?.lightSoft ?? 0.35
+        sim.syncParams()
+        var directional: SIMD3<Float>? = nil
+        if let v = r.v21, v.renderLight == "growth" {
+            directional = simd_normalize(SIMD3<Float>(sim.params.lightDirX,
+                                                      sim.params.lightDirY,
+                                                      sim.params.lightDirZ))
+        }
         if let cb = queue.makeCommandBuffer() {
             sim.refreshRadii(cb)
             sim.encodeGridRebuild(cb)
+            if directional != nil {
+                sim.encodeIlluminationRefresh(cb)
+            }
             cb.commit()
             cb.waitUntilCompleted()
             if let e = cb.error { print("golden render prep CB ERROR: \(e)") }
@@ -1556,7 +1697,7 @@ enum HeadlessRunner {
 
         var settings = RayRenderSettings()
         settings.style = r.style == "xray" ? .xray : .solid
-        settings.directionalLight = nil   // goldens keep the unbiased look (M5 unified light)
+        settings.directionalLight = directional   // legacy goldens: nil (unbiased look)
         settings.width = cfg.width
         settings.height = cfg.height
         settings.samples = r.samples
@@ -1568,6 +1709,15 @@ enum HeadlessRunner {
         settings.densityScale = r.densityScale
         settings.profileSupport = r.profileSupport
         settings.seed = r.seed
+        // V2.1 golden render knobs (recorded in the meta; all defaults for
+        // legacy goldens — byte-identical path).
+        if let v = r.v21 {
+            settings.edges = v.edges
+            settings.edgeWidth = v.edgeWidth
+            settings.shadows = v.shadows
+            settings.shadowSamples = v.shadowSamples
+            settings.xrayColored = v.xrayColor
+        }
         // Same framing convention as --render/--screenshot.
         var maxAbs: Float = 0
         for p in sim.readPositions() { maxAbs = max(maxAbs, simd_length(p)) }
@@ -1587,13 +1737,32 @@ enum HeadlessRunner {
         var render: RenderGoldenSettings? = nil
         if o.styleGiven {
             let d = RayRenderSettings()
+            // V2.1: attach the new knob block ONLY when any of it is
+            // non-default — legacy metas' canonical strings (and config
+            // hashes) must stay byte-identical.
+            let shadowSamples = ProcessInfo.processInfo.environment["CG_SHADOW_SAMPLES"]
+                .flatMap { Int($0) } ?? d.shadowSamples
+            let v21Active = o.edges > 0 || o.edgeWidth != 0.12 || o.shadows != 1.0
+                || o.xrayColor || o.lightSoft != 0.35 || o.renderLight != "auto"
+                || o.growth != "uniform" || o.food != 0.01 || o.threshold != 1.0
+                || o.rdeF != 0.037 || o.rdeK != 0.06 || o.rdeDu != 0.35
+                || o.rdeDv != 0.15 || o.rdeBase != 0.25 || o.rdeGain != 2.5
+            let v21: RenderGoldenV21? = v21Active
+                ? RenderGoldenV21(growth: o.growth, food: o.food, threshold: o.threshold,
+                                  rdeF: o.rdeF, rdeK: o.rdeK, rdeDu: o.rdeDu, rdeDv: o.rdeDv,
+                                  rdeBase: o.rdeBase, rdeGain: o.rdeGain,
+                                  renderLight: o.renderLight, edges: o.edges,
+                                  edgeWidth: o.edgeWidth, shadows: o.shadows,
+                                  shadowSamples: shadowSamples, xrayColor: o.xrayColor,
+                                  lightSoft: o.lightSoft)
+                : nil
             render = RenderGoldenSettings(style: o.style, samples: o.samples,
                                           maxCells: o.maxCells, division: o.division,
                                           aoRadius: d.aoRadius, aoStrength: d.aoStrength,
                                           aoFloor: d.aoFloor, xrayExposure: d.xrayExposure,
                                           xrayGamma: d.xrayGamma, densityScale: d.densityScale,
                                           profileSupport: d.profileSupport,
-                                          snapshot: true, seed: d.seed)
+                                          snapshot: true, seed: d.seed, v21: v21)
         }
         let cfg = GoldenConfig(steps: o.steps, subdiv: o.subdiv, jitter: o.jitter,
                                spring: o.spring, planar: o.planar, bulge: o.bulge,
@@ -1757,8 +1926,18 @@ enum HeadlessRunner {
             }
         }
         let lightMetrics = lightGradientStats(sim: sim)
-        print("   light gradient: facing=\(String(format: "%.3f", lightMetrics.facing)) away=\(String(format: "%.3f", lightMetrics.away)) ratio=\(String(format: "%.2f", lightMetrics.ratio)) \(lightMetrics.ratio > 1.2 ? "PASS" : "FAIL") (gate > 1.2)")
-        if !(lightMetrics.ratio > 1.2) { allPass = false }
+        // V2.1 gate recalibration (measured, documented — NOT lowered): the
+        // fractional soft light (lightSoft 0.35) compresses the facing/away
+        // nutrient ratio by design — partially shaded cells now receive a
+        // partial nutrient flux instead of a hard 0. Measured on this exact
+        // config: binary (lightSoft 0) ratio ~10.7, fractional ratio 2.07
+        // (selftest) / 2.15 (headless, same config). The old gate (> 1.2)
+        // was calibrated for the binary verdict's ~10x ratio; at the new
+        // operating point it would pass even a badly degraded gradient.
+        // Raised to > 1.5: still well below the measured 2.07 (38% margin),
+        // and it keeps asserting that a clear lit/dark gradient EXISTS.
+        print("   light gradient: facing=\(String(format: "%.3f", lightMetrics.facing)) away=\(String(format: "%.3f", lightMetrics.away)) ratio=\(String(format: "%.2f", lightMetrics.ratio)) \(lightMetrics.ratio > 1.5 ? "PASS" : "FAIL") (gate > 1.5, V2.1 recalibrated for the fractional light)")
+        if !(lightMetrics.ratio > 1.5) { allPass = false }
 
         // --- Phase D: growth under the RDE mode (M5) ---
         sim.params.growthMode = 2
@@ -1958,13 +2137,18 @@ enum HeadlessRunner {
     /// (the historical depth-tested impostors) or "xray" (the M6 additive
     /// density-sprite impostors — the interactive X-ray, NOT the ray tracer).
     /// Goldens always pass "solid" (default), so their pixels are unchanged.
+    /// V2.1: edgeStrength/edgeWidth plumb the --edges/--edge-width flags into
+    /// the impostor fragment (goldens keep the 0 default — byte-identical).
     private static func renderToBytes(sim: CellSim, queue: MTLCommandQueue, width: Int, height: Int,
-                                      style: String = "solid") -> [UInt8] {
+                                      style: String = "solid",
+                                      edgeStrength: Float = 0, edgeWidth: Float = 0.12) -> [UInt8] {
         let device = sim.device
 
         let renderer = Renderer(device: device, queue: queue, sim: sim)
         renderer.isPlaying = false
         renderer.renderStyle = style == "xray" ? .xray : .solid
+        renderer.edgeStrength = edgeStrength
+        renderer.edgeWidth = edgeWidth
         let ballRadius = sim.readPositions().map { simd_length($0) }.max() ?? 1
         renderer.camera.distance = ballRadius * 2.6
 
@@ -2005,11 +2189,13 @@ enum HeadlessRunner {
 
     private static func renderScreenshot(sim: CellSim, queue: MTLCommandQueue, to path: String,
                                          width: Int = 1600, height: Int = 1200,
-                                         style: String = "solid") {
-        let bytes = renderToBytes(sim: sim, queue: queue, width: width, height: height, style: style)
+                                         style: String = "solid",
+                                         edgeStrength: Float = 0, edgeWidth: Float = 0.12) {
+        let bytes = renderToBytes(sim: sim, queue: queue, width: width, height: height, style: style,
+                                  edgeStrength: edgeStrength, edgeWidth: edgeWidth)
         do {
             try writePNG(bytes, width: width, height: height, to: path)
-            print("Screenshot written: \(path) (\(style == "xray" ? "impostor X-ray" : "solid"))")
+            print("Screenshot written: \(path) (\(style == "xray" ? "impostor X-ray" : "solid")\(edgeStrength > 0 ? ", edges \(edgeStrength)" : ""))")
         } catch {
             print("Screenshot failed: \(error)")
         }

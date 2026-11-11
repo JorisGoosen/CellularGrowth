@@ -52,6 +52,7 @@ struct ContentView: View {
                 if vm.renderStyle == .xray {
                     slider("X-ray gain", $vm.xrayGain, 0.05...2)
                 }
+                slider("Edges", $vm.edges, 0...1)
             }
 
             GroupBox("State") {

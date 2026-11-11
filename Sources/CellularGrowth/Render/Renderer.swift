@@ -9,7 +9,7 @@ import Metal
 import MetalKit
 import simd
 
-/// Must mirror MSL `struct Camera` (208 bytes: 192 + the M6 xrayPad float4).
+/// Must mirror MSL `struct Camera` (224 bytes: 208 + the V2.1 edgePad float4).
 struct CameraUniforms {
     var view: simd_float4x4
     var proj: simd_float4x4
@@ -18,6 +18,7 @@ struct CameraUniforms {
     var negFwd: SIMD4<Float>
     var lightDir: SIMD4<Float>
     var xrayPad: SIMD4<Float>   // M6: .x = interactive X-ray exposure gain
+    var edgePad: SIMD4<Float>   // V2.1: .x = edge strength, .y = edge width (x radius)
 }
 
 final class Renderer: NSObject, MTKViewDelegate {
@@ -44,6 +45,12 @@ final class Renderer: NSObject, MTKViewDelegate {
     /// the offline X-ray of the same grown state (M6 report): 0.3 keeps dense
     /// knots from saturating to flat white while dim regions still read.
     var xrayGain: Float = 0.3
+    // --- V2.1 edge layer (solid impostor path; 0 = off — the default keeps
+    // the M3 raster goldens byte-identical) ---
+    /// Edge strength: darkens the surface near the walls with ring neighbours.
+    var edgeStrength: Float = 0
+    /// Wall width in cell radii (band fades over edgeWidth × radius).
+    var edgeWidth: Float = 0.12
 
     var camera = OrbitCamera()
 
@@ -194,7 +201,8 @@ final class Renderer: NSObject, MTKViewDelegate {
             up: SIMD4(up, 0),
             negFwd: SIMD4(-fwd, 0),
             lightDir: SIMD4(light, 0),
-            xrayPad: SIMD4(xrayGain, 0, 0, 0)
+            xrayPad: SIMD4(xrayGain, 0, 0, 0),
+            edgePad: SIMD4(edgeStrength, edgeWidth, 0, 0)
         )
         withUnsafeBytes(of: &u) { src in
             cameraBuffer.contents().copyMemory(from: src.baseAddress!,
@@ -224,6 +232,14 @@ final class Renderer: NSObject, MTKViewDelegate {
         enc.setVertexBuffer(cameraBuffer, offset: 0, index: 2)
         enc.setVertexBuffer(sim.tintBuffer, offset: 0, index: 3)   // M5 per-cell colour
         enc.setFragmentBuffer(cameraBuffer, offset: 0, index: 0)
+        // V2.1 fragment-side edge layer + per-cell fractional shadow:
+        // positions/links/linkCounts (ring queries), litFraction (illuminate),
+        // params (maxValence stride).
+        enc.setFragmentBuffer(sim.positionsBuffer, offset: 0, index: 1)
+        enc.setFragmentBuffer(sim.linksBuffer, offset: 0, index: 2)
+        enc.setFragmentBuffer(sim.linkCountsBuffer, offset: 0, index: 3)
+        enc.setFragmentBuffer(sim.litFractionBuffer, offset: 0, index: 4)
+        enc.setFragmentBuffer(sim.paramsBuffer, offset: 0, index: 5)
         enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: sim.cellCount)
         enc.endEncoding()
     }

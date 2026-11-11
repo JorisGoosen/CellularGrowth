@@ -87,13 +87,32 @@ struct RayRenderSettings {
     /// Lateral eye offset in world units (set internally per eye; do not set
     /// by hand).
     var eyeShift: SIMD3<Float> = .zero
+    // --- V2.1 ---
+    /// Edge-layer strength (0 = off, default). At every primary hit (solid)
+    /// or per contributing sphere (xray): darken where the query point is
+    /// near the wall with a neighbouring cell. Blend parameter, not a style.
+    var edges: Float = 0
+    /// Wall width in cell RADII: the darkening band fades over
+    /// edgeWidth × radius (size-invariant across a grown structure).
+    var edgeWidth: Float = 0.12
+    /// Per-pixel shadow strength in DIRECTIONAL solid mode (0 = shade with
+    /// the per-cell illumination fraction only, no shadow rays; 1 = full
+    /// per-pixel penumbra). Shadows exist ONLY under the directional light —
+    /// unbiased renders never trace shadow rays (M4 goldens byte-identical).
+    var shadows: Float = 1.0
+    /// Jittered shadow rays per hit pixel (4–8; cost ~ linear).
+    var shadowSamples: Int = 4
+    /// Coloured X-ray: per-channel tinted density (contribution = the cell's
+    /// tint × its density term, tone mapped per channel). false = the legacy
+    /// grayscale accumulation (bit-identical to M4).
+    var xrayColored: Bool = false
 }
 
 /// Must mirror MSL `struct RenderParams` (Shaders.raytrace) EXACTLY.
 /// float4 members on both sides so there is no float3-in-struct alignment
 /// ambiguity (Swift SIMD3<Float> aligns to 16; MSL float3 struct layout is a
 /// documented trap). 20 scalar fields (80 B) + 8 float4 (128 B) + 2 uint (8 B)
-/// = 216 bytes.
+/// = 216 bytes, + the V2.1 tail (6 x 4 B) = 240 bytes.
 /// Render-only uniform block — deliberately NOT appended to SimParams (that
 /// struct is the simulation contract; render tuning changes freely here).
 struct RayRenderParams {
@@ -127,6 +146,13 @@ struct RayRenderParams {
     var lightDir = SIMD4<Float>(0, 1, 0, 0)          // M5 unified light (unit, toward the light)
     var directionalLight: UInt32 = 0                 // M5: 0 unbiased (default), 1 shared directional
     var pad3: UInt32 = 0
+    // --- V2.1 (appended) ---
+    var edges: Float = 0            // edge-layer strength (0 = off)
+    var edgeWidth: Float = 0.12     // wall width in cell radii
+    var shadows: Float = 1.0        // per-pixel shadow strength (directional only)
+    var shadowSamples: UInt32 = 4   // jittered shadow rays per hit pixel
+    var xrayColored: UInt32 = 0     // 0 grayscale (legacy), 1 per-channel tinted
+    var pad4: UInt32 = 0
 }
 
 // MSL's .xyz swizzle for the float4 members of RayRenderParams.
@@ -154,7 +180,7 @@ final class RayRenderer {
     private var bigCellsBuffer: MTLBuffer!
 
     /// Expected byte size of RayRenderParams (guards layout drift).
-    private static let paramsSize = 216
+    private static let paramsSize = 240
 
     init(device: MTLDevice, queue: MTLCommandQueue, sim: CellSim) {
         self.device = device
@@ -245,6 +271,12 @@ final class RayRenderer {
         p.camFwd = SIMD4(fwd, 0)
         p.boundingCentre = SIMD4(centre, 1)
         p.albedo = SIMD4(settings.albedo, 0)
+        // V2.1 render knobs.
+        p.edges = settings.edges
+        p.edgeWidth = settings.edgeWidth
+        p.shadows = settings.shadows
+        p.shadowSamples = UInt32(max(0, settings.shadowSamples))
+        p.xrayColored = settings.xrayColored ? 1 : 0
         // M5 unified light: nil = unbiased (paper default); otherwise shade
         // with the shared growth light direction.
         if let dl = settings.directionalLight {
@@ -405,7 +437,8 @@ final class RayRenderer {
                 enc.setBuffer(sim.paramsBuffer, offset: 0, index: 6)
                 enc.setBuffer(bigCellsBuffer, offset: 0, index: 7)
                 enc.setBuffer(sim.tintBuffer, offset: 0, index: 8)   // M5 per-cell colour
-                enc.setBuffer(sim.litFlagsBuffer, offset: 0, index: 9)   // M5 illumination verdicts
+                enc.setBuffer(sim.litFractionBuffer, offset: 0, index: 9)   // V2.1 illumination fractions
+                enc.setBuffer(sim.occupancyBuffer, offset: 0, index: 10)   // M6 coarse skip (shadow marches)
                 enc.dispatchThreads(MTLSize(width: tw, height: th, depth: 1),
                                     threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
                 enc.endEncoding()
@@ -479,6 +512,7 @@ final class RayRenderer {
         enc.setBuffer(sim.paramsBuffer, offset: 0, index: 7)
         enc.setBuffer(bigCellsBuffer, offset: 0, index: 8)
         enc.setBuffer(pxBuf, offset: 0, index: 9)
+        enc.setBuffer(sim.tintBuffer, offset: 0, index: 10)   // V2.1: traverseGrid signature
         enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
         enc.endEncoding()
