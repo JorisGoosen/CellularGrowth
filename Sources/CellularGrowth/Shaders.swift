@@ -2,14 +2,40 @@
 //  Metal shader sources (MSL), compiled at runtime with device.makeLibrary(source:).
 //  Kept as string constants so both `swift run` and the .app bundle work
 //  without SPM resource plumbing.
+//
+//  COMPOSED CHUNKS — single-source rule: no verbatim MSL duplicates between
+//  the three libraries. The former copies of struct SimParams (render +
+//  raytrace) and of binHash / coarseHash / coarseNeighbourhoodClear /
+//  lightVisibility (raytrace) are merged into `common`.
+//
+//    common           canonical struct SimParams (appended-only layout
+//                     contract with the Swift SimParams; all three libraries
+//                     bind the SAME params buffer memory) + the helpers
+//                     shared by more than one library: per-cell RNG, the
+//                     fine spatial hash (binHash / binHashOfPos), the coarse
+//                     occupancy hash (coarseHash / coarseNeighbourhoodClear)
+//                     and the DDA light march (lightVisibility).
+//    simKernels       simulation kernels: normals, grid rebuild passes,
+//                     repulsion, forces, food, division, chemicals, tint,
+//                     pulse, stats (+ the CELLDBG probe kernels).
+//    renderKernels    raster impostor shaders: Camera, VOut/FOut, solid +
+//                     interactive X-ray (render-only structs stay here).
+//    raytraceKernels  offline ray tracer: RenderParams (render-only uniform
+//                     block), traversal/AO/shadow helpers, raytraceTile,
+//                     raytraceProbe.
+//
+//  makeLibrary contract (names are load-bearing, do not rename):
+//    static let sim      -> Core/CellSim.swift
+//    static let render   -> Render/Renderer.swift
+//    static let raytrace -> Render/RayRenderer.swift
 
 import Foundation
 
 enum Shaders {
 
-    // MARK: - Simulation kernels (M1 forces; M2 adds food + cell division)
+    // MARK: - `common`: canonical SimParams + helpers shared by >1 library
 
-    static let sim = """
+    static let common = """
     #include <metal_stdlib>
     using namespace metal;
 
@@ -122,35 +148,6 @@ enum Shaders {
         return (float)(pcgOutput(s) >> 8) * (1.0f / 16777216.0f);
     }
 
-    // Buffer table:
-    //   0 positions (const)    1 links (const)      2 linkCounts (const)
-    //   3 normals (write)      4 cellCounter        5 params
-    kernel void computeNormals(device const float3* positions [[buffer(0)]],
-                               device const uint*   links      [[buffer(1)]],
-                               device const uint*   linkCounts [[buffer(2)]],
-                               device float3* normals           [[buffer(3)]],
-                               device const uint*   cellCounter [[buffer(4)]],
-                               constant SimParams&  params      [[buffer(5)]],
-                               uint gid [[thread_position_in_grid]])
-    {
-        if (gid >= cellCounter[0]) return;
-        float3 P = float3(positions[gid]);
-        uint   n = linkCounts[gid];
-        uint base = gid * params.maxValence;
-        float3 acc = float3(0.0);
-        if (n >= 3) {
-            float3 prev = float3(positions[links[base + n - 1]]) - P;
-            for (uint k = 0; k < n; ++k) {
-                float3 cur = float3(positions[links[base + k]]) - P;
-                acc += cross(prev, cur);
-                prev = cur;
-            }
-        }
-        float len2 = dot(acc, acc);
-        // Fallback for a degenerate ring; cannot happen on a healthy closed manifold.
-        normals[gid] = float3(len2 > 1e-20f ? acc * rsqrt(len2) : float3(0.0, 1.0, 0.0));
-    }
-
     // ---- M3: spatial hash grid for repulsion (paper §4) --------------------
     //
     // Hashed sparse uniform grid, rebuilt EVERY step (everything moves).
@@ -240,6 +237,185 @@ enum Shaders {
             }
         }
         return true;
+    }
+
+    // Fractional light visibility (V2.1): the fraction of the light DISK
+    // (angular radius lightSoft, radians — a physical soft light) visible
+    // from ro along direction rd. Blockers are the SAME centerline-crossing
+    // spheres the legacy binary march tested (dLine2 <= rad^2 — the DDA
+    // candidate set and bin walk are UNCHANGED); each blocker occludes
+    //   coverage = clamp((lightSoft + alpha - phi) / (2*lightSoft), 0, 1)
+    // of the disk, where phi = angle(rd, blocker centre) and
+    // alpha = asin(rad/d) is its angular radius as seen from ro (linear
+    // ramp: full coverage once the blocker disk contains the light disk,
+    // zero beyond its rim). The product over blockers assumes independent
+    // occluders. lightSoft = 0 reduces coverage to the binary (phi < alpha)
+    // verdict — bit-identical to the pre-V2.1 lightOccluded, including the
+    // early exit at the same candidate the boolean `return true` fired at.
+    // Penumbra approximation (documented): blockers that do NOT cross the
+    // centerline (the penumbra cone skirt) are not in the DDA candidate set
+    // and contribute nothing — the softness comes from the angular size of
+    // centerline-crossing blockers, which carries nearly all of the
+    // occlusion energy. A cone-widened march would need wider bin
+    // neighbourhoods per DDA step; not worth it (measured in the V2.1
+    // bench: the fraction cost is dominated by the LOST early exit, not by
+    // the coverage arithmetic).
+    //
+    // M6 coarse occupancy skip unchanged (only ever skipped over regions
+    // proven free of cells — verdict-identical for any lightSoft).
+    static float lightVisibility(float3 ro, float3 rd, float t0, float t1, uint selfIdx,
+                                 float lightSoft,
+                                 device const float3* positions,
+                                 device const float* radii,
+                                 device const uint* binStarts,
+                                 device const uint* particleIndices,
+                                 device const uint* occupancy,
+                                 constant SimParams& sp)
+    {
+        if (!(t1 > t0)) return 1.0f;
+        const bool binary = (lightSoft <= 1e-6f);
+        const float h = sp.roi;
+        float vis = 1.0f;
+        float3 p0 = ro + rd * t0;
+        int3 c = int3((int)floor(p0.x / h), (int)floor(p0.y / h), (int)floor(p0.z / h));
+        int3 st = int3(rd.x > 0.0f ? 1 : -1, rd.y > 0.0f ? 1 : -1, rd.z > 0.0f ? 1 : -1);
+        // +inf where rd == 0: that axis never advances (IEEE division).
+        float3 tDelta = fabs(float3(h) / rd);
+        float3 tMax;
+        tMax.x = rd.x != 0.0f ? t0 + ((rd.x > 0.0f ? (float)(c.x + 1) * h : (float)c.x * h) - p0.x) / rd.x : INFINITY;
+        tMax.y = rd.y != 0.0f ? t0 + ((rd.y > 0.0f ? (float)(c.y + 1) * h : (float)c.y * h) - p0.y) / rd.y : INFINITY;
+        tMax.z = rd.z != 0.0f ? t0 + ((rd.z > 0.0f ? (float)(c.z + 1) * h : (float)c.z * h) - p0.z) / rd.z : INFINITY;
+
+        float tCur = t0;
+        // Safety bound: identical rationale to traverseGrid (a hung kernel
+        // stalls the whole machine; 8192 bins is orders above any reachable
+        // ray length: t1 <= sceneR + |P| + 2*roi <= ~2 * max |P|).
+        for (uint iter = 0; iter < 8192u && tCur < t1; ++iter) {
+            // --- M6 coarse skip: jump over provably-empty 8³-bin blocks ---
+            // (lightCoarseSkip is the A/B kill switch; the skip is only ever
+            // taken over regions proven free of cells — see
+            // coarseNeighbourhoodClear — so the verdict is identical either way)
+            if (sp.lightCoarseSkip != 0u && coarseNeighbourhoodClear(c, occupancy, sp)) {
+                int3 bc0 = int3(floor(float3(c) * 0.125f));   // current block (floored)
+                float3 blockLo = float3(bc0 * 8) * h;
+                float3 blockHi = float3((bc0 + int3(1)) * 8) * h;
+                float tExitB = INFINITY;
+                if (rd.x > 0.0f)      tExitB = min(tExitB, (blockHi.x - ro.x) / rd.x);
+                else if (rd.x < 0.0f) tExitB = min(tExitB, (blockLo.x - ro.x) / rd.x);
+                if (rd.y > 0.0f)      tExitB = min(tExitB, (blockHi.y - ro.y) / rd.y);
+                else if (rd.y < 0.0f) tExitB = min(tExitB, (blockLo.y - ro.y) / rd.y);
+                if (rd.z > 0.0f)      tExitB = min(tExitB, (blockHi.z - ro.z) / rd.z);
+                else if (rd.z < 0.0f) tExitB = min(tExitB, (blockLo.z - ro.z) / rd.z);
+                if (tExitB >= t1) return 1.0f;   // segment ends inside the clear block
+                if (tExitB > tCur + 1e-4f) {
+                    // Jump: reinitialize the DDA state at the block exit
+                    // (same formulas as the loop head; tDelta/st unchanged).
+                    tCur = tExitB;
+                    p0 = ro + rd * tCur;
+                    c = int3((int)floor(p0.x / h), (int)floor(p0.y / h), (int)floor(p0.z / h));
+                    tMax.x = rd.x != 0.0f ? tCur + ((rd.x > 0.0f ? (float)(c.x + 1) * h : (float)c.x * h) - p0.x) / rd.x : INFINITY;
+                    tMax.y = rd.y != 0.0f ? tCur + ((rd.y > 0.0f ? (float)(c.y + 1) * h : (float)c.y * h) - p0.y) / rd.y : INFINITY;
+                    tMax.z = rd.z != 0.0f ? tCur + ((rd.z > 0.0f ? (float)(c.z + 1) * h : (float)c.z * h) - p0.z) / rd.z : INFINITY;
+                    continue;
+                }
+                // Degenerate (exit ~ tCur, ray clipping the block corner):
+                // fall through to the ordinary fine step.
+            }
+            for (int dz = -1; dz <= 1; ++dz) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        uint hh = binHash(c + int3(dx, dy, dz), sp);
+                        uint s = binStarts[hh];
+                        uint e = binStarts[hh + 1];
+                        for (uint idx = s; idx < e; ++idx) {
+                            uint r = particleIndices[idx];
+                            if (r == selfIdx) continue;
+                            // Occlusion radius = the renderer's per-cell radius
+                            // (mean link distance x radiusScale), CLAMPED below
+                            // roi to stay inside the grid path's proof (radii
+                            // >= roi exist only on stretched cells, typically
+                            // << 1% of a grown state — they under-shadow
+                            // slightly; documented in the M5 report).
+                            float rad = min(radii[r], 0.99f * h);
+                            if (rad <= 0.0f) continue;
+                            float3 C = float3(positions[r]);
+                            float3 toC = C - ro;
+                            float tc = dot(toC, rd);
+                            float dLine2 = dot(toC, toC) - tc * tc;
+                            if (dLine2 > rad * rad) continue;
+                            float thc = sqrt(max(rad * rad - dLine2, 0.0f));
+                            float ta = tc - thc;
+                            float tb = tc + thc;
+                            if (tb > t0 && ta < t1) {
+                                // Blocker crosses the segment: angular coverage
+                                // of the light disk. d > rad here unless the
+                                // start point itself lies INSIDE the blocker
+                                // (tb > t0 with the centre behind ro forces
+                                // d < rad) — full coverage either way.
+                                float d = sqrt(dLine2 + tc * tc);
+                                float coverage;
+                                if (binary || d <= rad) {
+                                    coverage = 1.0f;
+                                } else {
+                                    float phi = acos(clamp(tc / d, -1.0f, 1.0f));
+                                    float alpha = asin(min(rad / d, 1.0f));
+                                    coverage = clamp((lightSoft + alpha - phi) / (2.0f * lightSoft), 0.0f, 1.0f);
+                                }
+                                vis *= 1.0f - coverage;
+                                if (vis < 1e-3f) return 0.0f;   // fully blocked; stop marching
+                            }
+                        }
+                    }
+                }
+            }
+            if (tCur >= t1) break;
+            // Advance to the next bin (ties broken consistently, as in the
+            // renderer: ranges stay a partition of [t0, t1] either way).
+            float tExit = min(min(tMax.x, tMax.y), tMax.z);
+            if (tExit >= t1) break;
+            if (tMax.x <= tMax.y && tMax.x <= tMax.z) {
+                c.x += st.x; tCur = tMax.x; tMax.x += tDelta.x;
+            } else if (tMax.y <= tMax.z) {
+                c.y += st.y; tCur = tMax.y; tMax.y += tDelta.y;
+            } else {
+                c.z += st.z; tCur = tMax.z; tMax.z += tDelta.z;
+            }
+        }
+        return clamp(vis, 0.0f, 1.0f);
+    }
+    """
+
+    // MARK: - `simKernels`: simulation kernels (M1 forces; M2 food + division; M3 grid; M5 chemicals; V2.2 tint/pulse)
+
+    static let simKernels = """
+
+    // Buffer table:
+    //   0 positions (const)    1 links (const)      2 linkCounts (const)
+    //   3 normals (write)      4 cellCounter        5 params
+    kernel void computeNormals(device const float3* positions [[buffer(0)]],
+                               device const uint*   links      [[buffer(1)]],
+                               device const uint*   linkCounts [[buffer(2)]],
+                               device float3* normals           [[buffer(3)]],
+                               device const uint*   cellCounter [[buffer(4)]],
+                               constant SimParams&  params      [[buffer(5)]],
+                               uint gid [[thread_position_in_grid]])
+    {
+        if (gid >= cellCounter[0]) return;
+        float3 P = float3(positions[gid]);
+        uint   n = linkCounts[gid];
+        uint base = gid * params.maxValence;
+        float3 acc = float3(0.0);
+        if (n >= 3) {
+            float3 prev = float3(positions[links[base + n - 1]]) - P;
+            for (uint k = 0; k < n; ++k) {
+                float3 cur = float3(positions[links[base + k]]) - P;
+                acc += cross(prev, cur);
+                prev = cur;
+            }
+        }
+        float len2 = dot(acc, acc);
+        // Fallback for a degenerate ring; cannot happen on a healthy closed manifold.
+        normals[gid] = float3(len2 > 1e-20f ? acc * rsqrt(len2) : float3(0.0, 1.0, 0.0));
     }
 
     // Pass 1: count particles per hashed bin. M6: also SET the coarse
@@ -684,151 +860,6 @@ enum Shaders {
     {
         if (gid != 0u) return;
         atomic_store_explicit(&bound2[0], 0u, memory_order_relaxed);
-    }
-
-    // Fractional light visibility (V2.1): the fraction of the light DISK
-    // (angular radius lightSoft, radians — a physical soft light) visible
-    // from ro along direction rd. Blockers are the SAME centerline-crossing
-    // spheres the legacy binary march tested (dLine2 <= rad^2 — the DDA
-    // candidate set and bin walk are UNCHANGED); each blocker occludes
-    //   coverage = clamp((lightSoft + alpha - phi) / (2*lightSoft), 0, 1)
-    // of the disk, where phi = angle(rd, blocker centre) and
-    // alpha = asin(rad/d) is its angular radius as seen from ro (linear
-    // ramp: full coverage once the blocker disk contains the light disk,
-    // zero beyond its rim). The product over blockers assumes independent
-    // occluders. lightSoft = 0 reduces coverage to the binary (phi < alpha)
-    // verdict — bit-identical to the pre-V2.1 lightOccluded, including the
-    // early exit at the same candidate the boolean `return true` fired at.
-    // Penumbra approximation (documented): blockers that do NOT cross the
-    // centerline (the penumbra cone skirt) are not in the DDA candidate set
-    // and contribute nothing — the softness comes from the angular size of
-    // centerline-crossing blockers, which carries nearly all of the
-    // occlusion energy. A cone-widened march would need wider bin
-    // neighbourhoods per DDA step; not worth it (measured in the V2.1
-    // bench: the fraction cost is dominated by the LOST early exit, not by
-    // the coverage arithmetic).
-    //
-    // M6 coarse occupancy skip unchanged (only ever skipped over regions
-    // proven free of cells — verdict-identical for any lightSoft).
-    static float lightVisibility(float3 ro, float3 rd, float t0, float t1, uint selfIdx,
-                                 float lightSoft,
-                                 device const float3* positions,
-                                 device const float* radii,
-                                 device const uint* binStarts,
-                                 device const uint* particleIndices,
-                                 device const uint* occupancy,
-                                 constant SimParams& sp)
-    {
-        if (!(t1 > t0)) return 1.0f;
-        const bool binary = (lightSoft <= 1e-6f);
-        const float h = sp.roi;
-        float vis = 1.0f;
-        float3 p0 = ro + rd * t0;
-        int3 c = int3((int)floor(p0.x / h), (int)floor(p0.y / h), (int)floor(p0.z / h));
-        int3 st = int3(rd.x > 0.0f ? 1 : -1, rd.y > 0.0f ? 1 : -1, rd.z > 0.0f ? 1 : -1);
-        // +inf where rd == 0: that axis never advances (IEEE division).
-        float3 tDelta = fabs(float3(h) / rd);
-        float3 tMax;
-        tMax.x = rd.x != 0.0f ? t0 + ((rd.x > 0.0f ? (float)(c.x + 1) * h : (float)c.x * h) - p0.x) / rd.x : INFINITY;
-        tMax.y = rd.y != 0.0f ? t0 + ((rd.y > 0.0f ? (float)(c.y + 1) * h : (float)c.y * h) - p0.y) / rd.y : INFINITY;
-        tMax.z = rd.z != 0.0f ? t0 + ((rd.z > 0.0f ? (float)(c.z + 1) * h : (float)c.z * h) - p0.z) / rd.z : INFINITY;
-
-        float tCur = t0;
-        // Safety bound: identical rationale to traverseGrid (a hung kernel
-        // stalls the whole machine; 8192 bins is orders above any reachable
-        // ray length: t1 <= sceneR + |P| + 2*roi <= ~2 * max |P|).
-        for (uint iter = 0; iter < 8192u && tCur < t1; ++iter) {
-            // --- M6 coarse skip: jump over provably-empty 8³-bin blocks ---
-            // (lightCoarseSkip is the A/B kill switch; the skip is only ever
-            // taken over regions proven free of cells — see
-            // coarseNeighbourhoodClear — so the verdict is identical either way)
-            if (sp.lightCoarseSkip != 0u && coarseNeighbourhoodClear(c, occupancy, sp)) {
-                int3 bc0 = int3(floor(float3(c) * 0.125f));   // current block (floored)
-                float3 blockLo = float3(bc0 * 8) * h;
-                float3 blockHi = float3((bc0 + int3(1)) * 8) * h;
-                float tExitB = INFINITY;
-                if (rd.x > 0.0f)      tExitB = min(tExitB, (blockHi.x - ro.x) / rd.x);
-                else if (rd.x < 0.0f) tExitB = min(tExitB, (blockLo.x - ro.x) / rd.x);
-                if (rd.y > 0.0f)      tExitB = min(tExitB, (blockHi.y - ro.y) / rd.y);
-                else if (rd.y < 0.0f) tExitB = min(tExitB, (blockLo.y - ro.y) / rd.y);
-                if (rd.z > 0.0f)      tExitB = min(tExitB, (blockHi.z - ro.z) / rd.z);
-                else if (rd.z < 0.0f) tExitB = min(tExitB, (blockLo.z - ro.z) / rd.z);
-                if (tExitB >= t1) return 1.0f;   // segment ends inside the clear block
-                if (tExitB > tCur + 1e-4f) {
-                    // Jump: reinitialize the DDA state at the block exit
-                    // (same formulas as the loop head; tDelta/st unchanged).
-                    tCur = tExitB;
-                    p0 = ro + rd * tCur;
-                    c = int3((int)floor(p0.x / h), (int)floor(p0.y / h), (int)floor(p0.z / h));
-                    tMax.x = rd.x != 0.0f ? tCur + ((rd.x > 0.0f ? (float)(c.x + 1) * h : (float)c.x * h) - p0.x) / rd.x : INFINITY;
-                    tMax.y = rd.y != 0.0f ? tCur + ((rd.y > 0.0f ? (float)(c.y + 1) * h : (float)c.y * h) - p0.y) / rd.y : INFINITY;
-                    tMax.z = rd.z != 0.0f ? tCur + ((rd.z > 0.0f ? (float)(c.z + 1) * h : (float)c.z * h) - p0.z) / rd.z : INFINITY;
-                    continue;
-                }
-                // Degenerate (exit ~ tCur, ray clipping the block corner):
-                // fall through to the ordinary fine step.
-            }
-            for (int dz = -1; dz <= 1; ++dz) {
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        uint hh = binHash(c + int3(dx, dy, dz), sp);
-                        uint s = binStarts[hh];
-                        uint e = binStarts[hh + 1];
-                        for (uint idx = s; idx < e; ++idx) {
-                            uint r = particleIndices[idx];
-                            if (r == selfIdx) continue;
-                            // Occlusion radius = the renderer's per-cell radius
-                            // (mean link distance x radiusScale), CLAMPED below
-                            // roi to stay inside the grid path's proof (radii
-                            // >= roi exist only on stretched cells, typically
-                            // << 1% of a grown state — they under-shadow
-                            // slightly; documented in the M5 report).
-                            float rad = min(radii[r], 0.99f * h);
-                            if (rad <= 0.0f) continue;
-                            float3 C = float3(positions[r]);
-                            float3 toC = C - ro;
-                            float tc = dot(toC, rd);
-                            float dLine2 = dot(toC, toC) - tc * tc;
-                            if (dLine2 > rad * rad) continue;
-                            float thc = sqrt(max(rad * rad - dLine2, 0.0f));
-                            float ta = tc - thc;
-                            float tb = tc + thc;
-                            if (tb > t0 && ta < t1) {
-                                // Blocker crosses the segment: angular coverage
-                                // of the light disk. d > rad here unless the
-                                // start point itself lies INSIDE the blocker
-                                // (tb > t0 with the centre behind ro forces
-                                // d < rad) — full coverage either way.
-                                float d = sqrt(dLine2 + tc * tc);
-                                float coverage;
-                                if (binary || d <= rad) {
-                                    coverage = 1.0f;
-                                } else {
-                                    float phi = acos(clamp(tc / d, -1.0f, 1.0f));
-                                    float alpha = asin(min(rad / d, 1.0f));
-                                    coverage = clamp((lightSoft + alpha - phi) / (2.0f * lightSoft), 0.0f, 1.0f);
-                                }
-                                vis *= 1.0f - coverage;
-                                if (vis < 1e-3f) return 0.0f;   // fully blocked; stop marching
-                            }
-                        }
-                    }
-                }
-            }
-            if (tCur >= t1) break;
-            // Advance to the next bin (ties broken consistently, as in the
-            // renderer: ranges stay a partition of [t0, t1] either way).
-            float tExit = min(min(tMax.x, tMax.y), tMax.z);
-            if (tExit >= t1) break;
-            if (tMax.x <= tMax.y && tMax.x <= tMax.z) {
-                c.x += st.x; tCur = tMax.x; tMax.x += tDelta.x;
-            } else if (tMax.y <= tMax.z) {
-                c.y += st.y; tCur = tMax.y; tMax.y += tDelta.y;
-            } else {
-                c.z += st.z; tCur = tMax.z; tMax.z += tDelta.z;
-            }
-        }
-        return clamp(vis, 0.0f, 1.0f);
     }
 
     // One thread per cell: illumination march + nutrient production. Runs on
@@ -1737,11 +1768,9 @@ enum Shaders {
     }
     """
 
-    // MARK: - Cell renderer (instanced sphere impostors)
+    // MARK: - `renderKernels`: raster impostor shaders (solid + interactive X-ray)
 
-    static let render = """
-    #include <metal_stdlib>
-    using namespace metal;
+    static let renderKernels = """
 
     // Layout must mirror Swift struct CameraUniforms.
     struct Camera {
@@ -1755,55 +1784,9 @@ enum Shaders {
         float4 edgePad;  // V2.1: .x = edge strength (0 = off), .y = edge width (x cell radius)
     };
 
-    // Same struct layout as Shaders.sim SimParams — bound to the SAME params
-    // buffer (the cellFragment edge layer reads maxValence for the link
-    // stride). Keep in sync; appended-only per AGENTS.md.
-    struct SimParams {
-        float linkRestLength;
-        float springFactor;
-        float planarFactor;
-        float bulgeFactor;
-        float radiusScale;
-        uint  cellCount;
-        uint  maxValence;
-        float foodIncrement;
-        float splitThreshold;
-        uint  divisionEnabled;
-        uint  rngSeed;
-        uint  maxCells;
-        float roi;
-        float repulsionStrength;
-        uint  gridBitsX;
-        uint  gridBitsY;
-        uint  gridBitsZ;
-        // --- M5 (appended; must mirror Shaders.sim exactly) ---
-        uint  growthMode;
-        float lightDirX;
-        float lightDirY;
-        float lightDirZ;
-        float lightDiffusionRate;
-        float lightNutrient;
-        float lightDecay;
-        float lightBase;
-        uint  lightInterval;
-        float rdeF;
-        float rdeK;
-        float rdeDu;
-        float rdeDv;
-        float rdeBase;
-        float rdeGain;
-        // --- M6 (appended; must mirror Shaders.sim exactly) ---
-        uint  gridCoarseBitsX;
-        uint  gridCoarseBitsY;
-        uint  gridCoarseBitsZ;
-        uint  lightCoarseSkip;
-        // --- V2.1 (appended; must mirror Shaders.sim exactly) ---
-        float lightSoft;
-        // --- V2.2 (appended; must mirror Shaders.sim exactly) ---
-        uint  tintMode;      // cellTint mode (render paths read the precomputed tint buffer)
-        float heatScale;     // food-heatmap normalization (<= 1e-6 = auto)
-        float pulseDecay;    // mitosis pulse per-step decay
-    };
+    // SimParams comes from the shared `common` chunk above — bound to the
+    // SAME params buffer as the sim (the cellFragment edge layer reads
+    // maxValence for the link stride). Appended-only per AGENTS.md.
 
     struct VOut {
         float4 clip    [[position]];
@@ -1996,11 +1979,9 @@ enum Shaders {
     }
     """
 
-    // MARK: - M4 offline ray tracer (compute kernels; raster path untouched)
+    // MARK: - `raytraceKernels`: offline ray tracer (M4; V2.1 edges + shadow rays)
 
-    static let raytrace = """
-    #include <metal_stdlib>
-    using namespace metal;
+    static let raytraceKernels = """
 
     // ---- M4: offline ray-traced renderer (compute path) --------------------
     //
@@ -2111,193 +2092,13 @@ enum Shaders {
         uint  pad4;
     };
 
-    // Same struct layout as Shaders.sim SimParams — bound to the SAME params
-    // buffer (only roi + the grid bit fields are read here). Keep in sync;
-    // appended-only per AGENTS.md.
-    struct SimParams {
-        float linkRestLength;
-        float springFactor;
-        float planarFactor;
-        float bulgeFactor;
-        float radiusScale;
-        uint  cellCount;
-        uint  maxValence;
-        float foodIncrement;
-        float splitThreshold;
-        uint  divisionEnabled;
-        uint  rngSeed;
-        uint  maxCells;
-        float roi;
-        float repulsionStrength;
-        uint  gridBitsX;
-        uint  gridBitsY;
-        uint  gridBitsZ;
-        // --- M5 (appended; must mirror Shaders.sim exactly) ---
-        uint  growthMode;
-        float lightDirX;
-        float lightDirY;
-        float lightDirZ;
-        float lightDiffusionRate;
-        float lightNutrient;
-        float lightDecay;
-        float lightBase;
-        uint  lightInterval;
-        float rdeF;
-        float rdeK;
-        float rdeDu;
-        float rdeDv;
-        float rdeBase;
-        float rdeGain;
-        // --- M6 (appended; must mirror Shaders.sim exactly) ---
-        uint  gridCoarseBitsX;
-        uint  gridCoarseBitsY;
-        uint  gridCoarseBitsZ;
-        uint  lightCoarseSkip;
-        // --- V2.1 (appended; must mirror Shaders.sim exactly) ---
-        float lightSoft;
-        // --- V2.2 (appended; must mirror Shaders.sim exactly) ---
-        uint  tintMode;      // cellTint mode (render paths read the precomputed tint buffer)
-        float heatScale;     // food-heatmap normalization (<= 1e-6 = auto)
-        float pulseDecay;    // mitosis pulse per-step decay
-    };
-
-    // Bit-packed bin hash — IDENTICAL to Shaders.sim binHash (same grid).
-    static inline uint binHash(int3 c, constant SimParams& p) {
-        uint maskX = (1u << p.gridBitsX) - 1u;
-        uint maskY = (1u << p.gridBitsY) - 1u;
-        uint maskZ = (1u << p.gridBitsZ) - 1u;
-        return ((uint)c.x & maskX)
-             | (((uint)c.y & maskY) << p.gridBitsX)
-             | (((uint)c.z & maskZ) << (p.gridBitsX + p.gridBitsY));
-    }
-
-    // V2.1: coarse occupancy hash + neighbourhood test + fractional light
-    // visibility — VERBATIM copies of the Shaders.sim versions (the per-pixel
-    // shadow rays march the SAME grid with the SAME skip map; keeping the
-    // code identical is the drift-prevention rule). SimParams is bound as the
-    // sim's own params buffer, so gridBits*/gridCoarseBits*/roi/lightSoft all
-    // match by construction.
-    static inline uint coarseHash(int3 c, constant SimParams& p) {
-        uint maskX = (1u << p.gridCoarseBitsX) - 1u;
-        uint maskY = (1u << p.gridCoarseBitsY) - 1u;
-        uint maskZ = (1u << p.gridCoarseBitsZ) - 1u;
-        return ((uint)c.x & maskX)
-             | (((uint)c.y & maskY) << p.gridCoarseBitsX)
-             | (((uint)c.z & maskZ) << (p.gridCoarseBitsX + p.gridCoarseBitsY));
-    }
-
-    static bool coarseNeighbourhoodClear(int3 c, device const uint* occupancy,
-                                         constant SimParams& p) {
-        int3 cc = int3(floor(float3(c) * 0.125f));   // floor block coord (exact, see gridCount)
-        for (int dz = -1; dz <= 1; ++dz) {
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    uint h = coarseHash(cc + int3(dx, dy, dz), p);
-                    if (occupancy[h >> 5] & (1u << (h & 31u))) return false;
-                }
-            }
-        }
-        return true;
-    }
-
-    // Fractional light visibility — see Shaders.sim lightVisibility for the
-    // full derivation. The per-pixel shadow rays call it with lightSoft = 0
-    // (hard per-sample occlusion); the cone jitter provides the penumbra.
-    static float lightVisibility(float3 ro, float3 rd, float t0, float t1, uint selfIdx,
-                                 float lightSoft,
-                                 device const float3* positions,
-                                 device const float* radii,
-                                 device const uint* binStarts,
-                                 device const uint* particleIndices,
-                                 device const uint* occupancy,
-                                 constant SimParams& sp)
-    {
-        if (!(t1 > t0)) return 1.0f;
-        const bool binary = (lightSoft <= 1e-6f);
-        const float h = sp.roi;
-        float vis = 1.0f;
-        float3 p0 = ro + rd * t0;
-        int3 c = int3((int)floor(p0.x / h), (int)floor(p0.y / h), (int)floor(p0.z / h));
-        int3 st = int3(rd.x > 0.0f ? 1 : -1, rd.y > 0.0f ? 1 : -1, rd.z > 0.0f ? 1 : -1);
-        float3 tDelta = fabs(float3(h) / rd);
-        float3 tMax;
-        tMax.x = rd.x != 0.0f ? t0 + ((rd.x > 0.0f ? (float)(c.x + 1) * h : (float)c.x * h) - p0.x) / rd.x : INFINITY;
-        tMax.y = rd.y != 0.0f ? t0 + ((rd.y > 0.0f ? (float)(c.y + 1) * h : (float)c.y * h) - p0.y) / rd.y : INFINITY;
-        tMax.z = rd.z != 0.0f ? t0 + ((rd.z > 0.0f ? (float)(c.z + 1) * h : (float)c.z * h) - p0.z) / rd.z : INFINITY;
-
-        float tCur = t0;
-        for (uint iter = 0; iter < 8192u && tCur < t1; ++iter) {
-            if (sp.lightCoarseSkip != 0u && coarseNeighbourhoodClear(c, occupancy, sp)) {
-                int3 bc0 = int3(floor(float3(c) * 0.125f));
-                float3 blockLo = float3(bc0 * 8) * h;
-                float3 blockHi = float3((bc0 + int3(1)) * 8) * h;
-                float tExitB = INFINITY;
-                if (rd.x > 0.0f)      tExitB = min(tExitB, (blockHi.x - ro.x) / rd.x);
-                else if (rd.x < 0.0f) tExitB = min(tExitB, (blockLo.x - ro.x) / rd.x);
-                if (rd.y > 0.0f)      tExitB = min(tExitB, (blockHi.y - ro.y) / rd.y);
-                else if (rd.y < 0.0f) tExitB = min(tExitB, (blockLo.y - ro.y) / rd.y);
-                if (rd.z > 0.0f)      tExitB = min(tExitB, (blockHi.z - ro.z) / rd.z);
-                else if (rd.z < 0.0f) tExitB = min(tExitB, (blockLo.z - ro.z) / rd.z);
-                if (tExitB >= t1) return 1.0f;
-                if (tExitB > tCur + 1e-4f) {
-                    tCur = tExitB;
-                    p0 = ro + rd * tCur;
-                    c = int3((int)floor(p0.x / h), (int)floor(p0.y / h), (int)floor(p0.z / h));
-                    tMax.x = rd.x != 0.0f ? tCur + ((rd.x > 0.0f ? (float)(c.x + 1) * h : (float)c.x * h) - p0.x) / rd.x : INFINITY;
-                    tMax.y = rd.y != 0.0f ? tCur + ((rd.y > 0.0f ? (float)(c.y + 1) * h : (float)c.y * h) - p0.y) / rd.y : INFINITY;
-                    tMax.z = rd.z != 0.0f ? tCur + ((rd.z > 0.0f ? (float)(c.z + 1) * h : (float)c.z * h) - p0.z) / rd.z : INFINITY;
-                    continue;
-                }
-            }
-            for (int dz = -1; dz <= 1; ++dz) {
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        uint hh = binHash(c + int3(dx, dy, dz), sp);
-                        uint s = binStarts[hh];
-                        uint e = binStarts[hh + 1];
-                        for (uint idx = s; idx < e; ++idx) {
-                            uint r = particleIndices[idx];
-                            if (r == selfIdx) continue;
-                            float rad = min(radii[r], 0.99f * h);
-                            if (rad <= 0.0f) continue;
-                            float3 C = float3(positions[r]);
-                            float3 toC = C - ro;
-                            float tc = dot(toC, rd);
-                            float dLine2 = dot(toC, toC) - tc * tc;
-                            if (dLine2 > rad * rad) continue;
-                            float thc = sqrt(max(rad * rad - dLine2, 0.0f));
-                            float ta = tc - thc;
-                            float tb = tc + thc;
-                            if (tb > t0 && ta < t1) {
-                                float d = sqrt(dLine2 + tc * tc);
-                                float coverage;
-                                if (binary || d <= rad) {
-                                    coverage = 1.0f;
-                                } else {
-                                    float phi = acos(clamp(tc / d, -1.0f, 1.0f));
-                                    float alpha = asin(min(rad / d, 1.0f));
-                                    coverage = clamp((lightSoft + alpha - phi) / (2.0f * lightSoft), 0.0f, 1.0f);
-                                }
-                                vis *= 1.0f - coverage;
-                                if (vis < 1e-3f) return 0.0f;
-                            }
-                        }
-                    }
-                }
-            }
-            if (tCur >= t1) break;
-            float tExit = min(min(tMax.x, tMax.y), tMax.z);
-            if (tExit >= t1) break;
-            if (tMax.x <= tMax.y && tMax.x <= tMax.z) {
-                c.x += st.x; tCur = tMax.x; tMax.x += tDelta.x;
-            } else if (tMax.y <= tMax.z) {
-                c.y += st.y; tCur = tMax.y; tMax.y += tDelta.y;
-            } else {
-                c.z += st.z; tCur = tMax.z; tMax.z += tDelta.z;
-            }
-        }
-        return clamp(vis, 0.0f, 1.0f);
-    }
+    // SimParams and the grid/march helpers (binHash, coarseHash,
+    // coarseNeighbourhoodClear, lightVisibility) come from the shared
+    // `common` chunk — this library binds the SIM's own params buffer, so
+    // gridBits*/gridCoarseBits*/roi/lightSoft all match by construction
+    // (the former verbatim copies are single-sourced there). The per-pixel
+    // shadow rays call lightVisibility with lightSoft = 0 (hard per-sample
+    // occlusion); the cone jitter provides the penumbra.
 
     // Deterministic per-pixel/per-sample AA jitter (PCG-style integer hash).
     static inline uint jitterHash(uint x) {
@@ -2311,23 +2112,6 @@ enum Shaders {
                       (float)((h >> 16u) & 0xFFFFu) / 65535.0f - 0.5f);
     }
 
-    // Traversal over the hashed grid along the segment [t0, t1] of the ray
-    // ro + t*rd (see the header comment for the correctness argument).
-    // wantNearest: writes the nearest sphere entry parameter + its cell index
-    //   (re-testing a candidate from several of the neighbourhoods is
-    //   idempotent — min). Sphere test: dLine2 <= rad².
-    // wantDensity: accumulates per-sphere profiles with the entry-anchor
-    //   dedup (each sphere counted at exactly one visited bin — the bin whose
-    //   [tCur, tExitC) range contains the clamped foot tf). The density
-    //   filter is the PROFILE SUPPORT (rad·profileSupport), NOT the sphere
-    //   test: the profile is C¹ at the support edge, so a cell's contribution
-    //   vanishes continuously there — filtering at rad² instead would make
-    //   skirt cells (perp distance in (rad, support]) jump discontinuously
-    //   between 0 and ~0.75·rad on 1-ulp dLine2 differences (measured: 0.26
-    //   density flicker per affected ray). The support filter needs a wider
-    //   neighbourhood: the closest segment point can be support away from
-    //   the centre, i.e. profileSupport bins per axis for rad < h — the
-    //   caller passes nbhdK = wantDensity ? ceil(profileSupport) : 1.
     // V2.1 edge-layer helper: 1 - smoothstep over the wall band. dNearest =
     // (nearest other centre distance - own centre distance) at the query
     // point; the darkening ramps from full at dNearest <= 0 (on/inside the
@@ -2386,6 +2170,23 @@ enum Shaders {
         return normalize(L + soft * (u.x * t1 + u.y * t2));
     }
 
+    // Traversal over the hashed grid along the segment [t0, t1] of the ray
+    // ro + t*rd (see the header comment for the correctness argument).
+    // wantNearest: writes the nearest sphere entry parameter + its cell index
+    //   (re-testing a candidate from several of the neighbourhoods is
+    //   idempotent — min). Sphere test: dLine2 <= rad².
+    // wantDensity: accumulates per-sphere profiles with the entry-anchor
+    //   dedup (each sphere counted at exactly one visited bin — the bin whose
+    //   [tCur, tExitC) range contains the clamped foot tf). The density
+    //   filter is the PROFILE SUPPORT (rad·profileSupport), NOT the sphere
+    //   test: the profile is C¹ at the support edge, so a cell's contribution
+    //   vanishes continuously there — filtering at rad² instead would make
+    //   skirt cells (perp distance in (rad, support]) jump discontinuously
+    //   between 0 and ~0.75·rad on 1-ulp dLine2 differences (measured: 0.26
+    //   density flicker per affected ray). The support filter needs a wider
+    //   neighbourhood: the closest segment point can be support away from
+    //   the centre, i.e. profileSupport bins per axis for rad < h — the
+    //   caller passes nbhdK = wantDensity ? ceil(profileSupport) : 1.
     static void traverseGrid(float3 ro, float3 rd, float t0, float t1, uint count,
                              device const float3* positions,
                              device const float* radii,
@@ -2957,4 +2758,10 @@ enum Shaders {
         }
     }
     """
+
+    // MARK: - Library sources (compositions; the names are the makeLibrary contract)
+
+    static let sim = common + simKernels
+    static let render = common + renderKernels
+    static let raytrace = common + raytraceKernels
 }
