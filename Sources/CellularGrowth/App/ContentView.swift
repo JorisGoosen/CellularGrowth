@@ -47,12 +47,21 @@ struct ContentView: View {
                 Picker("Style", selection: $vm.renderStyle) {
                     Text("Solid").tag(Renderer.RenderStyle.solid)
                     Text("X-ray").tag(Renderer.RenderStyle.xray)
+                    Text("Foam").tag(Renderer.RenderStyle.foam)
                 }
                 .pickerStyle(.segmented)
                 if vm.renderStyle == .xray {
                     slider("X-ray gain", $vm.xrayGain, 0.05...2)
                 }
-                slider("Edges", $vm.edges, 0...1)
+                if vm.renderStyle == .foam {
+                    slider("Foam opacity", $vm.foamOpacity, 0.2...0.8)
+                    // V2.1b: the foam chambers only develop flat walls where
+                    // neighbouring spheres OVERLAP — radiusScale 0.5 (the
+                    // default) makes them degenerate to points.
+                    Text("Foam recommends Radius scale 0.7 (below ~0.55 the walls degenerate to points).")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 // V2.2 tint modes (feeds solid AND X-ray — the tint buffer is
                 // shared). "Default" = chemical colours in RDE mode, neutral
                 // otherwise (the pre-V2.2 behaviour).

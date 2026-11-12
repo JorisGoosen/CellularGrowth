@@ -8,7 +8,7 @@ including the `bulgeDist` typo analysis) lives in
 [`docs/reference/lomas_cellular_forms_extraction.md`](docs/reference/lomas_cellular_forms_extraction.md),
 with page screenshots in `docs/reference/pages/`.
 
-## Status — V2.2 complete: tint modes (food/nutrient heatmap, mitosis pulse visualization)
+## Status — V2.1b complete: foam rendering (real flat walls, power-diagram chambers)
 
 **M1–M6 base** (details in git history / docs/benchlog.md): over-damped
 spring/planar/bulge forces (paper §4, Fig. 3); food + cell division with
@@ -26,18 +26,69 @@ chemical tinting in both render paths; interactive X-ray, CGST v3 state
 save/load, animation export, stereo pairs, presets, light-march occupancy
 skip.
 
-V2.1 additions:
-- **Edge layer** (`--edges F`, `--edge-width F`, default off): a wall-darkening
-  blend parameter (NOT a separate style) in all three render paths. At every
-  query point the darkening ramps over `edgeWidth × radius` from the wall
-  plane (nearest other cell centre == own centre distance) into the cell
-  interior: ray-tracer solid = grid nearest-centre query at the primary hit;
-  ray-tracer X-ray = per contributing sphere at the density-profile foot
-  (faint cell outlines woven into the density cloud — the microscopy look);
-  interactive impostors = the cell's own ring neighbours (≤ 16 fragment
-  reads). `solid + edges 1` gives the Voronoi-wall look the paper mentions
-  as an early experiment (§8: "a variation on Voronoi cells"); `X-ray +
-  edges` reads like stained microscopy.
+V2.1/V2.2 additions (soft shadows + fractional per-cell light `--light-soft`/
+`--shadows`, coloured X-ray `--xray-color`, food-heatmap and mitosis-pulse
+tint modes `--tint food|pulse`) are described in git history and the V2.1/V2.2
+entries of docs/benchlog.md. The V2.1 painted **edge layer** (`--edges`,
+`--edge-width`) was RETIRED in V2.1b: a darkening blend painted near walls
+reads as drawn outlines, not geometry — the foam walls below are the wall
+visualization now (the v21-solid-edges golden was retired with it).
+
+V2.1b additions — **foam rendering** (`--style foam`, `--style foam-xray`):
+- Each cell renders as its **power-diagram chamber**:
+  `sphere(c_i, r_i) ∩ ⋂_{j∈ring(i)} {x : |x−c_i|²−r_i² ≤ |x−c_j|²−r_j²}` —
+  the sphere truncated by the POWER-BISECTOR half-spaces toward its ring
+  neighbours. Power bisectors are PLANES, so walls between pressed cells are
+  truly flat and sit fairly between unequal cells (unlike chord-midpoint
+  Voronoi). The chamber math lives once in the shared `common` shader chunk
+  (`foamChamberInterval`/`foamWallNormal`); both renderers and the shadow
+  march use it.
+- **Walls are visible because foam is translucent**: the union of chambers
+  equals the union of spheres exactly (tiling proof in Shaders.swift), so an
+  opaque render would show only curved caps — the renderers composite the
+  chamber ENTRY faces front-to-back with a per-face opacity
+  (`CG_FOAM_OPACITY`, default 0.5): the flat walls show through the curved
+  front caps — walls behind walls, the soap-froth depth. Every wall crossed
+  by a ray is provably the following chamber's entry, so each wall is shaded
+  exactly once, with the two cells' AVERAGE tint and illumination (the ray
+  tracer and the impostors shade the shared wall identically — no
+  z-fighting: the bisector planes are derived from the lower cell index, so
+  both sides compute bit-identical planes).
+- **Ray tracer** (`--style foam`): per candidate the ray-sphere interval is
+  clipped against the ≤16 ring bisectors (interval CSG), the nearest K
+  chamber entries (K = `CG_FOAM_LAYERS`, default 6) are composited with the
+  existing AO + directional soft shadows (the shadow march skips BOTH cells
+  of a wall). `--style foam-xray`: the X-ray density follows the CHAMBER
+  intervals (skirt cells vanish) plus an obliquity-weighted spike at every
+  wall crossing (`CG_FOAM_WALL`, default 0.25) — internal membranes in the
+  microscopy look.
+- **Interactive impostors**: the fragment intersects the pixel's exact view
+  ray with the cell's chamber and shades the first face (cap or wall);
+  premultiplied over-blending with the instances sorted back-to-front
+  (throttled CPU sort: every frame ≤ 20k cells, every 30th above). Replaces
+  the retired edge layer.
+- **Radius scale contract**: a wall has real area only when neighbouring
+  spheres OVERLAP — foam mode recommends `--radius-scale 0.7` (the GUI hint
+  says the same); at the 0.5 default the spheres merely touch and the walls
+  degenerate to points (the foam then reads as the plain sphere union).
+- **Validation**: `swift build` (debug+release), `--selftest` (4 phases)
+  PASS, `--lockstep` PASS, all 11 surviving goldens byte-PASS (the
+  v21-solid-edges golden retired — its config is no longer renderable), 3
+  new goldens (ray-traced foam ball, ray-traced foam grown state with
+  byte-exact snapshot replay, impostor foam ball) capture + check PASS;
+  cross-renderer consistency (the same 84k grown state through the impostor
+  foam and the ray-traced foam reads as the same object); foam cost bench
+  (benchlog V2.1b: ray foam ≈ 3.6–5.3× solid, foam-xray ≈ 1.2× xray,
+  impostor foam ≈ solid cost + a one-off sort).
+
+V2.1 additions (the edge layer described here was RETIRED in V2.1b — see the
+status header; the other two are live features):
+- ~~**Edge layer** (`--edges F`, `--edge-width F`)~~ — RETIRED in V2.1b: a
+  darkening blend painted near walls read as drawn outlines, not geometry
+  (the user rejected it). The foam walls (--style foam) are the wall
+  visualization now; the flags and the v21-solid-edges golden were removed
+  (the meta format keeps the keys so the older goldens' config hashes stay
+  stable).
 - **Coloured X-ray** (`--xray-color`, ray tracer): per-channel tinted density
   accumulation — contribution = the cell's tint (cellTint: RDE chemistry
   colours) × its density term, tone mapped per channel. RDE spots glow warm
@@ -132,18 +183,24 @@ Flags: `--steps N`, `--subdiv N`, `--jitter F`, `--spring F`, `--planar F`,
 `--rde-probe`, `--rde-dump DIR`, `--render-light auto|growth|unbiased`.
 M6: `--preset ball|brain|plant|coral|degenerate-demo`, `--anim DIR
 --anim-steps N --anim-frames M`, `--stereo`, `--interocular F`,
-`--screenshot-style solid|xray`. V2.1: `--edges F` (edge-layer strength,
-0 = off), `--edge-width F` (wall width in cell radii, default 0.12),
-`--shadows F` (per-pixel shadow strength, directional solid only, default 1),
-`--xray-color` (per-channel tinted X-ray), `--light-soft F` (light angular
-radius in radians, default 0.35, 0 = legacy binary illumination). V2.2:
-`--tint none|chemical|food|pulse` (cellTint colour mode; default auto =
-chemical colours in RDE mode, neutral otherwise — the pre-V2.2 behaviour;
-`food` = food/nutrient heatmap, `pulse` = magenta division flashes; an
-explicit `--tint` overrides the mode a loaded state carries),
-`--heat-scale F` (heatmap normalization, 0 = auto: splitThreshold +
+`--screenshot-style solid|xray|foam`. V2.1: `--shadows F` (per-pixel shadow
+strength, directional solid only, default 1), `--xray-color` (per-channel
+tinted X-ray), `--light-soft F` (light angular radius in radians, default
+0.35, 0 = legacy binary illumination). The V2.1 `--edges`/`--edge-width`
+flags were RETIRED in V2.1b (the painted edge layer is gone — the foam walls
+replaced it). V2.2: `--tint none|chemical|food|pulse` (cellTint colour mode;
+default auto = chemical colours in RDE mode, neutral otherwise — the
+pre-V2.2 behaviour; `food` = food/nutrient heatmap, `pulse` = magenta
+division flashes; an explicit `--tint` overrides the mode a loaded state
+carries), `--heat-scale F` (heatmap normalization, 0 = auto: splitThreshold +
 lightNutrient/lightDecay in light mode, splitThreshold otherwise),
-`--pulse-decay F` (per-step pulse multiplier, default 0.95). Diagnostic:
+`--pulse-decay F` (per-step pulse multiplier, default 0.95). V2.1b:
+`--style solid|xray|foam|foam-xray` (foam = the power-diagram chamber
+rendering, `--radius-scale F` sets the render radius scale — foam recommends
+0.7; the 0.5 default makes walls degenerate to points). Foam look knobs via
+env: `CG_FOAM_OPACITY` (per-face composite opacity, default 0.5),
+`CG_FOAM_LAYERS` (max composited chamber faces per ray, default 6),
+`CG_FOAM_WALL` (foam-xray wall-spike gain, default 0.25). Diagnostic:
 `--div-stop N` (disable division after step N); env `CG_NO_COARSE_SKIP=1`
 disables the light-march occupancy skip (A/B kill switch); env
 `CG_SHADOW_SAMPLES=N` overrides the 4 default shadow rays per pixel (bench
@@ -160,9 +217,10 @@ swift run -c release CellularGrowth --render xray.png --style xray \
 ## Controls
 
 Drag to orbit, scroll/pinch to zoom. Panel: preset dropdown (ball / brain /
-plant / coral / degenerate-demo), Solid/X-ray render-style switch (+ X-ray
-gain), Save State…/Load State…, growth mode + light/RDE parameter groups,
-repulsion, forces, run controls. Jitter and subdivision apply on Reset.
+plant / coral / degenerate-demo), Solid/X-ray/Foam render-style switch
+(+ X-ray gain, foam opacity + the foam radius-scale hint), Save State…/Load
+State…, growth mode + light/RDE parameter groups, repulsion, forces, run
+controls. Jitter and subdivision apply on Reset.
 
 ## Roadmap
 
@@ -176,3 +234,4 @@ repulsion, forces, run controls. Jitter and subdivision apply on Reset.
 | M6 ✅ | app polish: interactive X-ray, CGST v3 state save/load, animation export, stereo pairs, presets, light-march occupancy skip (~4x) | `--selftest` 4 phases, `--lockstep`, 6/6 goldens (no recapture), state round-trip byte-identical, 20-frame animation + H.264, stereo parallax check, interleaved occupancy A/B (benchlog) |
 | V2.1 ✅ | render v2: edge-blend layer in all three paths (`--edges`), coloured X-ray (`--xray-color`), soft shadows + fractional per-cell light (`--shadows`, `--light-soft`) | `--selftest` 4 phases (recalibrated C gate), `--lockstep`, 6/6 legacy goldens byte-identical (no recapture), 3 new goldens capture+check, render-cost bench (edges ~free, shadows ~2–3x directional solid, coloured X-ray ~free), fractional-light A/B (benchlog) |
 | V2.2 ✅ | tint modes: food/nutrient heatmap (`--tint food`, `--heat-scale`), mitosis pulse visualization (`--tint pulse`, `--pulse-decay`) — division flashes trace the paper §7 growth wavefronts; CGST v3 persists the pulse buffer (byte-exact pulse replays); render-time illumination refresh made side-effect-free | `--selftest` 4 phases, `--lockstep`, 9/9 legacy goldens PASS, 3 new goldens capture+check (pulse + heatmap byte-exact snapshot replays), state round-trip byte-identical, tint-mode bench ~nil (benchlog), pulse ring-R² wavefront metric: light 0.33–0.36 vs uniform 0.18–0.22 |
+| V2.1b ✅ | foam rendering: cells as power-diagram chambers (flat power-bisector walls + curved caps), translucent front-to-back composite ("walls behind walls") in the ray tracer (`--style foam`) and the interactive impostors (sorted premultiplied blend); foam X-ray with wall-crossing membranes (`--style foam-xray`); painted edge layer RETIRED (`--edges`/`--edge-width` removed, v21-solid-edges golden retired) | `--selftest` 4 phases, `--lockstep`, 11/11 surviving goldens byte-PASS, 3 new foam goldens capture+check, cross-renderer consistency (impostor-foam vs ray-foam same state), 0.5-vs-0.7 radius-scale mechanism demo (walls degenerate at 0.5), foam cost bench (ray foam 3.6–5.3× solid, impostor ≈ solid + one-off sort) |

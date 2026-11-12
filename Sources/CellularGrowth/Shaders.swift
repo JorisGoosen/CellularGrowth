@@ -263,7 +263,14 @@ enum Shaders {
     //
     // M6 coarse occupancy skip unchanged (only ever skipped over regions
     // proven free of cells — verdict-identical for any lightSoft).
+    // selfIdx2 (V2.1b): a SECOND cell index to skip in the blocker test —
+    // the foam wall faces sit INSIDE two chambers' spheres (the wall disk is
+    // shared), so the shadow march from a wall point must skip both cells or
+    // every wall would read as fully self-shadowed. Callers without a second
+    // self pass 0xFFFFFFFFu (never matches — behaviour bit-identical to the
+    // pre-V2.1b single-self form; the growth illumination does exactly that).
     static float lightVisibility(float3 ro, float3 rd, float t0, float t1, uint selfIdx,
+                                 uint selfIdx2,
                                  float lightSoft,
                                  device const float3* positions,
                                  device const float* radii,
@@ -329,7 +336,7 @@ enum Shaders {
                         uint e = binStarts[hh + 1];
                         for (uint idx = s; idx < e; ++idx) {
                             uint r = particleIndices[idx];
-                            if (r == selfIdx) continue;
+                            if (r == selfIdx || r == selfIdx2) continue;
                             // Occlusion radius = the renderer's per-cell radius
                             // (mean link distance x radiusScale), CLAMPED below
                             // roi to stay inside the grid path's proof (radii
@@ -382,6 +389,133 @@ enum Shaders {
             }
         }
         return clamp(vis, 0.0f, 1.0f);
+    }
+
+    // ---- V2.1b: foam (power-diagram chamber) helpers -----------------------
+    // Shared by the impostor fragment (renderKernels cellFragment) and the
+    // ray tracer's foam paths (raytraceKernels) — single-sourced here.
+    //
+    // GEOMETRY. A cell's rendered volume is its POWER-DIAGRAM CHAMBER:
+    //   chamber(i) = sphere(c_i, r_i) ∩ ⋂_{j ∈ ring(i)} {x : |x−c_i|² − r_i²
+    //                                                    ≤ |x−c_j|² − r_j²}
+    // i.e. the sphere truncated by the POWER-BISECTOR half-spaces toward its
+    // ring neighbours. Additively weighted (power) bisectors are PLANES, so
+    // the walls between pressed cells are truly flat and sit FAIRLY between
+    // unequal cells (unlike the chord-midpoint plane of plain Voronoi). With
+    // c_i at the origin and D = c_j − c_i the bisector is
+    //   x·D = (|c_j|² − |c_i|² + r_i² − r_j²)/2,
+    // a plane with normal D — in the canonical form below, normalised from
+    // the LOWER-indexed cell so the two chambers sharing a wall compute
+    // bit-identical plane values (the raster depth test then sees identical
+    // depths — no z-fighting, per the milestone contract).
+    //
+    // VISIBILITY FACT (drives the whole foam design): the union of chambers
+    // equals the union of spheres EXACTLY — any point x in some sphere has a
+    // global power-minimiser k with |x−c_k|² − r_k² < 0, hence x ∈ sphere_k,
+    // and being the minimiser x also satisfies every ring half-space of k, so
+    // x ∈ chamber(k); ring-only truncation loses nothing. Therefore the
+    // OPAQUE nearest surface of the chamber union is always a SPHERE CAP —
+    // walls are strictly interior interfaces (only measure-zero wall-rim rays
+    // hit a wall first). Foam therefore renders TRANSLUCENTLY: the chamber
+    // ENTRY faces along the ray are composited front-to-back with a per-face
+    // opacity (foamOpacity), so the flat walls show through the curved front
+    // caps — "walls behind walls", the soap-froth depth. Every wall crossed
+    // by a ray is provably the ENTRY of the following chamber: the wall point
+    // lies on the shared disk (plane ∩ sphere_i = plane ∩ sphere_j, equal by
+    // the bisector identity), so the ray enters sphere_j before/at the wall
+    // and the bisector constraint raises j's entry bound exactly to the wall
+    // (the plane's signed distance along the ray is monotone, so the entry is
+    // raised at most once per plane). Chambers tile the union, entries are
+    // strictly ordered along the ray, and gaps between disconnected blobs are
+    // simply transparent.
+    //
+    // Radius-scale contract: a wall has REAL area only when the two spheres
+    // overlap; at radiusScale 0.5 (mean link distance ~1) neighbours merely
+    // touch and walls degenerate to points — foam mode wants radiusScale 0.7
+    // (wall-disk radius sqrt(r² − h²) ≈ 0.49 r at equal cells, d = 2h).
+
+    // Clip cell `r`'s ray-sphere interval [ta, tb] (from centre C, radius
+    // rad, tc = closest-approach parameter, dLine2 = squared centre-line
+    // distance — all precomputed by the caller) against the POWER-BISECTOR
+    // half-spaces toward its ring neighbours. Returns false when the chamber
+    // is empty along the ray. Outputs: e/x = the clipped interval, wallJ =
+    // 0xFFFFFFFF for a SPHERE (cap) entry, else the ring neighbour whose
+    // bisector produced the entry bound (a flat WALL entry; the plane is
+    // recomputed for shading via foamWallNormal — canonical, see above).
+    static bool foamChamberInterval(float3 ro, float3 rd, float3 C, float rad,
+                                    float tc, float dLine2, uint r,
+                                    device const float3* positions,
+                                    device const float* radii,
+                                    device const uint* links,
+                                    device const uint* linkCounts,
+                                    uint maxValence,
+                                    thread float* outE, thread float* outX,
+                                    thread uint* outWallJ)
+    {
+        float thc = sqrt(max(rad * rad - dLine2, 0.0f));
+        float e = tc - thc;
+        float x = tc + thc;
+        uint wallJ = 0xFFFFFFFFu;
+        uint n = linkCounts[r];
+        uint base = r * maxValence;
+        for (uint k = 0; k < n; ++k) {
+            uint j = links[base + k];
+            if (j == r) continue;
+            // Canonical plane of the (ia, ib) pair, ia = the lower index:
+            // unit normal nh (ia -> ib) and offset hh with
+            //   chamber(ia): x·nh <= hh      chamber(ib): x·nh >= hh
+            uint ia = min(r, j), ib = max(r, j);
+            float3 ca = float3(positions[ia]);
+            float3 cb = float3(positions[ib]);
+            float3 D = cb - ca;
+            float d2 = dot(D, D);
+            if (d2 < 1e-12f) continue;          // coincident centres: no bisector
+            float invD = rsqrt(d2);
+            float3 nh = D * invD;
+            float hh = (dot(cb, cb) - dot(ca, ca)
+                        + radii[ia] * radii[ia] - radii[ib] * radii[ib]) * (0.5f * invD);
+            // Signed distance of the ray against the plane, f(t) = rn + t·dn
+            // (monotone in t): clip the interval, keep the chamber's near side.
+            float rn = dot(ro, nh);
+            float dn = dot(rd, nh);
+            if (r == ia) {
+                if (dn > 1e-9f) {
+                    float ub = (hh - rn) / dn;
+                    if (ub < x) x = ub;
+                } else if (dn < -1e-9f) {
+                    float lb = (hh - rn) / dn;
+                    if (lb > e) { e = lb; wallJ = j; }
+                } else if (rn > hh) {
+                    return false;               // ray parallel, outside the chamber
+                }
+            } else {
+                if (dn < -1e-9f) {
+                    float ub = (hh - rn) / dn;
+                    if (ub < x) x = ub;
+                } else if (dn > 1e-9f) {
+                    float lb = (hh - rn) / dn;
+                    if (lb > e) { e = lb; wallJ = j; }
+                } else if (rn < hh) {
+                    return false;
+                }
+            }
+            if (e > x) return false;            // chamber empty along the ray
+        }
+        if (!(e < x)) return false;             // degenerate (measure-zero) contact
+        *outE = e;
+        *outX = x;
+        *outWallJ = wallJ;
+        return true;
+    }
+
+    // Canonical unit normal of the wall shared by cells r and j (from the
+    // lower to the higher index — both sides of the wall derive the SAME
+    // vector; the caller flips it toward the camera for shading).
+    static inline float3 foamWallNormal(uint r, uint j,
+                                        device const float3* positions) {
+        uint ia = min(r, j), ib = max(r, j);
+        float3 D = float3(positions[ib]) - float3(positions[ia]);
+        return D * rsqrt(max(dot(D, D), 1e-20f));
     }
     """
 
@@ -911,7 +1045,7 @@ enum Shaders {
         float sceneR = sqrt(as_type<float>(bound2[0]));
         float t1 = sceneR + length(P) + 2.0f * params.roi;
 
-        float vis = lightVisibility(P, L, 1e-3f, t1, gid, params.lightSoft,
+        float vis = lightVisibility(P, L, 1e-3f, t1, gid, 0xFFFFFFFFu, params.lightSoft,
                                     positions, radii, binStarts, particleIndices,
                                     occupancy, params);
         if (vis > 0.0f) {
@@ -1772,7 +1906,8 @@ enum Shaders {
 
     static let renderKernels = """
 
-    // Layout must mirror Swift struct CameraUniforms.
+    // Layout must mirror Swift struct CameraUniforms (240 bytes: 208 + the
+    // V2.1 xrayPad float4 + the V2.1b foamPad/eyePad float4s).
     struct Camera {
         float4x4 view;
         float4x4 proj;
@@ -1781,7 +1916,12 @@ enum Shaders {
         float4 negFwd;   // world-space direction from target toward the camera
         float4 lightDir; // world-space unit vector pointing TOWARD the light
         float4 xrayPad;  // M6: .x = interactive X-ray exposure gain (solid path never reads it)
-        float4 edgePad;  // V2.1: .x = edge strength (0 = off), .y = edge width (x cell radius)
+        float4 foamPad;  // V2.1b: .x = foam opacity (0 = the historical solid
+                         // path — cellFragment branches on it; > 0 selects the
+                         // foam chamber CSG). Replaces the retired V2.1 edgePad.
+        float4 eyePad;   // V2.1b: .xyz = world eye position — the foam CSG runs
+                         // in WORLD space (positions/links are world) and needs
+                         // the ray origin; .w unused
     };
 
     // SimParams comes from the shared `common` chunk above — bound to the
@@ -1800,7 +1940,8 @@ enum Shaders {
         uint  cellId;    // V2.1: instance index (flat) — the fragment reads the cell's ring
     };
 
-    // One camera-facing quad per cell; the fragment shader shades it as a sphere.
+    // One camera-facing quad per cell; the fragment shader shades it as a
+    // sphere (solid) or as the cell's foam CHAMBER (foam — see cellFragment).
     vertex VOut cellVertex(uint vid [[vertex_id]],
                            uint iid [[instance_id]],
                            device const float3* positions [[buffer(0)]],
@@ -1825,6 +1966,43 @@ enum Shaders {
         o.negFwd  = cam.negFwd.xyz;
         o.tint    = float3(tint[iid]);
         o.cellId  = iid;
+        o.clip    = cam.proj * float4(cV + float3(uv * r, 0.0), 1.0);
+        return o;
+    }
+
+    // V2.1b foam vertex: identical to cellVertex except the instance -> cell
+    // mapping goes through the drawOrder buffer. The foam pipeline composites
+    // premultiplied-alpha chamber faces with NO depth test — the CPU keeps
+    // drawOrder sorted back-to-front (farthest instance first) so the fixed-
+    // function over-blend is the correct front-to-back composite. Buffer
+    // table: 0 positions   1 radii   2 camera   3 tint   4 drawOrder (u32
+    // per instance, cell index).
+    vertex VOut cellVertexFoam(uint vid [[vertex_id]],
+                               uint iid [[instance_id]],
+                               device const float3* positions [[buffer(0)]],
+                               device const float* radii             [[buffer(1)]],
+                               constant Camera& cam                  [[buffer(2)]],
+                               device const float3* tint             [[buffer(3)]],
+                               device const uint*   drawOrder        [[buffer(4)]])
+    {
+        const float2 corners[4] = { float2(-1.0, -1.0), float2(1.0, -1.0),
+                                    float2(-1.0,  1.0), float2(1.0,  1.0) };
+        float2 uv = corners[vid];
+        uint cell = drawOrder[iid];
+        float3 P  = float3(positions[cell]);
+        float  r  = radii[cell];
+
+        float3 cV = (cam.view * float4(P, 1.0)).xyz;
+
+        VOut o;
+        o.uv      = uv;
+        o.centerV = cV;
+        o.radius  = r;
+        o.right   = cam.right.xyz;
+        o.up      = cam.up.xyz;
+        o.negFwd  = cam.negFwd.xyz;
+        o.tint    = float3(tint[cell]);
+        o.cellId  = cell;
         o.clip    = cam.proj * float4(cV + float3(uv * r, 0.0), 1.0);
         return o;
     }
@@ -1901,33 +2079,95 @@ enum Shaders {
         float  depth [[depth(any)]];
     };
 
-    // Solid impostor fragment. V2.1 additions (both no-ops at their defaults,
-    // so the M3 raster goldens are byte-identical):
-    //   - Per-cell FRACTIONAL illumination (litFraction, written by the
-    //     illuminate kernel): the shadow factor scales the shaded colour.
-    //     Neutral 1.0 outside light mode / before the first march (the host
-    //     fills the buffer with 1.0 on reset), so uniform-mode runs — and the
-    //     M3 goldens — are unchanged. 0.25 keeps fully shaded cells readable.
-    //   - Edge layer over the cell's OWN ring neighbours (<= 16 links, cheap
-    //     fragment loop; same --edges strength as the ray tracer): at the
-    //     pixel's sphere-surface point, F1 = the cell radius (the surface
-    //     point is exactly centre + radius*normal) and F2 = the nearest ring
-    //     neighbour's centre distance; the darkening ramps down over
-    //     edgeWidth * radius — walls between neighbouring cells darken, cell
-    //     interiors stay bright (the "voronoi" look as a blend parameter,
-    //     not a separate style). Guarded by edges > 0 so no NaN can leak
-    //     into the golden path.
+    // Solid / foam impostor fragment.
+    //
+    // SOLID (cam.foamPad.x == 0 — the historical path, M3-golden-locked):
+    // V2.1 per-cell FRACTIONAL illumination (litFraction, written by the
+    // illuminate kernel) scales the shaded colour; neutral 1.0 outside light
+    // mode / before the first march. 0.25 keeps fully shaded cells readable.
+    //
+    // FOAM (cam.foamPad.x > 0 — V2.1b): the fragment shades the cell's
+    // POWER-DIAGRAM CHAMBER (see the foam helper block in `common`) instead
+    // of the full sphere. The pixel's exact view ray is intersected with the
+    // sphere and clipped against the cell's ring-neighbour power bisectors;
+    // the first face along the ray is shaded — a curved CAP (sphere normal,
+    // the cell's own tint) where the cell faces open space, or a flat WALL
+    // (canonical bisector normal flipped toward the camera, the AVERAGE tint
+    // and illumination of the two cells sharing the wall) where it presses a
+    // neighbour. Chamber-empty pixels discard, revealing the cell behind.
+    // Output is PREMULTIPLIED by the foam opacity and blended over (one /
+    // one-minus-source-alpha) with the instances sorted back-to-front — the
+    // front-to-back chamber composite ("walls behind walls", soap-froth
+    // depth). The chamber entry face of the nearest chamber is always a cap
+    // (see the visibility fact in `common`); the flat walls show THROUGH the
+    // translucent front caps and in the cut-away regions.
+    //
     // Fragment buffer table:
     //   0 camera (constant)   1 positions (const)   2 links (const)
     //   3 linkCounts (const)  4 litFraction (const)  5 SimParams (maxValence stride)
+    //   6 tint (const; V2.1b foam wall colour = the two cells' average)
+    //   7 radii (const; V2.1b foam CSG needs the neighbours' radii)
     fragment FOut cellFragment(VOut in [[stage_in]],
                                constant Camera& cam [[buffer(0)]],
                                device const float3* positions [[buffer(1)]],
                                device const uint*   links [[buffer(2)]],
                                device const uint*   linkCounts [[buffer(3)]],
                                device const float*  litFraction [[buffer(4)]],
-                               constant SimParams&  params [[buffer(5)]])
+                               constant SimParams&  params [[buffer(5)]],
+                               device const float3* tint [[buffer(6)]],
+                               device const float*  radii [[buffer(7)]])
     {
+        if (cam.foamPad.x > 0.0) {
+            // Exact view ray through this fragment's quad point (view space:
+            // camera at the origin looking down -Z; the quad point is where
+            // the pixel's ray crosses the centre-depth plane).
+            float3 rdV = normalize(in.centerV + float3(in.uv * in.radius, 0.0));
+            // Same ray in world space (the CSG works on world positions).
+            float3 ro = cam.eyePad.xyz;
+            float3 rd = normalize(in.right * rdV.x + in.up * rdV.y + in.negFwd * rdV.z);
+            float r = in.radius;
+            float3 Cw = float3(positions[in.cellId]);
+            float3 toC = Cw - ro;
+            float tc = dot(toC, rd);
+            float dL2 = dot(toC, toC) - tc * tc;
+            if (dL2 > r * r) { discard_fragment(); }   // outside the sphere disc
+            float e, x;
+            uint wallJ;
+            if (!foamChamberInterval(ro, rd, Cw, r, tc, dL2, in.cellId,
+                                     positions, radii, links, linkCounts,
+                                     params.maxValence, &e, &x, &wallJ)) {
+                discard_fragment();   // chamber cut away along this ray
+            }
+            float3 PhW = ro + rd * e;             // world hit point
+            float3 N;                             // world shading normal
+            float3 tintCol;
+            float litV;
+            if (wallJ == 0xFFFFFFFFu) {
+                N = normalize(PhW - Cw);          // curved cap
+                tintCol = in.tint;
+                litV = litFraction[in.cellId];
+            } else {
+                float3 nh = foamWallNormal(in.cellId, wallJ, positions);
+                N = dot(nh, rd) > 0.0f ? -nh : nh;   // face the camera
+                tintCol = 0.5f * (in.tint + float3(tint[wallJ]));
+                litV = 0.5f * (litFraction[in.cellId] + litFraction[wallJ]);
+            }
+            // Same shading form as the solid path, with the FACE normal.
+            float3 nV = float3(dot(N, in.right), dot(N, in.up), dot(N, in.negFwd));
+            float diff = max(dot(N, cam.lightDir.xyz), 0.0);
+            float rim  = pow(1.0 - nV.z, 2.0);
+            float3 col = tintCol * (0.24 + 0.76 * diff);
+            col *= (0.25 + 0.75 * litV);
+            col *= 1.0 - 0.35 * rim;
+            // Depth from the exact hit point (view space, ro = 0).
+            float4 clip = cam.proj * float4(rdV * e, 1.0);
+            FOut o;
+            o.color = float4(cam.foamPad.x * col, cam.foamPad.x);   // premultiplied over
+            o.depth = clip.z / clip.w;
+            return o;
+        }
+
+        // --- historical solid path (unchanged; foamPad.x == 0) ---
         float z2 = 1.0 - dot(in.uv, in.uv);
         if (z2 < 0.0) { discard_fragment(); }   // outside the sphere disc
         float z = sqrt(max(z2, 0.0));
@@ -1948,26 +2188,6 @@ enum Shaders {
         // (exactly 1.0 when litFraction == 1.0 — the neutral fill).
         col *= (0.25 + 0.75 * litFraction[in.cellId]);
         col *= 1.0 - 0.35 * rim;
-
-        // V2.1 edge layer over the cell's own ring neighbours.
-        if (cam.edgePad.x > 0.0) {
-            float3 Cw = float3(positions[in.cellId]);
-            float3 PhW = Cw + in.radius * nW;   // exact sphere-surface point
-            float f1 = in.radius;
-            float f2 = INFINITY;
-            uint n = linkCounts[in.cellId];
-            uint base = in.cellId * params.maxValence;
-            for (uint k = 0; k < n; ++k) {
-                float d = distance(float3(positions[links[base + k]]), PhW);
-                f2 = min(f2, d);
-            }
-            // Wall width in world units, scaled by the cell's own radius so
-            // the band is size-invariant across a grown structure.
-            float w = max(cam.edgePad.y * f1, 1e-6);
-            float t = clamp((f2 - f1) / w, 0.0, 1.0);
-            float edge = 1.0 - t * t * (3.0 - 2.0 * t);   // 1 - smoothstep(0,1,t)
-            col *= 1.0 - cam.edgePad.x * edge;
-        }
 
         // True sphere-surface point (view space) -> exact fragment depth.
         float4 clip = cam.proj * float4(in.centerV + in.radius * nV, 1.0);
@@ -2084,12 +2304,17 @@ enum Shaders {
         uint  directionalLight;  // M5: 0 = unbiased omnidirectional (default), 1 = shared directional light
         uint  pad3;
         // --- V2.1 (appended; struct grows 216 -> 240 bytes) ---
-        float edges;             // edge-layer strength (0 = off, default)
-        float edgeWidth;         // wall width in cell RADII (band fades over edgeWidth*radius)
         float shadows;           // per-pixel shadow strength in directional mode (0 = per-cell fraction only)
         uint  shadowSamples;     // jittered shadow rays per hit pixel (4-8; cost ~ linear)
         uint  xrayColored;       // 0 = legacy grayscale density (bit-identical), 1 = per-channel tinted density
         uint  pad4;
+        // --- V2.1b (appended; struct grows 240 -> 248 bytes; the retired V2.1
+        // edges/edgeWidth fields were REMOVED — the foam chamber walls are the
+        // wall visualization now) ---
+        float foamOpacity;       // per-face opacity of the foam composite (solid foam)
+        uint  foamLayers;        // max composited chamber faces per ray (<= 8, clamped host-side)
+        float foamWall;          // foam-xray wall-crossing spike gain
+        uint  pad5;
     };
 
     // SimParams and the grid/march helpers (binHash, coarseHash,
@@ -2112,53 +2337,6 @@ enum Shaders {
                       (float)((h >> 16u) & 0xFFFFu) / 65535.0f - 0.5f);
     }
 
-    // V2.1 edge-layer helper: 1 - smoothstep over the wall band. dNearest =
-    // (nearest other centre distance - own centre distance) at the query
-    // point; the darkening ramps from full at dNearest <= 0 (on/inside the
-    // wall plane) to zero at dNearest = edgeWidth * radius (wall width
-    // scaled by the cell's own radius — size-invariant across grown
-    // structures).
-    static inline float edgeFactor(float dNearest, float rad, float edgeWidth) {
-        float w = max(edgeWidth * rad, 1e-6f);
-        float t = clamp(dNearest / w, 0.0f, 1.0f);
-        return 1.0f - t * t * (3.0f - 2.0f * t);
-    }
-
-    // V2.1 edge-layer query: nearest OTHER cell-centre distance from point X.
-    // Scans the 27-bin neighbourhood of X's bin — guaranteed to contain every
-    // centre within roi of X (the h >= roi rule; ALL cells are scattered into
-    // the grid, including the big-cell supplement's). Approximation
-    // (documented): an edge factor > 0 needs a centre within
-    // rad*(1 + edgeWidth) of X; for typical cells (rad ~ 0.3 roi) that is
-    // well inside roi and fully covered. Stretched near-roi cells may find
-    // their edge band slightly thinner than the true Voronoi wall.
-    static float nearestCentreDistance(float3 X, uint selfIdx,
-                                       device const float3* positions,
-                                       device const uint* binStarts,
-                                       device const uint* particleIndices,
-                                       constant SimParams& sp)
-    {
-        const float h = sp.roi;
-        float best = INFINITY;
-        int3 c = int3((int)floor(X.x / h), (int)floor(X.y / h), (int)floor(X.z / h));
-        for (int dz = -1; dz <= 1; ++dz) {
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    uint hh = binHash(c + int3(dx, dy, dz), sp);
-                    uint s = binStarts[hh];
-                    uint e = binStarts[hh + 1];
-                    for (uint idx = s; idx < e; ++idx) {
-                        uint r = particleIndices[idx];
-                        if (r == selfIdx) continue;
-                        float d = distance(float3(positions[r]), X);
-                        best = min(best, d);
-                    }
-                }
-            }
-        }
-        return best;
-    }
-
     // V2.1: jittered direction inside the cone of half-angle `soft` around
     // the light direction L (small-angle: sin ~ tan ~ soft). soft = 0 gives
     // L exactly. u = 2 uniform samples in [0, 1).
@@ -2168,6 +2346,34 @@ enum Shaders {
         float3 t1 = normalize(cross(L, helper));
         float3 t2 = cross(L, t1);
         return normalize(L + soft * (u.x * t1 + u.y * t2));
+    }
+
+    // V2.1b foam-solid: one composited chamber face along a ray. t = the
+    // chamber's ENTRY parameter; idx = the chamber's cell; wallJ = the ring
+    // neighbour whose power bisector produced the entry bound (a flat WALL
+    // entry — see foamChamberInterval), or 0xFFFFFFFF for a curved CAP entry
+    // (the union boundary; always a cap — see the visibility fact in `common`).
+    struct FoamFace {
+        float t;
+        uint  idx;
+        uint  wallJ;
+    };
+
+    // Insert into the top-K nearest-entry list, kept sorted ascending by t
+    // (K = maxFaces <= 8 — the composite's layer budget). Called per candidate
+    // AFTER the exactly-once anchor check, so a chamber enters the list at
+    // most once per ray.
+    static void foamFaceInsert(thread FoamFace* faces, thread uint* faceCount,
+                               uint maxFaces, float t, uint idx, uint wallJ) {
+        if (*faceCount < maxFaces) {
+            uint p = (*faceCount)++;
+            while (p > 0u && faces[p - 1u].t > t) { faces[p] = faces[p - 1u]; --p; }
+            faces[p] = FoamFace{ t, idx, wallJ };
+        } else if (t < faces[maxFaces - 1u].t) {
+            uint p = maxFaces - 1u;
+            while (p > 0u && faces[p - 1u].t > t) { faces[p] = faces[p - 1u]; --p; }
+            faces[p] = FoamFace{ t, idx, wallJ };
+        }
     }
 
     // Traversal over the hashed grid along the segment [t0, t1] of the ray
@@ -2187,9 +2393,24 @@ enum Shaders {
     //   neighbourhood: the closest segment point can be support away from
     //   the centre, i.e. profileSupport bins per axis for rad < h — the
     //   caller passes nbhdK = wantDensity ? ceil(profileSupport) : 1.
+    // V2.1b style 3 (foam-xray): the density foot clamps to the cell's CHAMBER
+    //   interval (foamChamberInterval — needs the link arrays) instead of the
+    //   scene segment, so the density follows the power-diagram chambers
+    //   (skirt cells contribute nothing), and every plane-raised chamber
+    //   entry — a WALL CROSSING — adds a thin obliquity-weighted density
+    //   spike (rp.foamWall): internal membranes in the X-ray. Style 1 keeps
+    //   the M4 accumulation bit-identical.
+    // V2.1b wantFoam (style 2): per candidate the CHAMBER entry (foam CSG,
+    //   needs the link arrays) is inserted into the top-K faces list — the
+    //   exactly-once anchor is the entry parameter e itself (the entry point
+    //   — cap or wall — always lies within rad of the centre, so the centre's
+    //   bin is in the anchor bin's 27-bin neighbourhood and e lies in exactly
+    //   one bin range of the partition).
     static void traverseGrid(float3 ro, float3 rd, float t0, float t1, uint count,
                              device const float3* positions,
                              device const float* radii,
+                             device const uint* links,
+                             device const uint* linkCounts,
                              device const uint* binStarts,
                              device const uint* particleIndices,
                              constant SimParams& sp,
@@ -2197,7 +2418,9 @@ enum Shaders {
                              constant RenderParams& rp,
                              device const float3* tint,
                              bool wantNearest, thread float* nearest, thread uint* nearestIdx,
-                             bool wantDensity, thread float3* density)
+                             bool wantDensity, thread float3* density,
+                             bool wantFoam, thread FoamFace* faces, thread uint* faceCount,
+                             uint maxFaces)
     {
         if (count == 0u || !(t1 > t0)) return;
         const float h = sp.roi;
@@ -2259,7 +2482,30 @@ enum Shaders {
                                 // foot tf (well-defined for every cell —
                                 // skirt cells included — and strictly inside
                                 // [t0, t1] thanks to the bounding inflation).
-                                float tf = clamp(tc, t0, t1);
+                                // V2.1b foam-xray (style 3): the foot clamps
+                                // to the CHAMBER interval — no chamber along
+                                // the ray, no contribution — and every
+                                // plane-raised entry (a WALL CROSSING) adds
+                                // the membrane spike below. The chamber-
+                                // clamped foot is per-candidate, so the
+                                // anchor stays exactly-once (one bin range
+                                // contains it, and the candidate is walked
+                                // at that bin because its entry point lies
+                                // within rad of the centre — the same proof
+                                // as the sphere-test walk).
+                                float tf;
+                                uint wallJ = 0xFFFFFFFFu;
+                                if (rp.style == 3u) {
+                                    if (dLine2 > rad * rad) continue;   // no sphere -> no chamber
+                                    float e, x;
+                                    if (!foamChamberInterval(ro, rd, C, rad, tc, dLine2, r,
+                                                             positions, radii,
+                                                             links, linkCounts, sp.maxValence,
+                                                             &e, &x, &wallJ)) continue;
+                                    tf = clamp(tc, e, x);
+                                } else {
+                                    tf = clamp(tc, t0, t1);
+                                }
                                 if (tf >= tCur && tf < tExitC) {
                                     // Distance from the centre to the SEGMENT
                                     // (clamped foot): rim spheres beyond the
@@ -2269,23 +2515,45 @@ enum Shaders {
                                     if (d2 < support * support) {
                                         float q = 1.0f - d2 / (support * support);
                                         float contrib = rad * q * q;
-                                        // V2.1 edge layer: darken the sphere's
-                                        // density where its foot point sits
-                                        // near a wall with a neighbouring cell
-                                        // (faint cell outlines woven into the
-                                        // density cloud). Skipped entirely at
-                                        // edges = 0 (bit-identical accumulation).
-                                        if (rp.edges > 0.0f) {
-                                            float f2 = nearestCentreDistance(ro + rd * tf, r, positions, binStarts, particleIndices, sp);
-                                            contrib *= 1.0f - rp.edges * edgeFactor(f2 - sqrt(d2), rad, rp.edgeWidth);
-                                        }
                                         // V2.1 coloured X-ray: per-channel
                                         // tinted density. Grayscale (0) keeps
                                         // the M4 accumulation bit-identical
                                         // (multiply by exactly (1,1,1)).
                                         float3 w3 = (rp.xrayColored != 0u) ? float3(tint[r]) : float3(1.0f, 1.0f, 1.0f);
                                         *density += w3 * contrib;
+                                        // V2.1b foam-xray wall crossing: thin-
+                                        // film density with the grazing
+                                        // obliquity factor 1/|rd·n̂| — a sheet's
+                                        // projected optical depth grows as it is
+                                        // seen edge-on, which is what draws the
+                                        // internal membrane LINES (clamped at 4x
+                                        // against near-tangent rays). Coloured
+                                        // X-ray tints the membrane with the two
+                                        // cells' average (the wall is shared).
+                                        if (rp.style == 3u && wallJ != 0xFFFFFFFFu) {
+                                            float3 nh = foamWallNormal(r, wallJ, positions);
+                                            float obliq = min(1.0f / max(fabs(dot(rd, nh)), 0.25f), 4.0f);
+                                            float3 wSpike = (rp.xrayColored != 0u)
+                                                ? 0.5f * (float3(tint[r]) + float3(tint[wallJ]))
+                                                : float3(1.0f, 1.0f, 1.0f);
+                                            *density += wSpike * (rp.foamWall * rad * obliq);
+                                        }
                                     }
+                                }
+                            }
+                            // V2.1b foam-solid: the chamber's ENTRY face joins
+                            // the top-K composite list — exactly once per ray
+                            // at the bin whose range contains the entry
+                            // parameter (see the function comment).
+                            if (wantFoam && dLine2 <= rad * rad) {
+                                float e, x;
+                                uint wallJ;
+                                if (foamChamberInterval(ro, rd, C, rad, tc, dLine2, r,
+                                                        positions, radii,
+                                                        links, linkCounts, sp.maxValence,
+                                                        &e, &x, &wallJ)
+                                    && e >= tCur && e < tExitC) {
+                                    foamFaceInsert(faces, faceCount, maxFaces, e, r, wallJ);
                                 }
                             }
                         }
@@ -2311,10 +2579,15 @@ enum Shaders {
     // tests them ONCE here (they are few — stretched cells only). Same
     // formulas as the grid path; the two sets are disjoint, so density adds
     // without double counting and the nearest hit is the min over both.
+    // V2.1b: the foam-xray (style 3) chamber treatment matches traverseGrid;
+    // the foam-solid (style 2) entries join the same top-K list (big cells
+    // are enumerated exactly once per ray by construction — no anchor needed).
     static void bigCellPass(float3 ro, float3 rd, float t0, float t1,
                             device const uint* bigCells, uint bigCount,
                             device const float3* positions,
                             device const float* radii,
+                            device const uint* links,
+                            device const uint* linkCounts,
                             device const uint* binStarts,
                             device const uint* particleIndices,
                             constant SimParams& sp,
@@ -2322,7 +2595,9 @@ enum Shaders {
                             constant RenderParams& rp,
                             device const float3* tint,
                             bool wantNearest, thread float* nearest, thread uint* nearestIdx,
-                            bool wantDensity, thread float3* density)
+                            bool wantDensity, thread float3* density,
+                            bool wantFoam, thread FoamFace* faces, thread uint* faceCount,
+                            uint maxFaces)
     {
         for (uint bi = 0; bi < bigCount; ++bi) {
             uint r = bigCells[bi];
@@ -2346,19 +2621,45 @@ enum Shaders {
                     *nearestIdx = r;
                 }
             }
+            if (wantFoam && dLine2 <= rad * rad) {
+                float e, x;
+                uint wallJ;
+                if (foamChamberInterval(ro, rd, C, rad, tc, dLine2, r,
+                                        positions, radii,
+                                        links, linkCounts, sp.maxValence,
+                                        &e, &x, &wallJ) && e < t1) {
+                    foamFaceInsert(faces, faceCount, maxFaces, e, r, wallJ);
+                }
+            }
             if (wantDensity) {
-                float tf = clamp(tc, t0, t1);
+                float tf;
+                uint wallJ = 0xFFFFFFFFu;
+                if (rp.style == 3u) {
+                    if (dLine2 > rad * rad) continue;   // no sphere -> no chamber
+                    float e, x;
+                    if (!foamChamberInterval(ro, rd, C, rad, tc, dLine2, r,
+                                             positions, radii,
+                                             links, linkCounts, sp.maxValence,
+                                             &e, &x, &wallJ)) continue;
+                    tf = clamp(tc, e, x);
+                } else {
+                    tf = clamp(tc, t0, t1);
+                }
                 float3 dv = C - (ro + rd * tf);
                 float d2 = dot(dv, dv);
                 if (d2 < support * support) {
                     float q = 1.0f - d2 / (support * support);
                     float contrib = rad * q * q;
-                    if (rp.edges > 0.0f) {
-                        float f2 = nearestCentreDistance(ro + rd * tf, r, positions, binStarts, particleIndices, sp);
-                        contrib *= 1.0f - rp.edges * edgeFactor(f2 - sqrt(d2), rad, rp.edgeWidth);
-                    }
                     float3 w3 = (rp.xrayColored != 0u) ? float3(tint[r]) : float3(1.0f, 1.0f, 1.0f);
                     *density += w3 * contrib;
+                    if (rp.style == 3u && wallJ != 0xFFFFFFFFu) {
+                        float3 nh = foamWallNormal(r, wallJ, positions);
+                        float obliq = min(1.0f / max(fabs(dot(rd, nh)), 0.25f), 4.0f);
+                        float3 wSpike = (rp.xrayColored != 0u)
+                            ? 0.5f * (float3(tint[r]) + float3(tint[wallJ]))
+                            : float3(1.0f, 1.0f, 1.0f);
+                        *density += wSpike * (rp.foamWall * rad * obliq);
+                    }
                 }
             }
         }
@@ -2368,12 +2669,21 @@ enum Shaders {
     // N (formula in the header comment). Occluders = all spheres within
     // aoRadius of Ph, gathered from the grid with a cube walk
     // (2*(aoRadius/h) + 1 bins per axis).
+    // V2.1b: selfA/selfB are EXCLUDED explicitly. The solid/cap callers pass
+    // (0xFFFFFFFF, 0xFFFFFFFF) — the cell's own sphere already contributes
+    // exactly zero at a cap point (cosT <= 0 by construction), so behaviour
+    // is bit-identical to the pre-V2.1b form. Foam WALL callers pass the two
+    // cells sharing the wall: the wall point lies INSIDE both spheres, and
+    // without the exclusion they would read as two huge occluders sitting
+    // behind the surface (the wall is their shared boundary — the material
+    // behind a surface does not occlude it).
     static float ambientOcclusion(float3 Ph, float3 N, float aoRadius, float aoStrength,
                                   device const float3* positions,
                                   device const float* radii,
                                   device const uint* binStarts,
                                   device const uint* particleIndices,
-                                  constant SimParams& sp)
+                                  constant SimParams& sp,
+                                  uint selfA, uint selfB)
     {
         const float h = sp.roi;
         float r2max = aoRadius * aoRadius;
@@ -2392,6 +2702,7 @@ enum Shaders {
                     uint e = binStarts[hh + 1];
                     for (uint idx = s; idx < e; ++idx) {
                         uint r = particleIndices[idx];
+                        if (r == selfA || r == selfB) continue;
                         float rad = radii[r];
                         if (rad <= 0.0f) continue;
                         float3 dv = float3(positions[r]) - Ph;
@@ -2408,6 +2719,74 @@ enum Shaders {
         return clamp(1.0f - aoStrength * occ, 0.0f, 1.0f);
     }
 
+    // V2.1b: surface shading shared by the solid style and the foam faces
+    // (caps AND walls). Extracted VERBATIM from the M4/V2.1 solid block —
+    // the arithmetic order is unchanged, so the solid goldens stay
+    // byte-identical (ambientOcclusion's new exclusion params receive
+    // (hit, none) there: the hit cell contributed exactly zero before —
+    // cosT <= 0 at its own cap point — and the shadow march's second
+    // self-index never matches).
+    //
+    //   Ph    surface point; N shading normal (sphere normal for caps; the
+    //         canonical wall normal flipped toward the camera for walls)
+    //   tintV/litV  the face's tint and illumination fraction: the cell's own
+    //         for caps and the solid style; the two cells' AVERAGE for walls
+    //         (the wall is shared — both sides must shade it identically)
+    //   selfB second cell excluded from the AO cube walk and the shadow march
+    //         (walls: the wall partner — the wall point lies inside both
+    //         chambers' spheres; 0xFFFFFFFF = none)
+    //
+    // Directional mode (M5 unified light): vis = mix(per-cell fraction,
+    // per-pixel ray average, shadow strength); shade = 0.2 + 0.8*ndl*vis (the
+    // M5 ambient-floor form). AO stays the OMNIDIRECTIONAL self-shadowing
+    // multiplier (paper §5/§6 style 1); the shadow term is the DIRECTIONAL
+    // occlusion inside the Lambertian response — the standard ambient+direct
+    // split: col = tint·(aoFloor + (1−aoFloor)·ao)·(0.2 + 0.8·ndl·vis).
+    // Unbiased mode (directionalLight == 0) reads neither litFraction nor
+    // shadow rays: shade = 1 exactly (M4 goldens byte-identical).
+    static float3 shadeSurface(float3 Ph, float3 N, float3 tintV, float litV,
+                               uint selfIdx, uint selfB,
+                               uint px, uint py,
+                               device const float3* positions,
+                               device const float* radii,
+                               device const uint* binStarts,
+                               device const uint* particleIndices,
+                               device const uint* occupancy,
+                               constant SimParams& sp,
+                               constant RenderParams& rp)
+    {
+        float ao = ambientOcclusion(Ph, N, rp.aoRadius, rp.aoStrength,
+                                    positions, radii, binStarts,
+                                    particleIndices, sp, selfIdx, selfB);
+        float shade = 1.0f;
+        if (rp.directionalLight != 0u) {
+            float3 L = normalize(rp.lightDir.xyz);
+            float ndl = max(dot(N, L), 0.0f);
+            float vis = litV;
+            if (rp.shadows > 0.0f && rp.shadowSamples > 0u) {
+                // Per-pixel penumbra: hard occlusion along jittered
+                // directions inside the light's angular cone. Sample stream
+                // starts BEYOND the AA sample indices (s + rp.samples) so the
+                // two jitters are decorrelated but both deterministic.
+                float shadowT1 = length(Ph) + length(rp.boundingCentre.xyz)
+                               + 2.0f * rp.boundingRadius + 2.0f * sp.roi;
+                float visAccum = 0.0f;
+                for (uint ss = 0; ss < rp.shadowSamples; ++ss) {
+                    float2 sj = sampleJitter(px, py, rp.samples + ss, rp.renderSeed);
+                    float3 srd = coneJitter(L, sp.lightSoft, sj);
+                    visAccum += (lightVisibility(Ph, srd, 1e-3f, shadowT1, selfIdx,
+                                                 selfB, 0.0f, positions, radii,
+                                                 binStarts, particleIndices,
+                                                 occupancy, sp) > 0.0f) ? 1.0f : 0.0f;
+                }
+                float visPixel = visAccum / float(rp.shadowSamples);
+                vis = mix(vis, visPixel, clamp(rp.shadows, 0.0f, 1.0f));
+            }
+            shade = 0.2f + 0.8f * ndl * vis;
+        }
+        return tintV * (rp.aoFloor + (1.0f - rp.aoFloor) * ao) * shade;
+    }
+
     // One thread per pixel of the current tile.
     //
     // Buffer table:
@@ -2420,6 +2799,8 @@ enum Shaders {
     //   8 tint (const; M5 per-cell albedo from the cellTint kernel)
     //   9 litFraction (const; V2.1 per-cell illumination fraction from illuminate)
     //  10 occupancy (const; M6 coarse skip map — the shadow marches skip on it)
+    //  11 links (const; V2.1b foam chamber CSG — the cells' rings)
+    //  12 linkCounts (const; V2.1b)
     kernel void raytraceTile(texture2d<float, access::write> outTex [[texture(0)]],
                              device const float3* positions [[buffer(0)]],
                              device const float*   radii [[buffer(1)]],
@@ -2432,6 +2813,8 @@ enum Shaders {
                              device const float3* tint [[buffer(8)]],
                              device const float*  litFraction [[buffer(9)]],
                              device const uint*   occupancy [[buffer(10)]],
+                             device const uint*   links [[buffer(11)]],
+                             device const uint*   linkCounts [[buffer(12)]],
                              uint2 gid [[thread_position_in_grid]])
     {
         if (gid.x >= rp.tileW || gid.y >= rp.tileH) return;
@@ -2440,12 +2823,16 @@ enum Shaders {
         const uint py = rp.tileY + gid.y;
         const float aspect = (float)rp.imageW / (float)rp.imageH;
         const bool solid = (rp.style == 0u);
+        const bool foam = (rp.style == 2u);
+        const bool density = (rp.style == 1u || rp.style == 3u);
 
         float3 accum = float3(0.0);
         float3 densAccum = float3(0.0);
         float dummyF = 0.0f;      // wantNearest dummy (float*, traverseGrid contract)
         float3 dummyF3 = float3(0.0);   // wantDensity dummy
         uint  dummyU = 0u;
+        FoamFace dummyFaces[1];   // wantFoam dummy (non-foam styles never touch it)
+        uint  dummyFaceCount = 0u;
 
         for (uint s = 0; s < rp.samples; ++s) {
             float2 j = sampleJitter(px, py, s, rp.renderSeed);
@@ -2468,7 +2855,7 @@ enum Shaders {
             float d2 = dot(b, b) - tc * tc;
             float br = rp.boundingRadius;
             if (d2 > br * br) {
-                if (solid) accum += rp.background.xyz;
+                if (solid || foam) accum += rp.background.xyz;
                 continue;   // xray: nothing along the ray
             }
             float thc = sqrt(br * br - d2);
@@ -2478,103 +2865,117 @@ enum Shaders {
             if (solid) {
                 float nearest = INFINITY;
                 uint hitIdx = 0u;
-                traverseGrid(ro, rd, t0, t1, count, positions, radii, binStarts,
-                             particleIndices, sp, rp.profileSupport, 1u, rp, tint,
+                traverseGrid(ro, rd, t0, t1, count, positions, radii, links, linkCounts,
+                             binStarts, particleIndices, sp, rp.profileSupport, 1u, rp, tint,
                              true, &nearest, &hitIdx,
-                             false, &dummyF3);
+                             false, &dummyF3,
+                             false, dummyFaces, &dummyFaceCount, 1u);
                 bigCellPass(ro, rd, t0, t1, bigCells, rp.bigCount, positions, radii,
-                            binStarts, particleIndices, sp, rp.profileSupport, rp, tint,
-                            true, &nearest, &hitIdx, false, &dummyF3);
+                            links, linkCounts, binStarts, particleIndices, sp,
+                            rp.profileSupport, rp, tint,
+                            true, &nearest, &hitIdx, false, &dummyF3,
+                            false, dummyFaces, &dummyFaceCount, 1u);
                 if (nearest < INFINITY) {
                     float3 C = float3(positions[hitIdx]);
                     float rad = radii[hitIdx];
                     float3 Ph = ro + rd * nearest;
                     float3 N = (Ph - C) / max(rad, 1e-9f);   // (hit - centre)/radius
-                    float ao = ambientOcclusion(Ph, N, rp.aoRadius, rp.aoStrength,
-                                                positions, radii, binStarts,
-                                                particleIndices, sp);
-                    // M5 unified light: per-cell tint (neutral = the pre-M5
-                    // albedo, so unbiased renders are byte-identical to M4).
-                    //
-                    // V2.1 directional shading: the per-cell illumination
-                    // FRACTION the growth used (litFraction — smooth per-cell
-                    // soft-light visibility), refined per pixel by jittered
-                    // shadow rays through the light's angular cone (the same
-                    // lightSoft radius — one physical light). Combination
-                    // (documented): vis = mix(per-cell fraction, per-pixel
-                    // ray average, shadow strength); shade = 0.2 + 0.8*ndl*vis
-                    // (the M5 ambient-floor form). AO stays the OMNIDIRECTIONAL
-                    // self-shadowing multiplier (paper §5/§6 style 1); the
-                    // shadow term is the DIRECTIONAL occlusion inside the
-                    // Lambertian response — the standard ambient+direct split:
-                    //   col = tint * (aoFloor + (1-aoFloor)*ao) * (0.2 + 0.8*ndl*vis)
-                    // Unbiased mode (directionalLight == 0) reads neither
-                    // litFraction nor shadow rays: shade = 1 exactly (M4
-                    // goldens byte-identical).
-                    float shade = 1.0f;
-                    if (rp.directionalLight != 0u) {
-                        float3 L = normalize(rp.lightDir.xyz);
-                        float ndl = max(dot(N, L), 0.0f);
-                        float vis = litFraction[hitIdx];
-                        if (rp.shadows > 0.0f && rp.shadowSamples > 0u) {
-                            // Per-pixel penumbra: hard occlusion along
-                            // jittered directions inside the light's angular
-                            // cone. Sample stream starts BEYOND the AA sample
-                            // indices (s + rp.samples) so the two jitters are
-                            // decorrelated but both deterministic.
-                            float shadowT1 = length(Ph) + length(rp.boundingCentre.xyz)
-                                           + 2.0f * rp.boundingRadius + 2.0f * sp.roi;
-                            float visAccum = 0.0f;
-                            for (uint ss = 0; ss < rp.shadowSamples; ++ss) {
-                                float2 sj = sampleJitter(px, py, rp.samples + ss, rp.renderSeed);
-                                float3 srd = coneJitter(L, sp.lightSoft, sj);
-                                visAccum += (lightVisibility(Ph, srd, 1e-3f, shadowT1, hitIdx,
-                                                             0.0f, positions, radii,
-                                                             binStarts, particleIndices,
-                                                             occupancy, sp) > 0.0f) ? 1.0f : 0.0f;
-                            }
-                            float visPixel = visAccum / float(rp.shadowSamples);
-                            vis = mix(vis, visPixel, clamp(rp.shadows, 0.0f, 1.0f));
-                        }
-                        shade = 0.2f + 0.8f * ndl * vis;
-                    }
-                    float3 col = float3(tint[hitIdx])
-                               * (rp.aoFloor + (1.0f - rp.aoFloor) * ao) * shade;
-                    // V2.1 edge layer at the primary hit (F1 = own radius —
-                    // the hit point lies exactly on the sphere; F2 = nearest
-                    // other centre, grid query at the hit point).
-                    if (rp.edges > 0.0f) {
-                        float f2 = nearestCentreDistance(Ph, hitIdx, positions, binStarts, particleIndices, sp);
-                        col *= 1.0f - rp.edges * edgeFactor(f2 - rad, rad, rp.edgeWidth);
-                    }
-                    accum += col;
+                    // M5 unified light + V2.1 directional shading, factored
+                    // VERBATIM into shadeSurface (V2.1b) so the solid and the
+                    // foam faces share one implementation: AO = the
+                    // omnidirectional self-shadowing (paper §5/§6 style 1);
+                    // the shadow term = the DIRECTIONAL occlusion inside the
+                    // Lambertian response (per-cell illumination fraction
+                    // refined by jittered cone shadow rays). Per-cell tint
+                    // (neutral = the pre-M5 albedo, so unbiased renders are
+                    // byte-identical to M4).
+                    accum += shadeSurface(Ph, N, float3(tint[hitIdx]), litFraction[hitIdx],
+                                          hitIdx, 0xFFFFFFFFu, px, py,
+                                          positions, radii, binStarts, particleIndices,
+                                          occupancy, sp, rp);
                 } else {
                     accum += rp.background.xyz;
                 }
-            } else {
+            } else if (foam) {
+                // V2.1b foam (style 2): composite the nearest CHAMBER entry
+                // faces front to back with per-face opacity. The union
+                // boundary is always a cap; every wall crossed by the ray is
+                // the following chamber's entry (see the visibility fact in
+                // `common`), so the flat walls show THROUGH the translucent
+                // front caps — walls behind walls, the soap-froth depth.
+                FoamFace faces[8];
+                uint faceCount = 0u;
+                const uint maxFaces = min(rp.foamLayers, 8u);
+                traverseGrid(ro, rd, t0, t1, count, positions, radii, links, linkCounts,
+                             binStarts, particleIndices, sp, rp.profileSupport, 1u, rp, tint,
+                             false, &dummyF, &dummyU,
+                             false, &dummyF3,
+                             true, faces, &faceCount, maxFaces);
+                bigCellPass(ro, rd, t0, t1, bigCells, rp.bigCount, positions, radii,
+                            links, linkCounts, binStarts, particleIndices, sp,
+                            rp.profileSupport, rp, tint,
+                            false, &dummyF, &dummyU, false, &dummyF3,
+                            true, faces, &faceCount, maxFaces);
+                float T = 1.0f;
+                for (uint f = 0; f < faceCount; ++f) {
+                    float3 col;
+                    const uint idx = faces[f].idx;
+                    const float3 C = float3(positions[idx]);
+                    const float3 Ph = ro + rd * faces[f].t;
+                    if (faces[f].wallJ == 0xFFFFFFFFu) {
+                        // Curved cap: the solid shading with the sphere normal.
+                        float rad = radii[idx];
+                        float3 N = (Ph - C) / max(rad, 1e-9f);
+                        col = shadeSurface(Ph, N, float3(tint[idx]), litFraction[idx],
+                                           idx, 0xFFFFFFFFu, px, py,
+                                           positions, radii, binStarts, particleIndices,
+                                           occupancy, sp, rp);
+                    } else {
+                        // Flat wall: the canonical bisector normal flipped
+                        // toward the camera; tint and illumination are the two
+                        // cells' AVERAGE — the wall is shared, so both sides
+                        // shade it identically.
+                        float3 nh = foamWallNormal(idx, faces[f].wallJ, positions);
+                        float3 N = dot(nh, rd) > 0.0f ? -nh : nh;
+                        float3 tintV = 0.5f * (float3(tint[idx]) + float3(tint[faces[f].wallJ]));
+                        float litV = 0.5f * (litFraction[idx] + litFraction[faces[f].wallJ]);
+                        col = shadeSurface(Ph, N, tintV, litV, idx, faces[f].wallJ, px, py,
+                                           positions, radii, binStarts, particleIndices,
+                                           occupancy, sp, rp);
+                    }
+                    accum += T * rp.foamOpacity * col;
+                    T *= 1.0f - rp.foamOpacity;
+                    if (T < 0.02f) break;   // deeper layers contribute < 2%
+                }
+                accum += T * rp.background.xyz;   // gaps + the attenuated background
+            } else if (density) {
                 float3 dens = float3(0.0);
-                traverseGrid(ro, rd, t0, t1, count, positions, radii, binStarts,
-                             particleIndices, sp, rp.profileSupport,
+                traverseGrid(ro, rd, t0, t1, count, positions, radii, links, linkCounts,
+                             binStarts, particleIndices, sp, rp.profileSupport,
                              (uint)ceil(rp.profileSupport), rp, tint,
                              false, &dummyF, &dummyU,
-                             true, &dens);
+                             true, &dens,
+                             false, dummyFaces, &dummyFaceCount, 1u);
                 bigCellPass(ro, rd, t0, t1, bigCells, rp.bigCount, positions, radii,
-                            binStarts, particleIndices, sp, rp.profileSupport, rp, tint,
-                            false, &dummyF, &dummyU, true, &dens);
+                            links, linkCounts, binStarts, particleIndices, sp,
+                            rp.profileSupport, rp, tint,
+                            false, &dummyF, &dummyU, true, &dens,
+                            false, dummyFaces, &dummyFaceCount, 1u);
                 densAccum += dens;
             }
         }
 
         float4 out;
-        if (solid) {
-            out = float4(accum / float(max(rp.samples, 1u)), 1.0f);
-        } else {
+        if (density) {
             // V2.1: per-channel tone map (grayscale path accumulates the same
             // scalar density in all three channels — bit-identical to M4).
             float3 dens = densAccum / float(max(rp.samples, 1u)) * rp.densityScale;
             float3 L = 1.0f - exp(-dens * rp.xrayExposure);
             L = pow(L, 1.0f / max(rp.xrayGamma, 1e-3f));
             out = float4(L, 1.0f);
+        } else {
+            // solid AND foam: straight colour average over the AA samples.
+            out = float4(accum / float(max(rp.samples, 1u)), 1.0f);
         }
         outTex.write(out, gid);
     }
@@ -2588,6 +2989,7 @@ enum Shaders {
     //   0 out (write, 96 x float)   1 positions   2 radii   3 binStarts
     //   4 particleIndices   5 cellCounter   6 RenderParams   7 SimParams
     //   8 bigCells (supplement)   9 probe pixel (2 x uint)   10 tint (const)
+    //  11 links   12 linkCounts (V2.1b: traverseGrid's foam signature)
     kernel void raytraceProbe(device float* out [[buffer(0)]],
                               device const float3* positions [[buffer(1)]],
                               device const float* radii [[buffer(2)]],
@@ -2599,6 +3001,8 @@ enum Shaders {
                               device const uint* bigCells [[buffer(8)]],
                               device const uint* probePixel [[buffer(9)]],
                               device const float3* tint [[buffer(10)]],
+                              device const uint* links [[buffer(11)]],
+                              device const uint* linkCounts [[buffer(12)]],
                               uint gid [[thread_position_in_grid]])
     {
         if (gid != 0u) return;
@@ -2626,13 +3030,18 @@ enum Shaders {
         float nearest = INFINITY;
         uint hitIdx = 0u;
         float3 dens = float3(0.0);
-        traverseGrid(ro, rd, t0, t1, count, positions, radii, binStarts,
-                     particleIndices, sp, rp.profileSupport,
+        FoamFace dummyFaces[1];
+        uint dummyFaceCount = 0u;
+        traverseGrid(ro, rd, t0, t1, count, positions, radii, links, linkCounts,
+                     binStarts, particleIndices, sp, rp.profileSupport,
                      (uint)ceil(rp.profileSupport), rp, tint,
-                     true, &nearest, &hitIdx, true, &dens);
+                     true, &nearest, &hitIdx, true, &dens,
+                     false, dummyFaces, &dummyFaceCount, 1u);
         bigCellPass(ro, rd, t0, t1, bigCells, rp.bigCount, positions, radii,
-                    binStarts, particleIndices, sp, rp.profileSupport, rp, tint,
-                    true, &nearest, &hitIdx, true, &dens);
+                    links, linkCounts, binStarts, particleIndices, sp,
+                    rp.profileSupport, rp, tint,
+                    true, &nearest, &hitIdx, true, &dens,
+                    false, dummyFaces, &dummyFaceCount, 1u);
         out[2] = nearest;
         out[3] = (float)hitIdx;
         out[4] = dens.x;   // xray accumulation on the same ray (bonus diagnostic)

@@ -357,3 +357,39 @@ divisions remain organized in the lit band that moves with the growing form
 (the paper §7 "rhythmic pulses and waves of growth propagating across
 surfaces"). Active fraction (pulse > 0.05) at t=2000: 14.1% light vs 6.0%
 uniform.
+
+## V2.1b foam rendering (power-diagram chambers) — 2026-11-12 — Apple M1 Pro
+
+Render cost of the foam styles vs their base styles (release, 1600x1200,
+samples 1, `--state-load` replays; wall ~= gpu seconds). Foam-solid replaces
+the per-candidate sphere test with the interval CSG (<= 16 power-bisector
+plane clips per candidate) plus the top-K face insertions; foam-xray keeps
+the density walk and adds the chamber clip + wall spikes per candidate.
+radiusScale 0.7 everywhere (the foam contract: walls need overlap; the
+states' own radii were recomputed with it).
+
+| state | cells | solid | foam | foam/solid | xray | foam-xray | fx/xray |
+|---|---|---|---|---|---|---|---|
+| grown A (v21b-foam-grown.state) | 83 739 | 0.35 s | 1.57 s | 4.5x | 0.92 s | 1.13 s | 1.2x |
+| grown B (bench, 6200 steps) | 221 868 | 0.65 s | 3.45 s | 5.3x | 1.70 s | 2.13 s | 1.25x |
+| ball subdiv 8 (static) | 655 362 | 0.83 s | 3.01 s | 3.6x | — | — | — |
+
+The foam-solid ratio (3.6-5.3x) is the CSG's <= 16 plane clips per candidate
+against the solid path's single sphere test, amplified by candidate density
+along the ray (grown states pack more candidates per ray than the smooth
+ball). Interactive impostor foam: whole `--screenshot` run (process start +
+state load + one render + PNG; the delta isolates the foam cost incl. the
+one-off back-to-front sort) — solid 0.12 s vs foam 0.11 s at 83 739 cells;
+solid 0.75 s vs foam 0.78 s at 655 362 cells (the sort of 655k indices is in
+the delta: ~tens of ms). The impostor foam's per-fragment cost (<= 16 plane
+tests on the cell's own quad) is ~nil against rasterization.
+
+foamWall tuning (foam-xray spike gain, grown A, 800x600): 1.5 saturates the
+film curve (membrane web washed out), 0.15 is faint; default set to 0.25.
+
+Retirement note: the V2.1 painted edge layer (`--edges`/`--edge-width`) was
+removed in this milestone (the user rejected the painted-on look); the
+v21-solid-edges golden (png+meta+state) was deleted; the remaining 11
+pre-V2.1b goldens PASS byte-identical (the edge code was a no-op at their
+recorded edges=0), and 3 new foam goldens (v21b-foam-ball, v21b-foam-grown
+snapshot replay, v21b-foam-imp-ball) capture+check PASS.

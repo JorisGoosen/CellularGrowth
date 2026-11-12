@@ -146,11 +146,11 @@ final class SimViewModel: ObservableObject, ViewInput {
     @Published var xrayGain: Double = 0.3 {
         didSet { renderer.xrayGain = Float(xrayGain) }
     }
-    /// V2.1 edge-layer strength (solid impostor path; 0 = off). Same value
-    /// the ray tracer's --edges uses — the wall blend is a render parameter,
-    /// not a style.
-    @Published var edges: Double = 0 {
-        didSet { renderer.edgeStrength = Float(edges) }
+    /// V2.1b foam composite opacity (the foam impostor path). 0.5 makes the
+    /// two-layer blend order-insensitive; the back-to-front instance sort
+    /// handles deeper stacks.
+    @Published var foamOpacity: Double = 0.5 {
+        didSet { renderer.foamOpacity = Float(foamOpacity) }
     }
     // --- M6 presets (Core/Presets.swift) ---
     @Published var presetName: String? {

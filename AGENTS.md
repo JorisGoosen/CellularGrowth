@@ -80,9 +80,15 @@ Headless flags: `--steps N`, `--subdiv N`, `--jitter F`, `--spring F`,
 `--render-light auto|growth|unbiased`. M6: `--preset
 ball|brain|plant|coral|degenerate-demo`, `--anim DIR`, `--anim-steps N`,
 `--anim-frames M`, `--stereo`, `--interocular F`,
-`--screenshot-style solid|xray`. V2.1: `--edges F`, `--edge-width F`,
-`--shadows F`, `--xray-color`, `--light-soft F`. V2.2: `--tint
-none|chemical|food|pulse`, `--heat-scale F`, `--pulse-decay F`.
+`--screenshot-style solid|xray|foam`. V2.1: `--shadows F`, `--xray-color`,
+`--light-soft F`. V2.2: `--tint
+none|chemical|food|pulse`, `--heat-scale F`, `--pulse-decay F`. V2.1b:
+`--style solid|xray|foam|foam-xray` (foam = power-diagram chambers: flat
+walls + curved caps, translucent composite) and `--radius-scale F` (render
+radius scale; foam recommends 0.7 — at 0.5 neighbours merely touch and walls
+degenerate to points; foam look knobs via env CG_FOAM_OPACITY/CG_FOAM_LAYERS/
+CG_FOAM_WALL). The V2.1 `--edges`/`--edge-width` flags are RETIRED (painted
+edge layer removed in V2.1b).
 
 Scratch-artefact policy: screenshots, test renders and debug dumps go under
 `/private/tmp/opencode/cellulargrowth/` (pre-approved scratch) — NOT generic
@@ -116,6 +122,11 @@ RNG, raw SimParams); v1/v2 files load read-only-legacy. `docs/golden/*.state`
 files written from M6 onward are v3.
 
 ## Data layout & Metal conventions
+
+- Shaders.swift is COMPOSED from chunks: `common` (one canonical SimParams +
+  shared helpers) + `simKernels` / `renderKernels` / `raytraceKernels`. Never
+  duplicate MSL code verbatim between strings — put it in `common` (found MSL
+  refactor, V2.1).
 
 - Swift `SIMD3<Float>`: size 12, **alignment 16, stride 16**. MSL `device
   float3*` also strides 16. Always copy with

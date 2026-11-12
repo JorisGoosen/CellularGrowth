@@ -31,6 +31,8 @@ struct RayRenderSettings {
     enum Style: UInt32 {
         case solid = 0
         case xray = 1
+        case foam = 2          // V2.1b: power-diagram foam chambers, translucent composite
+        case foamXray = 3      // V2.1b: X-ray over the foam chambers + wall-crossing membranes
     }
 
     var style: Style = .solid
@@ -65,6 +67,22 @@ struct RayRenderSettings {
     /// look; 1 = hard chord integral).
     var profileSupport: Float = 2.0
     var backgroundXray = SIMD3<Float>(0, 0, 0)
+    // --- V2.1b foam (the painted V2.1 edge layer is RETIRED — the foam walls
+    // are the wall visualization; see the chamber geometry in Shaders.swift) ---
+    /// Per-face opacity of the front-to-back chamber composite (solid foam).
+    /// 0.5 also makes the interactive impostor path's two-layer blending
+    /// order-insensitive for the front pair. The soap-froth depth: with 0.5
+    /// the first wall behind a cap weighs 25%, the next layer 12.5%.
+    var foamOpacity: Float = 0.5
+    /// Max composited chamber faces per ray (the kernel clamps to 8). With
+    /// opacity 0.5 the transmittance after 6 faces is 1.6% — the cut is
+    /// invisible; dense grown foams can hold 10+ chambers per ray.
+    var foamLayers: Int = 6
+    /// Foam-xray wall-crossing spike gain (obliquity-weighted thin-film term;
+    /// see traverseGrid): the internal membrane lines of the microscopy look.
+    /// Tuned on the 84k grown state: 1.5 saturates the film curve, 0.15 is
+    /// faint; 0.25 keeps the membranes readable inside the density cloud.
+    var foamWall: Float = 0.25
     // --- shared ---
     /// Seed for the deterministic AA jitter.
     var seed: UInt32 = 991
@@ -88,13 +106,6 @@ struct RayRenderSettings {
     /// by hand).
     var eyeShift: SIMD3<Float> = .zero
     // --- V2.1 ---
-    /// Edge-layer strength (0 = off, default). At every primary hit (solid)
-    /// or per contributing sphere (xray): darken where the query point is
-    /// near the wall with a neighbouring cell. Blend parameter, not a style.
-    var edges: Float = 0
-    /// Wall width in cell RADII: the darkening band fades over
-    /// edgeWidth × radius (size-invariant across a grown structure).
-    var edgeWidth: Float = 0.12
     /// Per-pixel shadow strength in DIRECTIONAL solid mode (0 = shade with
     /// the per-cell illumination fraction only, no shadow rays; 1 = full
     /// per-pixel penumbra). Shadows exist ONLY under the directional light —
@@ -112,7 +123,10 @@ struct RayRenderSettings {
 /// float4 members on both sides so there is no float3-in-struct alignment
 /// ambiguity (Swift SIMD3<Float> aligns to 16; MSL float3 struct layout is a
 /// documented trap). 20 scalar fields (80 B) + 8 float4 (128 B) + 2 uint (8 B)
-/// = 216 bytes, + the V2.1 tail (6 x 4 B) = 240 bytes.
+/// = 216 bytes, + the V2.1 tail (4 x 4 B) = 232 bytes, + the V2.1b tail
+/// (2 x 4 B floats + 2 x 4 B uints) = 248 bytes. The retired V2.1
+/// edges/edgeWidth fields were removed in V2.1b (the foam walls replaced the
+/// painted edge layer).
 /// Render-only uniform block — deliberately NOT appended to SimParams (that
 /// struct is the simulation contract; render tuning changes freely here).
 struct RayRenderParams {
@@ -147,12 +161,15 @@ struct RayRenderParams {
     var directionalLight: UInt32 = 0                 // M5: 0 unbiased (default), 1 shared directional
     var pad3: UInt32 = 0
     // --- V2.1 (appended) ---
-    var edges: Float = 0            // edge-layer strength (0 = off)
-    var edgeWidth: Float = 0.12     // wall width in cell radii
     var shadows: Float = 1.0        // per-pixel shadow strength (directional only)
     var shadowSamples: UInt32 = 4   // jittered shadow rays per hit pixel
     var xrayColored: UInt32 = 0     // 0 grayscale (legacy), 1 per-channel tinted
     var pad4: UInt32 = 0
+    // --- V2.1b (appended; the retired edges/edgeWidth fields were removed) ---
+    var foamOpacity: Float = 0.5    // per-face opacity of the foam composite
+    var foamLayers: UInt32 = 6      // max composited chamber faces per ray (<= 8)
+    var foamWall: Float = 0.25       // foam-xray wall-crossing spike gain
+    var pad5: UInt32 = 0
 }
 
 // MSL's .xyz swizzle for the float4 members of RayRenderParams.
@@ -180,7 +197,7 @@ final class RayRenderer {
     private var bigCellsBuffer: MTLBuffer!
 
     /// Expected byte size of RayRenderParams (guards layout drift).
-    private static let paramsSize = 240
+    private static let paramsSize = 248
 
     init(device: MTLDevice, queue: MTLCommandQueue, sim: CellSim) {
         self.device = device
@@ -264,7 +281,8 @@ final class RayRenderer {
         p.renderSeed = settings.seed
         p.densityScale = settings.densityScale
         p.profileSupport = settings.profileSupport
-        p.background = SIMD4(settings.style == .solid ? settings.backgroundSolid : settings.backgroundXray, 1)
+        p.background = SIMD4(settings.style == .xray || settings.style == .foamXray
+                             ? settings.backgroundXray : settings.backgroundSolid, 1)
         p.camEye = SIMD4(eye, 1)
         p.camRight = SIMD4(right, 0)
         p.camUp = SIMD4(up, 0)
@@ -272,11 +290,13 @@ final class RayRenderer {
         p.boundingCentre = SIMD4(centre, 1)
         p.albedo = SIMD4(settings.albedo, 0)
         // V2.1 render knobs.
-        p.edges = settings.edges
-        p.edgeWidth = settings.edgeWidth
         p.shadows = settings.shadows
         p.shadowSamples = UInt32(max(0, settings.shadowSamples))
         p.xrayColored = settings.xrayColored ? 1 : 0
+        // V2.1b foam knobs.
+        p.foamOpacity = max(min(settings.foamOpacity, 1), 0.02)
+        p.foamLayers = UInt32(max(1, min(settings.foamLayers, 8)))
+        p.foamWall = max(settings.foamWall, 0)
         // M5 unified light: nil = unbiased (paper default); otherwise shade
         // with the shared growth light direction.
         if let dl = settings.directionalLight {
@@ -439,6 +459,8 @@ final class RayRenderer {
                 enc.setBuffer(sim.tintBuffer, offset: 0, index: 8)   // M5 per-cell colour
                 enc.setBuffer(sim.litFractionBuffer, offset: 0, index: 9)   // V2.1 illumination fractions
                 enc.setBuffer(sim.occupancyBuffer, offset: 0, index: 10)   // M6 coarse skip (shadow marches)
+                enc.setBuffer(sim.linksBuffer, offset: 0, index: 11)        // V2.1b foam CSG (rings)
+                enc.setBuffer(sim.linkCountsBuffer, offset: 0, index: 12)   // V2.1b
                 enc.dispatchThreads(MTLSize(width: tw, height: th, depth: 1),
                                     threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
                 enc.endEncoding()
@@ -513,6 +535,8 @@ final class RayRenderer {
         enc.setBuffer(bigCellsBuffer, offset: 0, index: 8)
         enc.setBuffer(pxBuf, offset: 0, index: 9)
         enc.setBuffer(sim.tintBuffer, offset: 0, index: 10)   // V2.1: traverseGrid signature
+        enc.setBuffer(sim.linksBuffer, offset: 0, index: 11)   // V2.1b: traverseGrid signature
+        enc.setBuffer(sim.linkCountsBuffer, offset: 0, index: 12)   // V2.1b
         enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
         enc.endEncoding()
@@ -540,7 +564,14 @@ final class RayRenderer {
     /// no dedup machinery exists to match) and compare against the rendered
     /// bytes. Validates the DDA traversal, the X-ray entry-anchor dedup
     /// (GPU total must equal the CPU total), and the AO sum. GPU idle.
+    /// V2.1b: solid/xray only — the foam styles' chamber CSG has no CPU
+    /// reference here (their validation is the golden + cross-renderer
+    /// consistency tests); a CGDBG run on foam would produce bogus diffs.
     func debugVerify(bytes: [UInt8], settings: RayRenderSettings, pixelCount: Int) {
+        guard settings.style == .solid || settings.style == .xray else {
+            print("CGDBG verify: skipped (style \(settings.style.rawValue) foam has no CPU reference here)")
+            return
+        }
         let p = makeParams(settings: settings)
         let w = Int(p.imageW)
         let h = Int(p.imageH)

@@ -49,12 +49,13 @@ enum HeadlessRunner {
             || args.contains("--stereo") || args.contains("--interocular")
             || args.contains("--screenshot-style")
             // --- V2.1 (pitfall 10: every new flag routes to the headless path) ---
-            || args.contains("--edges") || args.contains("--edge-width")
             || args.contains("--shadows") || args.contains("--xray-color")
             || args.contains("--light-soft")
             // --- V2.2 (pitfall 10: every new flag routes to the headless path) ---
             || args.contains("--tint") || args.contains("--heat-scale")
             || args.contains("--pulse-decay")
+            // --- V2.1b (pitfall 10: every new flag routes to the headless path) ---
+            || args.contains("--radius-scale")
     }
 
     struct Options {
@@ -117,8 +118,6 @@ enum HeadlessRunner {
         var interocular: Float = 0.03  // eye separation as a fraction of the scene scale
         var screenshotStyle = "solid"  // raster screenshot style: solid | xray (impostor)
         // --- V2.1 ---
-        var edges: Float = 0           // edge-layer strength (0 = off, default)
-        var edgeWidth: Float = 0.12    // wall width in cell radii
         var shadows: Float = 1.0       // per-pixel shadow strength (directional solid)
         var xrayColor = false          // coloured X-ray (per-channel tinted density)
         var lightSoft: Float = 0.35    // light angular radius (rad); 0 = binary verdict
@@ -128,6 +127,16 @@ enum HeadlessRunner {
         var pulseDecay: Float = 0.95   // per-step multiplier on the division pulse
         var heatScaleGiven = false     // --heat-scale present (golden meta provenance)
         var pulseDecayGiven = false    // --pulse-decay present (golden meta provenance)
+        // --- V2.1b ---
+        /// Render radius scale (computeRadii: mean link distance x radiusScale).
+        /// The foam style reads best at 0.7 (neighbours overlap, walls have
+        /// real area); 0.5 = spheres merely touch, walls degenerate to points.
+        /// Only applied when the flag is given (the growth/loaded state keeps
+        /// its own value otherwise). Radii are RENDER-side data — but light
+        /// mode's illumination march uses them, so in light mode the flag
+        /// changes the growth too (explicitly requested = fine).
+        var radiusScale: Float = 0.5
+        var radiusScaleGiven = false
     }
 
     private static func parseOptions() -> Options {
@@ -246,8 +255,6 @@ enum HeadlessRunner {
             case "--screenshot-style":
                 o.screenshotStyle = (value("--screenshot-style") ?? "solid").lowercased()
             // --- V2.1 ---
-            case "--edges": o.edges = Float(value("--edges") ?? "") ?? o.edges
-            case "--edge-width": o.edgeWidth = Float(value("--edge-width") ?? "") ?? o.edgeWidth
             case "--shadows": o.shadows = Float(value("--shadows") ?? "") ?? o.shadows
             case "--xray-color": o.xrayColor = true
             case "--light-soft": o.lightSoft = Float(value("--light-soft") ?? "") ?? o.lightSoft
@@ -259,6 +266,10 @@ enum HeadlessRunner {
             case "--pulse-decay":
                 o.pulseDecay = Float(value("--pulse-decay") ?? "") ?? o.pulseDecay
                 o.pulseDecayGiven = true
+            // --- V2.1b ---
+            case "--radius-scale":
+                o.radiusScale = Float(value("--radius-scale") ?? "") ?? o.radiusScale
+                o.radiusScaleGiven = true
             default: break
             }
         }
@@ -341,6 +352,14 @@ enum HeadlessRunner {
         sim.params.tintMode = tintModeCode(o.tint)
         sim.params.heatScale = max(o.heatScale, 0)   // <= 1e-6 = shader-side auto default
         sim.params.pulseDecay = min(max(o.pulseDecay, 0), 0.9999)
+        // --- V2.1b render radius scale (foam recommends 0.7; 0.5 = walls
+        // degenerate to points). Only when the flag is given. Re-applied
+        // after state loads below — loadState restores the state's own
+        // params, which would otherwise win.
+        if o.radiusScaleGiven {
+            sim.params.radiusScale = min(max(o.radiusScale, 0.05), 1)
+            sim.syncParams()
+        }
 
         if o.rdeProbe {
             runRdeProbe(queue: queue, sim: sim, o: o)   // exits
@@ -784,6 +803,16 @@ enum HeadlessRunner {
         sim.refreshTint()
     }
 
+    /// V2.1b: re-apply --radius-scale AFTER a state load (loadState restores
+    /// the state's own SimParams). The caller must refresh the radii (compute
+    /// computeRadii runs with the new scale) before rendering — both render
+    /// paths run a refreshRadii command buffer right after this.
+    private static func applyRadiusScaleAfterLoad(sim: CellSim, o: Options) {
+        guard o.radiusScaleGiven else { return }
+        sim.params.radiusScale = min(max(o.radiusScale, 0.05), 1)
+        sim.syncParams()
+    }
+
     private static func runHeadless(queue: MTLCommandQueue, sim: CellSim, o: Options) -> Never {
         // M6: --state-load works in the headless path too — render/screenshot
         // a stored state instead of growing (matches the --render workflow).
@@ -793,6 +822,7 @@ enum HeadlessRunner {
                 let modes = ["uniform", "light", "rde"]
                 print("state loaded: \(loadPath) (CGST v\(snap.version), \(sim.cellCount) cells, mode \(modes[Int(min(snap.growthMode, 2))]))")
                 applyTintOverrideAfterLoad(sim: sim, o: o)
+                applyRadiusScaleAfterLoad(sim: sim, o: o)
             } catch {
                 print("state load FAILED: \(error)")
                 exit(1)
@@ -821,11 +851,13 @@ enum HeadlessRunner {
                 cb.commit()
                 cb.waitUntilCompleted()
             }
-            if o.screenshotStyle != "solid" && o.screenshotStyle != "xray" {
+            if o.screenshotStyle != "solid" && o.screenshotStyle != "xray" && o.screenshotStyle != "foam" {
                 print("--screenshot-style '\(o.screenshotStyle)' unknown; using solid")
             }
-            renderScreenshot(sim: sim, queue: queue, to: path, style: o.screenshotStyle,
-                             edgeStrength: max(o.edges, 0), edgeWidth: max(o.edgeWidth, 1e-3))
+            renderScreenshot(sim: sim, queue: queue, to: path,
+                             style: (o.screenshotStyle == "xray" || o.screenshotStyle == "foam")
+                                    ? o.screenshotStyle : "solid",
+                             foamOpacity: foamOpacityFromEnv())
         }
 
         exit(0)
@@ -837,6 +869,18 @@ enum HeadlessRunner {
     /// --headless), then ray-trace it offscreen in the chosen style. The grid
     /// for the final state is built ONCE here (the sim rebuilds it per step;
     /// rendering traverses a static snapshot of it).
+    /// V2.1b foam look knobs via env (look iteration + bench A/B without a
+    /// CLI contract change; goldens record their explicit values in the meta).
+    static func foamOpacityFromEnv() -> Float {
+        ProcessInfo.processInfo.environment["CG_FOAM_OPACITY"].flatMap { Float($0) } ?? 0.5
+    }
+    static func foamLayersFromEnv() -> Int {
+        ProcessInfo.processInfo.environment["CG_FOAM_LAYERS"].flatMap { Int($0) } ?? 6
+    }
+    static func foamWallFromEnv() -> Float {
+        ProcessInfo.processInfo.environment["CG_FOAM_WALL"].flatMap { Float($0) } ?? 0.25
+    }
+
     private static func runRender(queue: MTLCommandQueue, sim: CellSim, o: Options) -> Never {
         if let loadPath = o.stateLoad {
             // Render a STORED state (--state-load): skips the growth entirely
@@ -846,6 +890,7 @@ enum HeadlessRunner {
                 let modes = ["uniform", "light", "rde"]
                 print("state loaded: \(loadPath) (CGST v\(snap.version), \(sim.cellCount) cells, mode \(modes[Int(min(snap.growthMode, 2))]))")
                 applyTintOverrideAfterLoad(sim: sim, o: o)
+                applyRadiusScaleAfterLoad(sim: sim, o: o)
             } catch {
                 print("state load FAILED: \(error)")
                 exit(1)
@@ -889,9 +934,14 @@ enum HeadlessRunner {
         sim.syncCellCountFromDevice()   // host mirror consistent (GPU idle)
 
         var settings = RayRenderSettings()
-        settings.style = o.style == "xray" ? .xray : .solid
-        if o.style != "solid" && o.style != "xray" {
-            print("--style '\(o.style)' unknown; using solid")
+        switch o.style {
+        case "solid": settings.style = .solid
+        case "xray": settings.style = .xray
+        case "foam": settings.style = .foam
+        case "foam-xray": settings.style = .foamXray
+        default:
+            print("--style '\(o.style)' unknown (solid | xray | foam | foam-xray); using solid")
+            settings.style = .solid
         }
         // M5 unified light: decided above (before the prep CB, so the
         // illumination fractions can be refreshed in it). X-ray has no
@@ -900,13 +950,15 @@ enum HeadlessRunner {
         settings.width = o.width
         settings.height = o.height
         settings.samples = o.samples
-        // V2.1 render knobs (--edges/--edge-width/--shadows/--xray-color; the
-        // CG_* env overrides exist for look iteration and bench A/B without
-        // touching the CLI contract — goldens record their explicit values).
-        settings.edges = max(o.edges, 0)
-        settings.edgeWidth = max(o.edgeWidth, 1e-3)
+        // V2.1 render knobs (--shadows/--xray-color; the CG_* env overrides
+        // exist for look iteration and bench A/B without touching the CLI
+        // contract — goldens record their explicit values).
         settings.shadows = max(o.shadows, 0)
         settings.xrayColored = o.xrayColor
+        // V2.1b foam knobs (env-driven look iteration; the meta records them).
+        settings.foamOpacity = max(min(foamOpacityFromEnv(), 1), 0.02)
+        settings.foamLayers = max(1, min(foamLayersFromEnv(), 8))
+        settings.foamWall = max(foamWallFromEnv(), 0)
         if let es = ProcessInfo.processInfo.environment["CG_SHADOW_SAMPLES"], let n = Int(es) {
             settings.shadowSamples = max(0, min(n, 64))
         }
@@ -947,7 +999,8 @@ enum HeadlessRunner {
         let t0 = CFAbsoluteTimeGetCurrent()
         let result = renderer.render(settings: settings)
         let wall = CFAbsoluteTimeGetCurrent() - t0
-        print("Render: \(settings.style.rawValue == 0 ? "solid" : "xray") \(result.width)x\(result.height)\(o.stereo ? " (stereo pair, interocular \(o.interocular)x scene)" : "") samples=\(settings.samples) cells=\(sim.cellCount)  wall \(String(format: "%.2f", wall))s  gpu \(String(format: "%.2f", result.gpuSeconds))s")
+        let styleNames = ["solid", "xray", "foam", "foam-xray"]
+        print("Render: \(styleNames[Int(min(settings.style.rawValue, 3))]) \(result.width)x\(result.height)\(o.stereo ? " (stereo pair, interocular \(o.interocular)x scene)" : "") samples=\(settings.samples) cells=\(sim.cellCount)  wall \(String(format: "%.2f", wall))s  gpu \(String(format: "%.2f", result.gpuSeconds))s")
         if let savePath = o.stateSave {
             do {
                 try sim.saveState(to: savePath)
@@ -1008,15 +1061,25 @@ enum HeadlessRunner {
         sim.reset(positions: positions, links: links)
 
         var settings = RayRenderSettings()
-        settings.style = o.style == "xray" ? .xray : .solid
+        switch o.style {
+        case "solid": settings.style = .solid
+        case "xray": settings.style = .xray
+        case "foam": settings.style = .foam
+        case "foam-xray": settings.style = .foamXray
+        default:
+            print("--style '\(o.style)' unknown (solid | xray | foam | foam-xray); using solid")
+            settings.style = .solid
+        }
         settings.width = o.width
         settings.height = o.height
         settings.samples = o.samples
         // V2.1: the animation honours the same render knobs as --render.
-        settings.edges = max(o.edges, 0)
-        settings.edgeWidth = max(o.edgeWidth, 1e-3)
         settings.shadows = max(o.shadows, 0)
         settings.xrayColored = o.xrayColor
+        // V2.1b foam knobs (env-driven, as in --render).
+        settings.foamOpacity = max(min(foamOpacityFromEnv(), 1), 0.02)
+        settings.foamLayers = max(1, min(foamLayersFromEnv(), 8))
+        settings.foamWall = max(foamWallFromEnv(), 0)
         // M6: the animation honours --render-light exactly like --render
         // (auto = directional only in light-growth mode). For paper-style
         // artefacts pass --render-light unbiased.
@@ -1444,6 +1507,10 @@ enum HeadlessRunner {
                 if let v = r.v22 {
                     s += ";v22=1;tint=\(v.tint);heatScale=\(fmt(v.heatScale));pulseDecay=\(fmt(v.pulseDecay))"
                 }
+                if let b = r.v21b {
+                    s += ";v21b=1;foamOpacity=\(fmt(b.foamOpacity));foamLayers=\(b.foamLayers);"
+                        + "foamWall=\(fmt(b.foamWall));radiusScale=\(fmt(b.radiusScale))"
+                }
             }
             return s
         }
@@ -1479,6 +1546,9 @@ enum HeadlessRunner {
         var v21: RenderGoldenV21? = nil
         // --- V2.2 (same rule: only appended when a V2.2 knob is declared) ---
         var v22: RenderGoldenV22? = nil
+        // --- V2.1b (same rule; the retired edges/edgeWidth keys stay in the
+        // V2.1 block's FORMAT for the old metas but are no longer rendered) ---
+        var v21b: RenderGoldenV21b? = nil
     }
 
     /// V2.1 golden knobs: the new render flags + the growth config the
@@ -1512,6 +1582,17 @@ enum HeadlessRunner {
         var tint: String          // auto | none | chemical | food | pulse
         var heatScale: Float      // 0 = auto default
         var pulseDecay: Float
+    }
+
+    /// V2.1b golden knobs: the foam look + the render radius scale. The
+    /// snapshot's raw SimParams carry radiusScale (belt-and-braces: the check
+    /// re-applies the meta value after the load so the radii refresh uses it
+    /// even if a state were re-saved with a different scale).
+    struct RenderGoldenV21b {
+        var foamOpacity: Float    // per-face composite opacity (solid foam + impostor)
+        var foamLayers: Int       // max composited faces per ray (ray tracer)
+        var foamWall: Float       // foam-xray wall-spike gain
+        var radiusScale: Float    // computeRadii scale (0.7 = the foam recommendation)
     }
     /// Default pulse decay (must match SimParams.pulseDecay — legacy metas
     /// without a v22 block load with this).
@@ -1604,6 +1685,13 @@ enum HeadlessRunner {
                 lines.append("heatScale=\(f(v.heatScale))")
                 lines.append("pulseDecay=\(f(v.pulseDecay))")
             }
+            if let b = r.v21b {
+                lines.append("v21b=1")
+                lines.append("foamOpacity=\(f(b.foamOpacity))")
+                lines.append("foamLayers=\(b.foamLayers)")
+                lines.append("foamWall=\(f(b.foamWall))")
+                lines.append("radiusScale=\(f(b.radiusScale))")
+            }
         }
         try lines.joined(separator: "\n").appending("\n").write(toFile: goldenMetaPath(name), atomically: true, encoding: .utf8)
     }
@@ -1671,6 +1759,14 @@ enum HeadlessRunner {
                 render!.v22 = RenderGoldenV22(tint: kv["tint"] ?? "auto",
                                               heatScale: f("heatScale") ?? 0,
                                               pulseDecay: f("pulseDecay") ?? defaultPulseDecay)
+            }
+            // V2.1b block: foam look + render radius scale.
+            if kv["v21b"] == "1" {
+                render!.v21b = RenderGoldenV21b(
+                    foamOpacity: f("foamOpacity") ?? 0.5,
+                    foamLayers: i("foamLayers") ?? 6,
+                    foamWall: f("foamWall") ?? 0.25,
+                    radiusScale: f("radiusScale") ?? 0.5)
             }
         }
         return GoldenConfig(steps: steps, subdiv: subdiv, jitter: jitter, spring: spring,
@@ -1791,6 +1887,13 @@ enum HeadlessRunner {
         // and the shadow-ray cone.
         sim.params.lightSoft = r.v21?.lightSoft ?? 0.35
         sim.syncParams()
+        // V2.1b: the meta's render radius scale (belt-and-braces over the
+        // snapshot's own raw params) — BEFORE the prep CB so refreshRadii
+        // computes every radius with it.
+        if let b = r.v21b {
+            sim.params.radiusScale = min(max(b.radiusScale, 0.05), 1)
+            sim.syncParams()
+        }
         var directional: SIMD3<Float>? = nil
         if let v = r.v21, v.renderLight == "growth" {
             directional = simd_normalize(SIMD3<Float>(sim.params.lightDirX,
@@ -1811,15 +1914,27 @@ enum HeadlessRunner {
 
         // M6: the interactive ADDITIVE X-ray (raster impostor path) can be
         // locked by its own golden — style "xray-impostor" selects it instead
-        // of the ray tracer. The ao*/xray*/density meta keys are ray-tracer
-        // knobs (recorded for meta compatibility; unused by the impostor).
+        // of the ray tracer. V2.1b: "foam-impostor" locks the interactive
+        // FOAM composite the same way (the sorted premultiplied chambers).
+        // The ao*/xray*/density meta keys are ray-tracer knobs (recorded for
+        // meta compatibility; unused by the impostor).
         if r.style == "xray-impostor" {
             return renderToBytes(sim: sim, queue: queue, width: cfg.width, height: cfg.height,
                                  style: "xray")
         }
+        if r.style == "foam-impostor" {
+            return renderToBytes(sim: sim, queue: queue, width: cfg.width, height: cfg.height,
+                                 style: "foam",
+                                 foamOpacity: r.v21b?.foamOpacity ?? 0.5)
+        }
 
         var settings = RayRenderSettings()
-        settings.style = r.style == "xray" ? .xray : .solid
+        switch r.style {
+        case "xray": settings.style = .xray
+        case "foam": settings.style = .foam
+        case "foam-xray": settings.style = .foamXray
+        default: settings.style = .solid
+        }
         settings.directionalLight = directional   // legacy goldens: nil (unbiased look)
         settings.width = cfg.width
         settings.height = cfg.height
@@ -1833,13 +1948,19 @@ enum HeadlessRunner {
         settings.profileSupport = r.profileSupport
         settings.seed = r.seed
         // V2.1 golden render knobs (recorded in the meta; all defaults for
-        // legacy goldens — byte-identical path).
+        // legacy goldens — byte-identical path). The RETIRED edges/edgeWidth
+        // keys are parsed for meta provenance only and are no longer applied
+        // (the foam chamber walls are the wall visualization now).
         if let v = r.v21 {
-            settings.edges = v.edges
-            settings.edgeWidth = v.edgeWidth
             settings.shadows = v.shadows
             settings.shadowSamples = v.shadowSamples
             settings.xrayColored = v.xrayColor
+        }
+        // V2.1b foam knobs (only present on foam-era metas).
+        if let b = r.v21b {
+            settings.foamOpacity = b.foamOpacity
+            settings.foamLayers = b.foamLayers
+            settings.foamWall = b.foamWall
         }
         // Same framing convention as --render/--screenshot.
         var maxAbs: Float = 0
@@ -1862,11 +1983,13 @@ enum HeadlessRunner {
             let d = RayRenderSettings()
             // V2.1: attach the new knob block ONLY when any of it is
             // non-default — legacy metas' canonical strings (and config
-            // hashes) must stay byte-identical.
+            // hashes) must stay byte-identical. The retired edges/edgeWidth
+            // flags no longer exist; the foam chamber walls are the wall
+            // visualization.
             let shadowSamples = ProcessInfo.processInfo.environment["CG_SHADOW_SAMPLES"]
                 .flatMap { Int($0) } ?? d.shadowSamples
-            let v21Active = o.edges > 0 || o.edgeWidth != 0.12 || o.shadows != 1.0
-                || o.xrayColor || o.lightSoft != 0.35 || o.renderLight != "auto"
+            let v21Active = o.shadows != 1.0 || o.xrayColor || o.lightSoft != 0.35
+                || o.renderLight != "auto"
                 || o.growth != "uniform" || o.food != 0.01 || o.threshold != 1.0
                 || o.rdeF != 0.037 || o.rdeK != 0.06 || o.rdeDu != 0.35
                 || o.rdeDv != 0.15 || o.rdeBase != 0.25 || o.rdeGain != 2.5
@@ -1874,8 +1997,8 @@ enum HeadlessRunner {
                 ? RenderGoldenV21(growth: o.growth, food: o.food, threshold: o.threshold,
                                   rdeF: o.rdeF, rdeK: o.rdeK, rdeDu: o.rdeDu, rdeDv: o.rdeDv,
                                   rdeBase: o.rdeBase, rdeGain: o.rdeGain,
-                                  renderLight: o.renderLight, edges: o.edges,
-                                  edgeWidth: o.edgeWidth, shadows: o.shadows,
+                                  renderLight: o.renderLight, edges: 0,
+                                  edgeWidth: 0.12, shadows: o.shadows,
                                   shadowSamples: shadowSamples, xrayColor: o.xrayColor,
                                   lightSoft: o.lightSoft)
                 : nil
@@ -1884,13 +2007,25 @@ enum HeadlessRunner {
             let v22: RenderGoldenV22? = v22Active
                 ? RenderGoldenV22(tint: o.tint, heatScale: o.heatScale, pulseDecay: o.pulseDecay)
                 : nil
+            // V2.1b knob block: written when the style is a foam style OR an
+            // explicit radius scale was given (either shapes the rendered
+            // pixels; the check re-applies the recorded values).
+            let foamStyle = o.style == "foam" || o.style == "foam-xray" || o.style == "foam-impostor"
+            let v21bActive = o.radiusScaleGiven || foamStyle
+            let v21b: RenderGoldenV21b? = v21bActive
+                ? RenderGoldenV21b(foamOpacity: max(min(foamOpacityFromEnv(), 1), 0.02),
+                                   foamLayers: max(1, min(foamLayersFromEnv(), 8)),
+                                   foamWall: max(foamWallFromEnv(), 0),
+                                   radiusScale: min(max(o.radiusScale, 0.05), 1))
+                : nil
             render = RenderGoldenSettings(style: o.style, samples: o.samples,
                                           maxCells: o.maxCells, division: o.division,
                                           aoRadius: d.aoRadius, aoStrength: d.aoStrength,
                                           aoFloor: d.aoFloor, xrayExposure: d.xrayExposure,
                                           xrayGamma: d.xrayGamma, densityScale: d.densityScale,
                                           profileSupport: d.profileSupport,
-                                          snapshot: true, seed: d.seed, v21: v21, v22: v22)
+                                          snapshot: true, seed: d.seed, v21: v21, v22: v22,
+                                          v21b: v21b)
         }
         let cfg = GoldenConfig(steps: o.steps, subdiv: o.subdiv, jitter: o.jitter,
                                spring: o.spring, planar: o.planar, bulge: o.bulge,
@@ -2265,21 +2400,22 @@ enum HeadlessRunner {
 
     /// Render the current state offscreen and return the raw RGBA bytes
     /// (shared by --screenshot and the golden capture/check). style: "solid"
-    /// (the historical depth-tested impostors) or "xray" (the M6 additive
-    /// density-sprite impostors — the interactive X-ray, NOT the ray tracer).
-    /// Goldens always pass "solid" (default), so their pixels are unchanged.
-    /// V2.1: edgeStrength/edgeWidth plumb the --edges/--edge-width flags into
-    /// the impostor fragment (goldens keep the 0 default — byte-identical).
+    /// (the historical depth-tested impostors), "xray" (the M6 additive
+    /// density-sprite impostors — the interactive X-ray, NOT the ray tracer)
+    /// or "foam" (V2.1b: the premultiplied chamber composite, back-to-front
+    /// sorted — see Renderer.encodeScene). Goldens always pass "solid" or an
+    /// explicit style key in their meta, so their pixels are unchanged.
+    /// V2.1b: the painted edge layer is retired; foamOpacity drives the foam
+    /// composite (goldens record the value in the v21b meta block).
     private static func renderToBytes(sim: CellSim, queue: MTLCommandQueue, width: Int, height: Int,
                                       style: String = "solid",
-                                      edgeStrength: Float = 0, edgeWidth: Float = 0.12) -> [UInt8] {
+                                      foamOpacity: Float = 0.5) -> [UInt8] {
         let device = sim.device
 
         let renderer = Renderer(device: device, queue: queue, sim: sim)
         renderer.isPlaying = false
-        renderer.renderStyle = style == "xray" ? .xray : .solid
-        renderer.edgeStrength = edgeStrength
-        renderer.edgeWidth = edgeWidth
+        renderer.renderStyle = style == "xray" ? .xray : (style == "foam" ? .foam : .solid)
+        renderer.foamOpacity = foamOpacity
         let ballRadius = sim.readPositions().map { simd_length($0) }.max() ?? 1
         renderer.camera.distance = ballRadius * 2.6
 
@@ -2288,7 +2424,8 @@ enum HeadlessRunner {
             fatalError("screenshot: texture alloc failed")
         }
 
-        // X-ray accumulates density on a BLACK background (offline-style look).
+        // X-ray accumulates density on a BLACK background (offline-style look);
+        // foam composites over the studio background like solid.
         let clear = style == "xray"
             ? MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
             : MTLClearColor(red: 0.065, green: 0.075, blue: 0.095, alpha: 1)
@@ -2321,12 +2458,13 @@ enum HeadlessRunner {
     private static func renderScreenshot(sim: CellSim, queue: MTLCommandQueue, to path: String,
                                          width: Int = 1600, height: Int = 1200,
                                          style: String = "solid",
-                                         edgeStrength: Float = 0, edgeWidth: Float = 0.12) {
+                                         foamOpacity: Float = 0.5) {
         let bytes = renderToBytes(sim: sim, queue: queue, width: width, height: height, style: style,
-                                  edgeStrength: edgeStrength, edgeWidth: edgeWidth)
+                                  foamOpacity: foamOpacity)
         do {
             try writePNG(bytes, width: width, height: height, to: path)
-            print("Screenshot written: \(path) (\(style == "xray" ? "impostor X-ray" : "solid")\(edgeStrength > 0 ? ", edges \(edgeStrength)" : ""))")
+            let styleName = style == "xray" ? "impostor X-ray" : (style == "foam" ? "impostor foam" : "solid")
+            print("Screenshot written: \(path) (\(styleName))")
         } catch {
             print("Screenshot failed: \(error)")
         }
