@@ -39,12 +39,13 @@ enum Shaders {
     #include <metal_stdlib>
     using namespace metal;
 
-    // NOTE: layout must mirror Swift struct SimParams exactly (44 x 4 bytes =
-    // 176). New fields are APPENDED at the end on both sides (AGENTS.md
+    // NOTE: layout must mirror Swift struct SimParams exactly (48 x 4 bytes =
+    // 192). New fields are APPENDED at the end on both sides (AGENTS.md
     // SimParams rule). Size history: 144 B through M6, 148 B in V2.1
     // (lightSoft), 160 B from V2.2 (tintMode + heatScale + pulseDecay),
-    // 176 B from V2.3 (lamelRate + dalRate + interiorDivider + phaseSwitchX) —
-    // the CGST v3 reader accepts every prefix length.
+    // 176 B from V2.3 (lamelRate + dalRate + interiorDivider + phaseSwitchX),
+    // 192 B from V2.4 (typeMode + differentiationPhase + typeCapV +
+    // typeStemV) — the CGST v3 reader accepts every prefix length.
     struct SimParams {
         float linkRestLength;
         float springFactor;
@@ -121,6 +122,31 @@ enum Shaders {
                                  // Type-0 (untyped) runs ignore the phase
                                  // entirely — the rule matrix is a no-op
                                  // (see divisionDecide / foodStep).
+        // --- V2.4 (appended; struct grows 176 -> 192 bytes) ---
+        uint  typeMode;          // rule-matrix mode: 0 band (the V2.3 polar
+                                 // matrix: stem edge-only, voeg dormant/band-
+                                 // only), 1 region (RDE-typed runs: every
+                                 // type divides uniformly within its own
+                                 // region — the patterned rate is carried by
+                                 // the v coupling in drive, and the two-phase
+                                 // machinery is not applied). Type-0 cells
+                                 // behave identically in BOTH modes (the
+                                 // type-0 contract).
+        uint  differentiationPhase; // 1 = the DIFFERENTIATION PHASE: the whole
+                                 // division block (food + decide + execute +
+                                 // finalize) is skipped — the division
+                                 // counter is frozen and food stops
+                                 // accumulating (growth resumes without a
+                                 // synchronized burst) — while the RDE keeps
+                                 // stepping and typeTransition converts
+                                 // undifferentiated cells. Only rde mode
+                                 // types; in uniform/light modes the phase is
+                                 // a pure growth pause.
+        float typeCapV;          // typeTransition: v >= typeCapV -> cap (type 4)
+        float typeStemV;         // typeTransition: v <= typeStemV -> stem
+                                 // (type 1); between the thresholds the cell
+                                 // stays undifferentiated (type 0). Host
+                                 // validates typeStemV < typeCapV.
     };
     // (alignment 16!). Links are stored strided per cell (cell * maxValence + k)
     // in CYCLIC RING ORDER (neighbors consecutive around the vertex), so the
@@ -957,6 +983,16 @@ enum Shaders {
     //     dal:   edge -> dalRate;   lamel<->dal interior -> interiorRate;
     //            dal<->dal only -> 0 (never)
     //     interiorRate = lamelRate / max(interiorDivider, 1) (default /10).
+    // V2.4 REGION mode (typeMode 1, RDE-typed runs): the band matrix above is
+    // NOT applied — every typed region grows at rate 1.0 (uniform within its
+    // region). The patterned growth rate is carried entirely by the DRIVE
+    // (rdeBase + rdeGain·v): the differentiation phase froze each typed
+    // cell's v, so cap regions (v ≈ 0.35+) grow several times faster per
+    // capita than stem regions (v ≈ 0) — regional rate differences from the
+    // chemical map, with the decide-pass gate reduced to "everything
+    // eligible" (see typeEligible). The two-phase machinery is band-specific
+    // and is not applied in region mode. Type 0 cells keep rate 1.0 in both
+    // modes (the type-0 contract).
     // The RNG stream is still consumed EXACTLY once per cell at rate 0 (the
     // product is simply 0) — stream parity across configs is preserved.
     //
@@ -994,6 +1030,10 @@ enum Shaders {
         float rate = 1.0f;
         uint type = cellType[gid];
         if (type != 0u) {
+            if (params.typeMode == 1u) {
+                // V2.4 region mode: uniform within the region (see above).
+                rate = 1.0f;
+            } else {
             const bool phase2 = (params.phaseSwitchX != 0u)
                              && (divCounter[0] >= params.phaseSwitchX);
             if (!phase2) {
@@ -1015,6 +1055,7 @@ enum Shaders {
                                          / max(params.interiorDivider, 1.0f);
                 rate = edge ? (type == 2u ? params.lamelRate : params.dalRate)
                             : (interior ? interiorRate : 0.0f);
+            }
             }
         }
         food[gid] += params.foodIncrement * drive * rate * rand01(&rngState[gid]);
@@ -1245,10 +1286,21 @@ enum Shaders {
     // Division inheritance (divisionExecute): daughters copy the parent's
     // u, v (mitosis: concentrations, not quantities).
     //
+    // V2.4 differentiation contract — "new types IGNORE the RDE (no reaction
+    // participation)": a cell with type != 0 does not update its chemicals —
+    // next = current (no reaction, no diffusion update). Its FROZEN values
+    // are still read by untyped neighbours' Laplacian stencil (the stencil
+    // shape and valence normalization are untouched — the simplest race-free
+    // reading; frozen v-high regions then PIN the pattern: it cannot drift or
+    // erode under the type map, and the frozen v is what sets the regional
+    // growth drive in foodStep). For all-type-0 runs the branch is a no-op:
+    // the reaction math below executes verbatim (the type-0 contract — one
+    // extra buffer read per cell, no arithmetic change).
+    //
     // Buffer table:
     //   0 links (const)   1 linkCounts (const)   2 chemUCur (const)
     //   3 chemVCur (const)   4 chemUNext (write)   5 chemVNext (write)
-    //   6 cellCounter   7 params
+    //   6 cellCounter   7 params   8 cellType (const; V2.4 reaction freeze)
     kernel void rdeStep(device const uint* links      [[buffer(0)]],
                         device const uint*   linkCounts [[buffer(1)]],
                         device const float*  chemUCur   [[buffer(2)]],
@@ -1257,6 +1309,7 @@ enum Shaders {
                         device float*        chemVNext  [[buffer(5)]],
                         device const uint*   cellCounter [[buffer(6)]],
                         constant SimParams&  params     [[buffer(7)]],
+                        device const uint*   cellType   [[buffer(8)]],
                         uint gid [[thread_position_in_grid]])
     {
         if (gid >= cellCounter[0]) return;
@@ -1276,6 +1329,12 @@ enum Shaders {
             vAvg *= invN;
         } else {
             uAvg = u; vAvg = v;
+        }
+        if (cellType[gid] != 0u) {
+            // V2.4: differentiated — no reaction participation; freeze.
+            chemUNext[gid] = u;
+            chemVNext[gid] = v;
+            return;
         }
         float uv2 = u * v * v;
         float du = params.rdeDu * (uAvg - u) - uv2 + params.rdeF * (1.0f - u);
@@ -1490,6 +1549,22 @@ enum Shaders {
     //                     interior lamel<->dal link; lamel<->lamel never
     //     type 3 (dal):   same (edge or a lamel neighbour)
     //
+    // V2.4 REGION mode (params.typeMode == 1 — RDE-typed runs): the band
+    // matrix above assumes a POLAR band (its edge/interior link classes are
+    // band concepts); an RDE type map has no band. In region mode EVERY type
+    // divides uniformly within its own region (stem anywhere, cap anywhere —
+    // "patterned growth = regional rate differences": the rates come from the
+    // frozen v coupling in foodStep, not from the matrix). The two-phase
+    // machinery is band-specific and is not applied in region mode. Type 0 is
+    // unconditionally eligible in BOTH modes (the type-0 contract: an
+    // all-type-0 run restores the historical predicate exactly).
+    // Mode summary (the full matrix, per mode):
+    //   band  (polar typing):  phase 1 — stem edge-only, voeg dormant, cap
+    //          uniform; phase 2 — voeg-only (edge/interior links).
+    //   region (RDE typing):   every type uniform, both phases (the phase
+    //          switch is ignored).
+    //   all-type-0:            the historical uniform rule (either mode).
+    //
     // BLOCKER PREDICATE (V2.3, critical): the independent-set test must count
     // only MATRIX-ELIGIBLE cells as blockers, not every food-heavy cell. With
     // the historical food-only predicate, a cell that hoards food above the
@@ -1524,14 +1599,16 @@ enum Shaders {
     // candidate itself and the blocker predicate for its ring-distance <= 2
     // neighbours (same predicate both roles — see the blocker-predicate note
     // above). Type 0 (none) is unconditionally eligible: the matrix is a
-    // no-op on untyped runs. All reads are of frozen data.
+    // no-op on untyped runs. V2.4: typeMode selects the matrix (band | region
+    // — see the mode summary above). All reads are of frozen data.
     static inline bool typeEligible(uint c,
                                     device const uint* links,
                                     device const uint* linkCounts,
                                     device const uint* cellType,
-                                    bool phase2, uint maxValence) {
+                                    uint typeMode, bool phase2, uint maxValence) {
         uint t = cellType[c];
         if (t == 0u) return true;
+        if (typeMode == 1u) return true;   // V2.4 region: uniform within region
         uint n = linkCounts[c];
         uint base = c * maxValence;
         if (!phase2) {
@@ -1578,11 +1655,12 @@ enum Shaders {
         if (food[gid] <= params.splitThreshold) { splitFlags[gid] = 0u; return; }
 
         // V2.3 rule matrix gate (type 0 exempt — typeEligible is constant
-        // true there and this is a no-op read).
+        // true there and this is a no-op read). V2.4: the mode selects the
+        // matrix (band | region).
         const bool phase2 = (params.phaseSwitchX != 0u)
                          && (divCounter[0] >= params.phaseSwitchX);
-        if (!typeEligible(gid, links, linkCounts, cellType, phase2,
-                          params.maxValence)) {
+        if (!typeEligible(gid, links, linkCounts, cellType, params.typeMode,
+                          phase2, params.maxValence)) {
             splitFlags[gid] = 0u;
             return;
         }
@@ -1595,8 +1673,8 @@ enum Shaders {
             uint j = links[base + k];
             if (j == gid) { splitFlags[gid] = 0u; return; }   // corrupt ring: defer
             if (food[j] > params.splitThreshold && j < gid
-                && typeEligible(j, links, linkCounts, cellType, phase2,
-                                params.maxValence)) {
+                && typeEligible(j, links, linkCounts, cellType, params.typeMode,
+                                phase2, params.maxValence)) {
                 splitFlags[gid] = 0u; return;
             }
             uint jn = linkCounts[j];
@@ -1605,8 +1683,8 @@ enum Shaders {
             for (uint k2 = 0; k2 < jn; ++k2) {
                 uint l = links[jbase + k2];
                 if (l != gid && food[l] > params.splitThreshold && l < gid
-                    && typeEligible(l, links, linkCounts, cellType, phase2,
-                                    params.maxValence)) {
+                    && typeEligible(l, links, linkCounts, cellType, params.typeMode,
+                                    phase2, params.maxValence)) {
                     splitFlags[gid] = 0u;
                     return;
                 }
@@ -1970,6 +2048,71 @@ enum Shaders {
     {
         if (gid >= cellCounter[0]) return;
         if (splitFlags[gid] != 0u) food[gid] *= 0.5f;
+    }
+
+    // ---- V2.4: the differentiation phase — RDE-driven cell-type transition
+    // ---- with hysteresis (paper §8: cell differentiation via parameter
+    // ---- gradients; the paper is silent on the mechanism — user-brief
+    // ---- design, documented here)
+    //
+    // The DIFFERENTIATION PHASE (params.differentiationPhase == 1) freezes
+    // the whole division block (step() skips foodStep/decide/execute/
+    // finalize — food stops accumulating too, so growth resumes WITHOUT a
+    // synchronized burst: the pre-phase food distribution is preserved) while
+    // the RDE keeps stepping. Each step, every UNDIFFERENTIATED cell (type 0)
+    // may transition:
+    //   v >= typeCapV  -> type 4 (cap)
+    //   v <= typeStemV -> type 1 (stem)
+    //   else           -> stays 0 (the undifferentiated dead band)
+    //
+    // HYSTERESIS = TYPE MEMORY (the chosen hysteresis form): a TYPED cell
+    // ignores the RDE entirely from the step it transitions on — the early
+    // exit below — so a cell's type changes AT MOST ONCE (0 -> 1 or 0 -> 4,
+    // never back). Patterns therefore cannot flicker at a threshold boundary:
+    // once committed, a cell stays in its region forever. (A full up/down
+    // hysteresis BAND — typed cells re-reading the field with offset
+    // thresholds — is a small extension of this kernel; type memory is the
+    // minimal stable form and the one the brief specifies.) The same
+    // "ignores the RDE" rule covers the chemicals themselves: rdeStep freezes
+    // u/v for typed cells (no reaction participation). Frozen values are
+    // still READ by untyped neighbours' stencil (see rdeStep) — a frozen
+    // v-high region pins the pattern and carries the regional growth drive.
+    //
+    // PIPELINE ORDER + race-freedom (the milestone contract, stated): the
+    // kernel is encoded AFTER the division block — same slot family as
+    // cellTint. When the phase is off the division block runs and its
+    // cellType writes (daughter inheritance) land BEFORE this kernel would
+    // (it is not encoded at all then); when the phase is ON the division
+    // block is skipped entirely and this kernel is the ONLY cellType writer
+    // of the step. Every thread reads chemV[gid] (finalized by the chemical
+    // pass at the top of the step — the host swapped the double buffers
+    // before the division block — and written by nothing after) and writes
+    // ONLY cellType[gid]: no cross-thread reads, nothing else writes cellType
+    // inside this CB window, so per-cell writes are trivially race-free. The
+    // transition's writes are consumed by NEXT step's foodStep/divisionDecide
+    // (encoder order) and by THIS step's trailing cellTint (later encoder —
+    // new types render the same step). Host-side re-typing between steps
+    // stays safe as before (GPU idle; applyPolarTypes).
+    //
+    // Only meaningful in rde mode (growthMode == 2): the host encodes it only
+    // then. In uniform/light modes the differentiation phase is a pure growth
+    // pause — the seeded chemical field is static and would type from noise.
+    //
+    // Buffer table:
+    //   0 chemV (const)   1 cellType (read + write)   2 cellCounter   3 params
+    kernel void typeTransition(device const float* chemV    [[buffer(0)]],
+                               device uint*        cellType [[buffer(1)]],
+                               device const uint*  cellCounter [[buffer(2)]],
+                               constant SimParams& params   [[buffer(3)]],
+                               uint gid [[thread_position_in_grid]])
+    {
+        if (gid >= cellCounter[0]) return;
+        uint t = cellType[gid];
+        if (t != 0u) return;               // hysteresis = type memory (above)
+        float v = chemV[gid];
+        if (v >= params.typeCapV)       cellType[gid] = 4u;   // cap
+        else if (v <= params.typeStemV) cellType[gid] = 1u;   // stem
+        // else: the undifferentiated dead band (typeStemV, typeCapV) — stays 0.
     }
 
     // Render radius per cell = mean distance to linked cells (paper §5), scaled.

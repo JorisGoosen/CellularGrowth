@@ -22,7 +22,7 @@ struct ContentView: View {
 
     private var controlPanel: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Cellular Growth — V2.3")
+            Text("Cellular Growth — V2.4")
                 .font(.headline)
 
             HStack(spacing: 8) {
@@ -114,6 +114,27 @@ struct ContentView: View {
                 slider("Phase switch X (divisions)", $vm.phaseX, 0...20000, step: 100)
                 slider("Lamel rate", $vm.lamelRate, 0...3)
                 slider("Dal rate", $vm.dalRate, 0...3)
+            }
+
+            // V2.4 differentiation phase: freeze division, let the RDE type
+            // the undifferentiated cells (v >= cap threshold -> cap, v <= stem
+            // threshold -> stem; typed cells then ignore the RDE — type-memory
+            // hysteresis). The button takes effect from the next frame.
+            GroupBox("Differentiation (V2.4)") {
+                Button(vm.differentiationPhase ? "Resume growth" : "Differentiate now") {
+                    vm.toggleDifferentiation()
+                }
+                .buttonStyle(.borderedProminent)
+                if vm.differentiationPhase {
+                    Text("Division frozen — RDE typing active (mode: \(vm.typingEnabled ? "band" : "region")).")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                slider("Cap threshold v ≥", $vm.typeCapV, 0...1)
+                slider("Stem threshold v ≤", $vm.typeStemV, 0...1)
+                Text("Works in RDE growth mode; with polar typing on the band matrix stays in charge.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             GroupBox("Light (growth + shading)") {

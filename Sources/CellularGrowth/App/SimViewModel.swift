@@ -164,6 +164,46 @@ final class SimViewModel: ObservableObject, ViewInput {
         didSet { sim.params.dalRate = Float(max(dalRate, 0)); sim.syncParams() }
     }
 
+    // --- V2.4 differentiation phase (RDE-driven typing with hysteresis) ---
+    /// The differentiation phase: division frozen, the RDE keeps stepping,
+    /// typeTransition converts type-0 cells from the chemical field every
+    /// step (v >= typeCapV -> cap, v <= typeStemV -> stem; typed cells then
+    /// ignore the RDE — type-memory hysteresis). Toggled by the
+    /// "Differentiate now" / "Resume growth" button; takes effect from the
+    /// next rendered frame (the phase flag is read per encoded step).
+    @Published var differentiationPhase = false {
+        didSet { sim.params.differentiationPhase = differentiationPhase ? 1 : 0; sim.syncParams() }
+    }
+    /// typeTransition thresholds (stem must stay below cap).
+    @Published var typeCapV: Double = 0.30 {
+        didSet { sim.params.typeCapV = Float(typeCapV); syncDiffThresholds() }
+    }
+    @Published var typeStemV: Double = 0.10 {
+        didSet { sim.params.typeStemV = Float(typeStemV); syncDiffThresholds() }
+    }
+    /// Keep stem < cap (the kernel's dead band must be non-empty).
+    private func syncDiffThresholds() {
+        let cap = max(sim.params.typeCapV, sim.params.typeStemV + 0.01)
+        sim.params.typeCapV = cap
+        sim.syncParams()
+    }
+    /// The button: entering the phase picks the rule-matrix mode — polar
+    /// typing on -> band (the V2.3 matrix governs the polar types), otherwise
+    /// region (RDE typing; every region divides uniformly). Leaving the phase
+    /// just resumes growth.
+    func toggleDifferentiation() {
+        if !differentiationPhase {
+            sim.params.typeMode = typingEnabled ? 0 : 1
+            sim.syncParams()
+        }
+        differentiationPhase.toggle()
+        statusMessage = differentiationPhase
+            ? (sim.params.growthMode == 2
+               ? "Differentiation phase: division frozen, RDE typing active (mode \(typingEnabled ? "band" : "region"))"
+               : "Differentiation phase: division frozen (non-RDE mode: growth pause only)")
+            : "Growth resumed"
+    }
+
     /// V2.3: apply the current type layout to the live cells (the Re-type
     /// button; also fired by the typing sliders). Re-bands the CURRENT
     /// geometry — after growth the centroid/shape have moved, so this is a
@@ -260,6 +300,9 @@ final class SimViewModel: ObservableObject, ViewInput {
     }
 
     func reset() {
+        // V2.4: a fresh ball must not stay frozen — clear the differentiation
+        // phase (the flag is a SimParams field, not reset()-cleared state).
+        differentiationPhase = false
         var (positions, links) = Icosphere.generate(subdivisions: Int(subdivision),
                                                     spacing: sim.params.linkRestLength)
         let j = Float(jitter)
@@ -327,6 +370,9 @@ final class SimViewModel: ObservableObject, ViewInput {
         phaseX = Double(p.phaseSwitchX)
         lamelRate = Double(p.lamelRate)
         dalRate = Double(p.dalRate)
+        // V2.4: a preset switch leaves the differentiation phase (presets do
+        // not carry it).
+        differentiationPhase = false
         typingEnabled = (preset.typeAxis != nil)
         if let ax = preset.typeAxis {
             typeAxisX = Double(ax.x)
@@ -428,6 +474,12 @@ final class SimViewModel: ObservableObject, ViewInput {
         phaseX = Double(p.phaseSwitchX)
         lamelRate = Double(p.lamelRate)
         dalRate = Double(p.dalRate)
+        // V2.4 differentiation state (stem first — the cap didSet clamps
+        // against the CURRENT stem; a saved mid-differentiation state resumes
+        // in the phase).
+        typeStemV = Double(p.typeStemV)
+        typeCapV = Double(p.typeCapV)
+        differentiationPhase = (p.differentiationPhase != 0)
         cellCount = sim.cellCount
         // Re-frame the camera on the loaded structure.
         let ballRadius = sim.readPositions().map { simd_length($0) }.max() ?? 1

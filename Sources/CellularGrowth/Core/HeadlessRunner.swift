@@ -61,6 +61,10 @@ enum HeadlessRunner {
             || args.contains("--type-t2") || args.contains("--phase-x")
             || args.contains("--lamel-rate") || args.contains("--dal-rate")
             || args.contains("--interior-divider")
+            // --- V2.4 (pitfall 10: every new flag routes to the headless path) ---
+            || args.contains("--differentiate-at") || args.contains("--differentiate-until")
+            || args.contains("--type-mode") || args.contains("--type-cap-v")
+            || args.contains("--type-stem-v") || args.contains("--diff-probe")
     }
 
     struct Options {
@@ -160,6 +164,27 @@ enum HeadlessRunner {
         var lamelRate: Float = 1.0
         var dalRate: Float = 0.5
         var interiorDivider: Float = 10.0
+        // --- V2.4 (differentiation phase: RDE-driven typing with hysteresis) ---
+        /// Step at which the differentiation phase starts (0 = never): from
+        /// this step the division block is skipped (division counter frozen,
+        /// food frozen) and typeTransition converts type-0 cells from the RDE
+        /// field every step.
+        var differentiateAt = 0
+        /// Step at which growth resumes (0 = stay differentiated until the
+        /// host/GUI ends the phase).
+        var differentiateUntil = 0
+        /// Rule-matrix mode: band (polar typing — the V2.3 matrix) | region
+        /// (RDE typing — every type divides uniformly within its region).
+        /// Auto-resolution when not given explicitly: differentiation
+        /// requested -> region, else band.
+        var typeMode = "band"
+        var typeModeGiven = false
+        /// typeTransition thresholds (v >= -> cap, v <= -> stem; must satisfy
+        /// stem < cap).
+        var typeCapV: Float = 0.30
+        var typeStemV: Float = 0.10
+        /// Static-ball differentiation validation mode (like --rde-probe).
+        var diffProbe = false
     }
 
     private static func parseOptions() -> Options {
@@ -321,6 +346,15 @@ enum HeadlessRunner {
             case "--lamel-rate": o.lamelRate = Float(value("--lamel-rate") ?? "") ?? o.lamelRate
             case "--dal-rate": o.dalRate = Float(value("--dal-rate") ?? "") ?? o.dalRate
             case "--interior-divider": o.interiorDivider = Float(value("--interior-divider") ?? "") ?? o.interiorDivider
+            // --- V2.4 (differentiation phase) ---
+            case "--differentiate-at": o.differentiateAt = Int(value("--differentiate-at") ?? "") ?? o.differentiateAt
+            case "--differentiate-until": o.differentiateUntil = Int(value("--differentiate-until") ?? "") ?? o.differentiateUntil
+            case "--type-mode":
+                o.typeMode = (value("--type-mode") ?? "band").lowercased()
+                o.typeModeGiven = true
+            case "--type-cap-v": o.typeCapV = Float(value("--type-cap-v") ?? "") ?? o.typeCapV
+            case "--type-stem-v": o.typeStemV = Float(value("--type-stem-v") ?? "") ?? o.typeStemV
+            case "--diff-probe": o.diffProbe = true
             default: break
             }
         }
@@ -341,6 +375,11 @@ enum HeadlessRunner {
         if o.rdeProbe {
             if !given("--steps") { o.steps = 2000 }
             if !given("--subdiv") { o.subdiv = 4 }
+        }
+        if o.diffProbe {
+            if !given("--steps") { o.steps = 2000 }
+            if !given("--subdiv") { o.subdiv = 4 }
+            if !given("--differentiate-at") { o.differentiateAt = max(500, o.steps / 4) }
         }
         return o
     }
@@ -416,7 +455,32 @@ enum HeadlessRunner {
         sim.params.dalRate = max(o.dalRate, 0)
         sim.params.interiorDivider = max(o.interiorDivider, 1)
         sim.params.phaseSwitchX = UInt32(max(o.phaseX, 0))
+        // --- V2.4 differentiation phase ---
+        if o.typeStemV >= o.typeCapV {
+            print("--type-stem-v (\(o.typeStemV)) must be < --type-cap-v (\(o.typeCapV))")
+            exit(1)
+        }
+        // Rule-matrix mode auto-resolution: a requested differentiation phase
+        // (RDE typing) -> region; otherwise band (polar typing / untyped —
+        // both are no-ops on type-0 cells). An explicit --type-mode wins.
+        if o.typeModeGiven {
+            switch o.typeMode {
+            case "band": sim.params.typeMode = 0
+            case "region": sim.params.typeMode = 1
+            default:
+                print("--type-mode '\(o.typeMode)' unknown (band | region)")
+                exit(1)
+            }
+        } else {
+            sim.params.typeMode = o.differentiateAt > 0 ? 1 : 0
+        }
+        sim.params.typeCapV = o.typeCapV
+        sim.params.typeStemV = o.typeStemV
+        sim.params.differentiationPhase = 0   // the phase starts via the step range (growAndReport/bench)
 
+        if o.diffProbe {
+            runDiffProbe(queue: queue, sim: sim, o: o)   // exits
+        }
         if o.rdeProbe {
             runRdeProbe(queue: queue, sim: sim, o: o)   // exits
         }
@@ -494,14 +558,43 @@ enum HeadlessRunner {
 
         let t0 = CFAbsoluteTimeGetCurrent()
         var done = 0
+        // V2.4: the differentiation step-range (--differentiate-at N
+        // [--differentiate-until M]) toggles params.differentiationPhase at
+        // EXACT step boundaries: batches are split at the boundaries and the
+        // params update happens with the GPU idle between command buffers
+        // (no mid-flight-params hazard). until == 0 -> the phase never ends
+        // host-side.
+        var diffPhase = false
+        func setDiffPhase(_ on: Bool, at step: Int) {
+            diffPhase = on
+            sim.params.differentiationPhase = on ? 1 : 0
+            sim.syncParams()
+            print("t=\(step): differentiation phase \(on ? "STARTED — division frozen, RDE typing active (\(sim.params.growthMode == 2 ? "rde" : "non-rde: growth pause only"))" : "ENDED — growth resumed")")
+        }
+        var lastTypes: [Int]? = nil   // for the per-type Δ (typing vs division)
         while done < o.steps {
-            let batch = min(100, o.steps - done)
+            var batch = min(100, o.steps - done)
+            // Split the batch at the next phase boundary inside it.
+            var boundary: Int? = nil
+            if !diffPhase, o.differentiateAt > done, o.differentiateAt <= done + batch {
+                boundary = o.differentiateAt
+            }
+            if diffPhase, o.differentiateUntil > done, o.differentiateUntil <= done + batch {
+                boundary = min(boundary ?? Int.max, o.differentiateUntil)
+            }
+            if let b = boundary { batch = b - done }
             guard let cb = queue.makeCommandBuffer() else { fatalError("no command buffer") }
             for _ in 0..<batch { sim.step(cb) }
             cb.commit()
             cb.waitUntilCompleted()
             done += batch
             sim.syncCellCountFromDevice(allowGridGrowth: true)
+            if !diffPhase, o.differentiateAt > 0, o.differentiateAt == done {
+                setDiffPhase(true, at: done)
+            }
+            if diffPhase, o.differentiateUntil > 0, o.differentiateUntil == done {
+                setDiffPhase(false, at: done)
+            }
             if done >= o.divStop && sim.params.divisionEnabled != 0 {
                 sim.params.divisionEnabled = 0
                 sim.syncParams()
@@ -510,7 +603,9 @@ enum HeadlessRunner {
             if done % 500 == 0 || done == o.steps {
                 print("t=\(done)   cells=\(sim.cellCount)  meanLinkLength=\(meanLinkLength())")
                 printGrowthCheckpoint(sim: sim)
-                if isTyped(sim) { printTypedCheckpoint(sim: sim) }
+                if isTyped(sim) || diffPhase {
+                    lastTypes = printTypedCheckpoint(sim: sim, previous: lastTypes)
+                }
             }
         }
         let elapsed = CFAbsoluteTimeGetCurrent() - t0
@@ -781,6 +876,125 @@ enum HeadlessRunner {
                          ringR2: rs.variance / s.variance, lag1: lag1)
     }
 
+    // MARK: - V2.4 differentiation probe (--diff-probe)
+
+    /// Validates the DIFFERENTIATION PHASE on a STATIC ball (division OFF):
+    /// the RDE settles for --differentiate-at steps (default steps/4), then
+    /// the phase turns on — typeTransition converts type-0 cells every step
+    /// while the field keeps evolving under the freeze rule (differentiated
+    /// cells stop participating; see rdeStep/typeTransition in Shaders.swift).
+    /// Reported per checkpoint:
+    ///   v variance / ring-avg R² — the pattern the typing reads;
+    ///   type counts              — 0/V -> mixed (stem + cap present);
+    ///   FLIPS per window         — new transitions since the last checkpoint;
+    ///     with type-memory hysteresis a cell changes type AT MOST ONCE
+    ///     (0 -> 1 or 0 -> 4, never back), so the flip stream must settle
+    ///     to ~0 — the no-flicker gate.
+    /// Writes the type-map PNG (type colours) at the phase start and the end.
+    /// PASS/FAIL + exit code.
+    private static func runDiffProbe(queue: MTLCommandQueue, sim: CellSim, o: Options) -> Never {
+        sim.params.growthMode = 2
+        sim.params.divisionEnabled = 0
+        sim.params.typeMode = 1          // region (RDE typing)
+        sim.params.typeCapV = o.typeCapV
+        sim.params.typeStemV = o.typeStemV
+        sim.syncParams()
+        let settle = o.differentiateAt
+        let (base, links) = Icosphere.generate(subdivisions: o.subdiv, spacing: sim.params.linkRestLength)
+        print("diff-probe: STATIC ball (division OFF), subdiv \(o.subdiv) (\(base.count) cells), F=\(sim.params.rdeF) k=\(sim.params.rdeK) Du=\(sim.params.rdeDu) Dv=\(sim.params.rdeDv), thresholds v>=\(o.typeCapV) cap / v<=\(o.typeStemV) stem, RDE settle \(settle) steps, differentiation \(o.steps - settle) steps")
+        sim.reset(positions: base, links: links)
+        let dumpDir = o.rdeDump ?? "/private/tmp/opencode/cellulargrowth/v24"
+        do { try writeTypeScatter("\(dumpDir)/types_t00000.png", sim: sim) } catch {
+            print("type dump FAILED: \(error)")
+        }
+
+        func fmt(_ v: Float) -> String { String(format: "%.4f", v) }
+        var settleV: ChemStats?
+        var prevTypes: [UInt32]?
+        var lastFlips = -1
+        var lastCounts: [Int] = []
+        var flipCurve: [Int] = []   // flips per checkpoint window (the settle curve)
+        var memoryOK = true      // type memory: only 0 -> 1 / 0 -> 4 transitions
+        var sawFlips = false
+        func typeSnap(_ t: Int) {
+            let types = sim.readTypes()
+            var counts = [Int](repeating: 0, count: 5)
+            var flips = 0
+            if let prev = prevTypes {
+                for i in 0..<min(prev.count, types.count) {
+                    let a = prev[i], b = types[i]
+                    if a != b {
+                        flips += 1
+                        if !(a == 0 && (b == 1 || b == 4)) { memoryOK = false }
+                    }
+                }
+                if flips > 0 { sawFlips = true }
+            }
+            for x in types where Int(x) < 5 { counts[Int(x)] += 1 }
+            let vs = chemStats(sim.readChemV(), links: links)
+            print("t=\(t)  v: mean \(fmt(vs.mean)) var \(fmt(vs.variance)) R² \(fmt(vs.ringR2))  |  types: none=\(counts[0]) stem=\(counts[1]) lamel=\(counts[2]) dal=\(counts[3]) cap=\(counts[4])  flips=\(flips)")
+            prevTypes = types
+            lastFlips = flips
+            lastCounts = counts
+            flipCurve.append(flips)
+        }
+
+        // Stage 1: RDE settle (no typing — the field the thresholds read).
+        runSteps(queue: queue, sim: sim, count: settle)
+        settleV = chemStats(sim.readChemV(), links: links)
+        print("settle t=\(settle): v mean \(fmt(settleV!.mean)) var \(fmt(settleV!.variance)) R² \(fmt(settleV!.ringR2)) lag1 \(fmt(settleV!.lag1)) (pattern gate: R² >= 0.4)")
+        sim.params.differentiationPhase = 1
+        sim.syncParams()
+        print("t=\(settle): differentiation phase STARTED — division frozen, RDE typing active")
+        typeSnap(settle)
+        do { try writeTypeScatter("\(dumpDir)/types_t\(String(format: "%05d", settle)).png", sim: sim) } catch {
+            print("type dump FAILED: \(error)")
+        }
+        var done = settle
+        while done < o.steps {
+            let batch = min(100, o.steps - done)
+            runSteps(queue: queue, sim: sim, count: batch)
+            done += batch
+            typeSnap(done)
+        }
+        sim.params.differentiationPhase = 0
+        sim.syncParams()
+        do {
+            try writeTypeScatter("\(dumpDir)/types_t\(String(format: "%05d", o.steps)).png", sim: sim)
+            try writeChemicalDumps(sim: sim, dir: dumpDir, tag: String(format: "t%05d", o.steps))
+        } catch {
+            print("probe dumps FAILED: \(error)")
+        }
+
+        // Hygiene invariants (no division here — mostly the NaN/finiteness
+        // net over the frozen-chemical dynamics).
+        let (invPass, invLines) = checkInvariants(sim: sim, settled: false, meanLimit: 1.5)
+        for l in invLines { print("   \(l)") }
+
+        guard let sv = settleV else {
+            print("DIFF PROBE FAIL: degenerate statistics")
+            exit(1)
+        }
+        let v = sim.cellCount
+        let patternOK = sv.ringR2 >= 0.4
+        let mixed = Float(lastCounts[1]) >= 0.05 * Float(v) && Float(lastCounts[4]) >= 0.02 * Float(v)
+        // "Flips settle to ~0": the residual trickle of marginal hoverers
+        // resolving (the RDE keeps stepping in the phase) must fall to a
+        // small fraction of V — far below the O(V)-per-window churn a
+        // FLICKERING (hysteresis-free) pattern would produce. Measured on the
+        // reference run: the burst window flips ~56% of V, the tail sits at
+        // 0-4 cells (<= 0.16%/window). Gates: <= 0.5% of V per window AND
+        // <= 5% of the burst window's rate.
+        let maxFlips = flipCurve.max() ?? 0
+        let flipGate = max(1, Int(0.005 * Float(v)))
+        let settled = lastFlips <= flipGate && lastFlips <= maxFlips / 20 && sawFlips
+        let typed = Float(lastCounts[1] + lastCounts[4]) / Float(v)
+        print("verdict: v R² \(String(format: "%.3f", sv.ringR2)) (gate >= 0.4) \(patternOK ? "PASS" : "FAIL"), types mixed stem \(String(format: "%.1f%%", 100 * Float(lastCounts[1]) / Float(v))) cap \(String(format: "%.1f%%", 100 * Float(lastCounts[4]) / Float(v))) (gates >= 5% / >= 2%) \(mixed ? "PASS" : "FAIL"), typed total \(String(format: "%.1f%%", 100 * typed)), last-window flips \(lastFlips) (gate <= \(flipGate), burst \(maxFlips)) \(settled ? "PASS" : "FAIL"), type memory \(memoryOK ? "PASS" : "FAIL") \(sawFlips ? "" : "(no transitions observed at all)")")
+        let ok = patternOK && mixed && settled && memoryOK && invPass
+        print(ok ? "DIFF PROBE PASS" : "DIFF PROBE FAIL")
+        exit(ok ? 0 : 1)
+    }
+
     // MARK: - M5 chemical dumps
 
     /// Chemical scatter dumps: rde mode → u and v maps; light mode → the
@@ -850,6 +1064,58 @@ enum HeadlessRunner {
         guard CGImageDestinationFinalize(dest) else { throw NSError(domain: "dump", code: 3) }
     }
 
+    /// V2.4: orthographic point-splat coloured by CELL TYPE — the
+    /// typeTransition map (stem white, lamel warm white, dal cool white, cap
+    /// red, type 0 neutral — the SAME palette as the cellTint type mode, so
+    /// the dump and the renders agree). Same projection as
+    /// writeChemicalScatter. Diagnostic only.
+    private static func writeTypeScatter(_ path: String, sim: CellSim) throws {
+        let count = sim.cellCount
+        let types = sim.readTypes()
+        guard count == types.count, count > 0 else { return }
+        let pos = UnsafeBufferPointer(start: sim.positionsPointer, count: count)
+        let rad = UnsafeBufferPointer(start: sim.radiiPointer, count: count)
+        var lo = pos[0]
+        var hi = pos[0]
+        for p in pos { lo = simd_min(lo, p); hi = simd_max(hi, p) }
+        let spanX = max(hi.x - lo.x, 1e-3)
+        let spanY = max(hi.y - lo.y, 1e-3)
+        let size = 800
+        let pad = 8
+        let scale = Float(size - 2 * pad) / max(spanX, spanY)
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8,
+                                  bytesPerRow: size * 4, space: colorSpace,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                      | CGBitmapInfo.byteOrder32Little.rawValue) else {
+            throw NSError(domain: "dump", code: 1)
+        }
+        ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
+        var order = Array(0..<count)
+        order.sort { pos[$0].z < pos[$1].z }
+        for i in order {
+            let t = Int(min(types[i], 4))
+            let c: (Double, Double, Double) = t == 1 ? (1.00, 1.00, 1.00)     // stem
+                : t == 2 ? (1.00, 0.88, 0.72)                                 // lamel
+                : t == 3 ? (0.72, 0.86, 1.00)                                 // dal
+                : t == 4 ? (0.80, 0.10, 0.10)                                 // cap
+                : (0.87, 0.85, 0.82)                                          // none
+            ctx.setFillColor(CGColor(red: c.0, green: c.1, blue: c.2, alpha: 1))
+            let r = Double(max(rad[i], 0.25) * scale * 0.9)
+            let cx = Double(pad) + Double((pos[i].x - lo.x) * scale)
+            let cy = Double(size) - Double(pad) - Double((pos[i].y - lo.y) * scale)   // +y up
+            ctx.fillEllipse(in: CGRect(x: cx - r, y: cy - r, width: 2 * r, height: 2 * r))
+        }
+        guard let img = ctx.makeImage(),
+              let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL,
+                                                         UTType.png.identifier as CFString, 1, nil) else {
+            throw NSError(domain: "dump", code: 2)
+        }
+        CGImageDestinationAddImage(dest, img, nil)
+        guard CGImageDestinationFinalize(dest) else { throw NSError(domain: "dump", code: 3) }
+    }
+
     /// V2.2: an EXPLICIT CLI tint request overrides the tint mode a loaded
     /// state carries (tintMode lives in SimParams — the cellTint kernel is
     /// part of the step pipeline — but it is a RENDER knob: --tint pulse on a
@@ -892,10 +1158,16 @@ enum HeadlessRunner {
     /// run is typed): per-type counts (Σ must equal V — every cell typed
     /// exactly once, daughters inherit), per-type MEAN PULSE (the phase-2
     /// validation: only voeg cells divide in phase 2, so the pulse mass must
-    /// sit on lamel/dal), and the phase state.
-    private static func printTypedCheckpoint(sim: CellSim) {
+    /// sit on lamel/dal), and the phase state. V2.4: `previous` (the counts
+    /// of the previous checkpoint) adds the per-type Δ — during the
+    /// differentiation phase Δ = newly typed cells (typeTransition), during
+    /// growth Δ = divisions per type (daughters inherit the parent's type,
+    /// so a type's count grows by exactly one per division of that type —
+    /// the per-region division-rate metric). Returns the current counts.
+    @discardableResult
+    private static func printTypedCheckpoint(sim: CellSim, previous: [Int]? = nil) -> [Int] {
         let v = sim.cellCount
-        guard v > 0 else { return }
+        guard v > 0 else { return [] }
         let types = sim.readTypes()
         var counts = [Int](repeating: 0, count: 5)
         var badType = 0
@@ -938,8 +1210,14 @@ enum HeadlessRunner {
             satByType[t] += 1
         }
         print("      valence: max=\(maxVal) at cap(\(CellSim.maxValence))=\(atCap) (\(String(format: "%.1f%%", 100 * Float(atCap) / Float(v))))  v14+ = \(valenceHist[14] + valenceHist[15] + valenceHist[16])  sat by type: none=\(satByType[0]) stem=\(satByType[1]) lamel=\(satByType[2]) dal=\(satByType[3]) cap=\(satByType[4])")
-        print("      types: none=\(counts[0]) stem=\(counts[1]) lamel=\(counts[2]) dal=\(counts[3]) cap=\(counts[4]) Σ=\(v)\(badType == 0 ? "" : " BAD=\(badType)")  divisions=\(div) phase=\(phase)")
+        let diff = sim.params.differentiationPhase != 0
+        let deltaLabel = diff ? "Δ typing" : "Δ divisions"
+        let deltas = previous != nil
+            ? "  \(deltaLabel): none=\(counts[0] - previous![0]) stem=\(counts[1] - previous![1]) lamel=\(counts[2] - previous![2]) dal=\(counts[3] - previous![3]) cap=\(counts[4] - previous![4])"
+            : ""
+        print("      types: none=\(counts[0]) stem=\(counts[1]) lamel=\(counts[2]) dal=\(counts[3]) cap=\(counts[4]) Σ=\(v)\(badType == 0 ? "" : " BAD=\(badType)")  divisions=\(div) phase=\(phase)\(diff ? " DIFFERENTIATING" : "")\(deltas)")
         print("      pulse/type: none \(avg(pulseSum[0], counts[0]))  stem \(avg(pulseSum[1], counts[1]))  lamel \(avg(pulseSum[2], counts[2]))  dal \(avg(pulseSum[3], counts[3]))  cap \(avg(pulseSum[4], counts[4]))")
+        return counts
     }
 
     /// True when the live state carries ANY typed cell (types are checked
@@ -1408,11 +1686,40 @@ enum HeadlessRunner {
         if o.typePoles != nil {
             print("typing: axis \(o.typePoles!) t1 \(o.typeT1) t2 \(o.typeT2), phaseX \(sim.params.phaseSwitchX), lamelRate \(sim.params.lamelRate), dalRate \(sim.params.dalRate)")
         }
+        // V2.4: the differentiation step-range is honoured BEFORE the timed
+        // window (see the per-level hook below): at = the phase start,
+        // until = growth resume (0 = the phase stays ON through the timed
+        // window — that arm measures the differentiation-pass cost at
+        // matched counts).
+        if o.differentiateAt > 0 {
+            print("differentiation phase: at \(o.differentiateAt), until \(o.differentiateUntil == 0 ? "∞ (stays on through the timed window)" : "\(o.differentiateUntil)"), thresholds v>=\(sim.params.typeCapV) cap / v<=\(sim.params.typeStemV) stem, typeMode \(sim.params.typeMode == 1 ? "region" : "band")")
+        }
         print("cells            | ms/step cpu | ms/step gpu | steps/s")
         for level in levels {
             let (positions, links) = Icosphere.generate(subdivisions: level, spacing: sim.params.linkRestLength)
             sim.reset(positions: positions, links: links)
             applyTypingIfRequested(sim: sim, o: o)   // V2.3: typed bench levels
+            // V2.4 phase hook: enter the differentiation phase, run its
+            // (untimed) portion until --differentiate-until, then resume
+            // growth for the timed window. With until == 0 no untimed steps
+            // run and the phase covers the timed window instead (the cost
+            // arm: typeTransition + one extra tint pass per step, division
+            // frozen — the cells column stays flat in a --bench-growth run).
+            if o.differentiateAt > 0 {
+                sim.params.differentiationPhase = 1
+                sim.syncParams()
+                let phaseSteps = o.differentiateUntil > o.differentiateAt
+                    ? o.differentiateUntil - o.differentiateAt : 0
+                if phaseSteps > 0 {
+                    if let cb = queue.makeCommandBuffer() {
+                        for _ in 0..<phaseSteps { sim.step(cb) }
+                        cb.commit()
+                        cb.waitUntilCompleted()
+                    }
+                    sim.params.differentiationPhase = 0
+                    sim.syncParams()
+                }
+            }
             let initial = sim.cellCount
 
             // warmup
@@ -1959,6 +2266,14 @@ enum HeadlessRunner {
         sim.params.tintMode = 0
         sim.params.heatScale = 0
         sim.params.pulseDecay = defaultPulseDecay
+        // V2.4 differentiation knobs: same leak-guard (typing off by default —
+        // the type-0 contract). A fresh SimParams is the source of truth so
+        // the defaults here cannot drift from the struct's.
+        let v24 = SimParams()
+        sim.params.typeMode = v24.typeMode
+        sim.params.differentiationPhase = v24.differentiationPhase
+        sim.params.typeCapV = v24.typeCapV
+        sim.params.typeStemV = v24.typeStemV
         guard let r = cfg.render else {
             sim.params.divisionEnabled = 0
             sim.params.springFactor = cfg.spring
@@ -2444,6 +2759,134 @@ enum HeadlessRunner {
         // Restore the untyped defaults (the shared sim object runs phases
         // sequentially; nothing after phase E reads the typed state).
         sim.params.phaseSwitchX = 0
+        sim.syncParams()
+
+        // --- Phase F: RDE differentiation (V2.4) ---------------------------
+        // The DIFFERENTIATION PHASE: division FROZEN (the whole division
+        // block is skipped — the cell count and the division counter must not
+        // move), the RDE keeps stepping, and typeTransition converts type-0
+        // cells (v >= typeCapV -> cap, v <= typeStemV -> stem) with
+        // TYPE-MEMORY hysteresis — a typed cell ignores the RDE forever, so
+        // the flip stream (new transitions per checkpoint window) must settle
+        // to 0. Then growth resumes under the REGION rule matrix (every type
+        // divides uniformly within its region; the frozen v field sets the
+        // regional rates via the food coupling) — cap regions must grow
+        // faster per capita than stem regions, that is the patterned-growth
+        // point. Thresholds are the shipped defaults (hardcoded so the
+        // selftest contract does not drift with CLI flags).
+        // Gates (beyond the usual invariants at every checkpoint):
+        //   1. frozen phase: cellCount and divisionCounter constant;
+        //   2. the type partition goes 0/V -> mixed (stem AND cap present);
+        //   3. the flip stream settles to 0 (type memory — no flicker);
+        //   4. type memory holds: only 0 -> 1 / 0 -> 4 transitions ever;
+        //   5. regional growth: cellCount grows AND cap per-capita growth >
+        //      stem per-capita growth.
+        sim.params.growthMode = 2
+        sim.params.typeMode = 1
+        sim.params.typeCapV = 0.30
+        sim.params.typeStemV = 0.10
+        sim.params.phaseSwitchX = 0      // region mode ignores it anyway
+        sim.params.divisionEnabled = 0   // the settle stage is a STATIC ball;
+                                         // division is enabled exactly when
+                                         // the phase starts (below), so the
+                                         // frozen gate proves the PHASE (not
+                                         // divisionEnabled) freezes division
+        sim.syncParams()
+        (base, links) = Icosphere.generate(subdivisions: max(o.subdiv, 4), spacing: sim.params.linkRestLength)
+        let settleF = 500
+        let phaseF = 1000
+        let growF = 1000
+        print("selftest phase F (RDE differentiation): \(base.count) cells, thresholds v>=\(sim.params.typeCapV) cap / v<=\(sim.params.typeStemV) stem, settle \(settleF) + differentiate \(phaseF) + regional growth \(growF) steps")
+        sim.reset(positions: base, links: links)
+        runSteps(queue: queue, sim: sim, count: settleF)
+        let frozenCount = sim.cellCount
+        let frozenDiv = sim.divisionCounter
+        sim.params.divisionEnabled = 1
+        sim.params.differentiationPhase = 1
+        sim.syncParams()
+        print("   t=\(settleF): differentiation phase STARTED (frozen: \(frozenCount) cells, \(frozenDiv) divisions)")
+        var fPrevTypes: [UInt32]? = nil
+        var fCounts: [Int] = []
+        var fLastFlips = -1
+        var fSawFlips = false
+        var fMemoryOK = true
+        var fFrozenOK = true
+        var doneF = 0
+        while doneF < phaseF {
+            let batch = min(100, phaseF - doneF)
+            runSteps(queue: queue, sim: sim, count: batch)
+            doneF += batch
+            let t = settleF + doneF
+            checkpoint(t)   // the usual invariants (topology static in the phase)
+            let types = sim.readTypes()
+            var counts = [Int](repeating: 0, count: 5)
+            var flips = 0
+            if let prev = fPrevTypes {
+                for i in 0..<min(prev.count, types.count) {
+                    let a = prev[i], b = types[i]
+                    if a != b {
+                        flips += 1
+                        if !(a == 0 && (b == 1 || b == 4)) { fMemoryOK = false }
+                    }
+                }
+                if flips > 0 { fSawFlips = true }
+            }
+            fPrevTypes = types
+            for x in types where Int(x) < 5 { counts[Int(x)] += 1 }
+            if sim.cellCount != frozenCount || sim.divisionCounter != frozenDiv {
+                fFrozenOK = false
+            }
+            fCounts = counts
+            fLastFlips = flips
+            print("   t=\(t) types: none=\(counts[0]) stem=\(counts[1]) cap=\(counts[4])  flips=\(flips)  cells=\(sim.cellCount) divisions=\(sim.divisionCounter) \(sim.cellCount == frozenCount && sim.divisionCounter == frozenDiv ? "frozen PASS" : "FROZEN FAIL")")
+        }
+        let mixedF = fCounts[1] > 0 && fCounts[4] > 0
+        // "Flips settle to ~0": the same gate as the diff-probe — the
+        // residual trickle of marginal hoverers (the RDE keeps stepping in
+        // the phase) must stay a small fraction of V (measured 0-4 cells per
+        // 100-step window at 2562 cells; a flickering pattern would churn
+        // O(V) per window).
+        let flipGateF = max(1, frozenCount / 200)
+        let settledF = fLastFlips <= flipGateF && fSawFlips
+        print("   differentiation: mixed \(mixedF ? "PASS" : "FAIL") (stem=\(fCounts[1]) cap=\(fCounts[4])), flips settled \(settledF ? "PASS" : "FAIL") (last window \(fLastFlips), gate <= \(flipGateF)), type memory \(fMemoryOK ? "PASS" : "FAIL"), frozen \(fFrozenOK ? "PASS" : "FAIL")")
+        if !(mixedF && settledF && fMemoryOK && fFrozenOK) { allPass = false }
+
+        // Stage 3: regional growth resumes.
+        sim.params.differentiationPhase = 0
+        sim.syncParams()
+        print("   t=\(settleF + phaseF): differentiation phase ENDED — regional growth resumes (typeMode region: every type divides uniformly; the frozen v field sets the regional rates)")
+        let startCountsF = fCounts
+        var endCountsF = startCountsF
+        var doneG = 0
+        while doneG < growF {
+            let batch = min(100, growF - doneG)
+            runSteps(queue: queue, sim: sim, count: batch)
+            doneG += batch
+            let t = settleF + phaseF + doneG
+            if doneG % 500 == 0 || doneG == growF {
+                checkpoint(t)
+                let types = sim.readTypes()
+                var counts = [Int](repeating: 0, count: 5)
+                for x in types where Int(x) < 5 { counts[Int(x)] += 1 }
+                endCountsF = counts
+                let stemF = startCountsF[1] > 0 ? Float(counts[1]) / Float(startCountsF[1]) : 0
+                let capF = startCountsF[4] > 0 ? Float(counts[4]) / Float(startCountsF[4]) : 0
+                print("   t=\(t) types: none=\(counts[0]) stem=\(counts[1]) cap=\(counts[4]) cells=\(sim.cellCount)  per-capita growth: stem x\(String(format: "%.2f", stemF)) cap x\(String(format: "%.2f", capF))")
+            }
+        }
+        let grewF = sim.cellCount > frozenCount
+        let stemFactorF = startCountsF[1] > 0 ? Float(endCountsF[1]) / Float(startCountsF[1]) : 0
+        let capFactorF = startCountsF[4] > 0 ? Float(endCountsF[4]) / Float(startCountsF[4]) : 0
+        let regionalOK = grewF && capFactorF > stemFactorF
+        print("   regional growth: cells \(frozenCount) -> \(sim.cellCount) \(grewF ? "PASS" : "FAIL")  per-capita stem x\(String(format: "%.2f", stemFactorF)) cap x\(String(format: "%.2f", capFactorF)) \(regionalOK ? "PASS (cap > stem)" : "FAIL")")
+        if !regionalOK { allPass = false }
+        // Restore the defaults (the shared sim object; nothing after phase F).
+        sim.params.growthMode = 0
+        sim.params.typeMode = 0
+        let v24d = SimParams()
+        sim.params.typeCapV = v24d.typeCapV
+        sim.params.typeStemV = v24d.typeStemV
+        sim.params.differentiationPhase = 0
         sim.syncParams()
 
         print(allPass ? "SELFTEST PASS" : "SELFTEST FAIL")

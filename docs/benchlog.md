@@ -474,3 +474,77 @@ stem/cap boundary cells ratchet slowly (stem: 0→1 at-cap by t=3500). The
 PHASE-1 stem front DOES saturate (the t2=10 isolation probe: growth froze
 after 723 divisions, 14 band cells at valence 16) — dormant band cells are
 valence sinks; switching to phase 2 (band divisions) relieves it.
+
+## V2.4 — 2026-11-13 — Apple M1 Pro
+
+The differentiation phase: one extra kernel (typeTransition) + one extra
+cellTint pass per step while the phase is active. Two bench questions:
+(a) the differentiation-PASS cost at matched counts (static ball, rde mode,
+division off, phase ON vs OFF — the phase arm adds typeTransition + the
+extra tint), and (b) regional growth vs uniform (per-step cost at matched
+starting counts; the growth RATE difference is the feature, not overhead —
+stem regions grow at drive rdeBase 0.25 vs uniform 1.0, cap regions at
+~1.1, so the typed runs grow slower in total).
+
+(a) Differentiation-pass cost, `--bench --growth rde --bench-steps 50`
+(division off). Two runs per arm (run-to-run GPU-clock noise dominates the
+small levels — the first-level rows swapped signs between runs; the
+top-level signal is stable):
+
+| cells | phase OFF gpu ms/step (run1/run2) | phase ON gpu ms/step (run1/run2) |
+|---|---|---|
+| 2 562 | 0.289 / 0.407 | 0.347 / 0.295 |
+| 10 242 | 0.371 / 0.299 | 0.334 / 0.319 |
+| 40 962 | 1.071 / 1.014 | 1.045 / 1.047 |
+| 163 842 | 3.515 / 3.481 | 3.558 / 3.602 |
+| 655 362 | 13.827 / 13.795 | 14.091 / 14.126 |
+
+At the stable top levels the phase adds +1.9–2.4% (655 362 cells) and
++1.2–3.5% (163 842) — two full-size passes (typeTransition reads chemV +
+writes cellType; the second cellTint re-tints from the new types) on a
+~13.8 ms step. ~nil as designed; below ~50k cells the measurement is
+noise-dominated.
+
+(b) Regional growth vs uniform, `--bench-growth --bench-steps 50` (the
+regional arm: `--growth rde --differentiate-at 1 --differentiate-until 21`
+— a 20-step differentiation phase types the ball from the seeded field, then
+the timed window is regional growth; typeMode region). The cells column is
+count-confounded BY DESIGN (the regional rate difference is the point —
+cf. the V2.3 typed rows): the stem majority (v frozen ~0, drive 0.25) grows
+~4x slower than uniform; cap regions (v ~0.35, drive ~1.1) slightly faster.
+
+| cells (uniform) | ms/step cpu | ms/step gpu | steps/s |
+|---|---|---|---|
+| 2 562 -> 3 288 | 0.451 | 0.405 | 2215 |
+| 10 242 -> 13 241 | 0.502 | 0.465 | 1993 |
+| 40 962 -> 53 179 | 1.583 | 1.537 | 632 |
+| 163 842 -> 212 709 | 7.635 | 7.587 | 131 |
+| 655 362 -> 851 455 | 31.950 | 31.899 | 31 |
+
+| cells (regional) | ms/step cpu | ms/step gpu | steps/s |
+|---|---|---|---|
+| 2 562 -> 2 805 | 0.366 | 0.327 | 2731 |
+| 10 242 -> 11 253 | 0.510 | 0.470 | 1960 |
+| 40 962 -> 45 126 | 1.426 | 1.381 | 701 |
+| 163 842 -> 180 316 | 6.704 | 6.656 | 149 |
+| 655 362 -> 721 922 | 28.029 | 27.980 | 36 |
+
+At the identical starting count (level 4) the regional arm is FASTER per
+step (0.327 vs 0.405 gpu) because it executes fewer divisions in the window
+(243 vs 726) — the region-mode rule matrix itself is a single branch
+(typeEligible returns true for every non-zero type; foodStep's rate is 1.0),
+i.e. regional growth costs ~nil over uniform at matched counts. The
+selftest phase F per-capita table is the rate-difference measurement: over
+1000 growth steps, stem ×6.14 vs cap ×94.90 (frozen v 0 vs ~0.35 under
+rdeGain 2.5 → ~5x drive ratio, amplified by the exponential division
+process).
+
+grid memory rows (T_max = 2^22 preallocated; live T per level):
+
+```
+   grid T=8192: binCounts 32768B + binStarts 32772B + particleIndices 10248B + collisionOffsets 40992B = 116780B
+   grid T=32768: binCounts 131072B + binStarts 131076B + particleIndices 40968B + collisionOffsets 163872B = 466988B
+   grid T=131072: binCounts 524288B + binStarts 524292B + particleIndices 163848B + collisionOffsets 655392B = 1867820B
+   grid T=524288: binCounts 2097152B + binStarts 2097156B + particleIndices 655368B + collisionOffsets 2621472B = 7471148B
+   grid T=2097152: binCounts 8388608B + binStarts 8388612B + particleIndices 2621448B + collisionOffsets 10485792B = 29884460B
+```

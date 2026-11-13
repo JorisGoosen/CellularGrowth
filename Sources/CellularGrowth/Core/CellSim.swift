@@ -53,7 +53,7 @@ import Foundation
 import Metal
 import simd
 
-/// Must mirror MSL `struct SimParams` exactly (44 x 4 bytes = 176).
+/// Must mirror MSL `struct SimParams` exactly (48 x 4 bytes = 192).
 /// Fields are only ever APPENDED at the end, on both sides.
 struct SimParams {
     var linkRestLength: Float = 1.0
@@ -195,6 +195,31 @@ struct SimParams {
     /// (lamel/dal) dormant. Phase 2: ONLY voeg cells divide (stem/cap food
     /// multiplier 0; type-0 cells stay uniform by contract).
     var phaseSwitchX: UInt32 = 0
+    // --- V2.4 (appended; struct grows 176 -> 192 bytes) ---
+    /// Rule-matrix mode (see typeEligible/foodStep in Shaders.swift):
+    /// 0 = band (the V2.3 polar matrix — stem edge-only, voeg dormant/band-
+    /// only), 1 = region (RDE-typed runs — every type divides uniformly
+    /// within its own region; the patterned rate is carried by the frozen-v
+    /// coupling in drive, and the two-phase machinery is not applied). Type-0
+    /// cells behave identically in both modes (the type-0 contract).
+    var typeMode: UInt32 = 0
+    /// The DIFFERENTIATION PHASE (1 = active): the whole division block
+    /// (foodStep + decide + execute + finalize) is skipped — the division
+    /// counter is frozen and food stops accumulating, so growth resumes
+    /// without a synchronized burst — while the RDE keeps stepping and
+    /// typeTransition converts undifferentiated (type 0) cells:
+    /// v >= typeCapV -> cap (4), v <= typeStemV -> stem (1), else stays 0.
+    /// Only rde mode types (the host encodes typeTransition only there); in
+    /// uniform/light modes the phase is a pure growth pause. Persisted in the
+    /// raw SimParams of CGST v3 — a saved mid-differentiation state resumes
+    /// in the phase.
+    var differentiationPhase: UInt32 = 0
+    /// typeTransition cap threshold: v >= typeCapV differentiates the cell
+    /// into a cap cell (type 4).
+    var typeCapV: Float = 0.30
+    /// typeTransition stem threshold: v <= typeStemV differentiates into a
+    /// stem cell (type 1). Host validates typeStemV < typeCapV.
+    var typeStemV: Float = 0.10
 }
 
 enum ShaderError: Error {
@@ -348,6 +373,8 @@ final class CellSim {
     private var pRdeStep: MTLComputePipelineState!
     private var pCellTint: MTLComputePipelineState!
     private var pPulseDecay: MTLComputePipelineState!
+    // --- V2.4 differentiation phase ---
+    private var pTypeTransition: MTLComputePipelineState!
     // TEMPORARY DEBUG (CELLDBG; remove after M3 gates are green):
     private var pParamEcho: MTLComputePipelineState!
     private var pQueryFingerprint: MTLComputePipelineState!
@@ -390,6 +417,8 @@ final class CellSim {
             pRdeStep = try pipeline("rdeStep")
             pCellTint = try pipeline("cellTint")
             pPulseDecay = try pipeline("pulseDecayStep")
+            // V2.4 differentiation phase
+            pTypeTransition = try pipeline("typeTransition")
             // TEMPORARY DEBUG (CELLDBG; remove after M3 gates are green):
             pParamEcho = try pipeline("paramEcho")
             pQueryFingerprint = try pipeline("queryFingerprint")
@@ -400,8 +429,8 @@ final class CellSim {
 
         // Layout drift guard: the MSL SimParams mirror is appended-only; a
         // mismatch here corrupts every kernel silently.
-        precondition(MemoryLayout<SimParams>.size == 176,
-                     "SimParams layout drift: \(MemoryLayout<SimParams>.size) != 176 (see Shaders.swift)")
+        precondition(MemoryLayout<SimParams>.size == 192,
+                     "SimParams layout drift: \(MemoryLayout<SimParams>.size) != 192 (see Shaders.swift)")
 
         let f3 = MemoryLayout<SIMD3<Float>>.stride
         positionsA = device.makeBuffer(length: maxCells * f3, options: .storageModeShared)!
@@ -716,6 +745,19 @@ final class CellSim {
     ///   buffers — the force/repulsion path is untouched (lockstep invariant).
     /// - The nutrient/rde buffers swap after their pass, so foodStep and
     ///   divisionExecute (later in this CB) see the post-pass chemicals.
+    ///
+    /// V2.4 differentiation phase (differentiationPhase == 1): the WHOLE
+    /// division block is skipped — divisionExecute's cell-counter/phase-clock
+    /// writes never happen (both frozen) and foodStep never runs (food freezes
+    /// with the division; growth resumes without a synchronized burst — the
+    /// pre-phase food distribution is preserved). The RDE keeps stepping at
+    /// the top of the step. In its place (same CB slot family as the
+    /// post-division cellTint) typeTransition runs: it is the only cellType
+    /// writer of the step, reads the freshly evolved chemV, and its writes
+    /// land for the NEXT step's decide/foodStep — race-free (see the
+    /// typeTransition comment in Shaders.swift). A trailing cellTint makes
+    /// the new types render the same step. In non-rde modes the phase is a
+    /// pure growth pause (nothing drives typing).
     func step(_ cb: MTLCommandBuffer) {
         guard cellCount > 0 else { return }
         let width = dispatchWidth
@@ -763,13 +805,21 @@ final class CellSim {
         // neutral albedo for every cell, so no golden pixels change.
         encodeCellTint(cb, width: width)
         encodeIntegrate(cb, width: width)
-        if params.divisionEnabled != 0 {
+        if params.divisionEnabled != 0 && params.differentiationPhase == 0 {
             encodeFoodStep(cb, width: width)
             encodeDivisionDecide(cb, width: width)
             encodeDivisionExecute(cb, width: width)
             encodeFinalizeFood(cb, width: width)
             // Tint AFTER division: daughters inherit the parent's u/v, and
             // cellTint must see them (see comment above).
+            encodeCellTint(cb, width: width)
+        }
+        // V2.4 differentiation phase: division frozen (the block above is
+        // skipped), RDE typing active — the transition runs in the division
+        // block's slot (after integrate; see the step() doc comment), then
+        // one extra tint pass so the new type colours render immediately.
+        if params.differentiationPhase != 0 && params.growthMode == 2 {
+            encodeTypeTransition(cb, width: width)
             encodeCellTint(cb, width: width)
         }
         encodeRadii(into: cb, positions: nextPositionsBuffer, width: width)
@@ -1217,6 +1267,26 @@ final class CellSim {
         enc.setBuffer(nextChemVBuffer, offset: 0, index: 5)
         enc.setBuffer(counterBuffer, offset: 0, index: 6)
         enc.setBuffer(paramsBuffer, offset: 0, index: 7)
+        enc.setBuffer(cellTypeBuffer, offset: 0, index: 8)   // V2.4 reaction freeze
+        enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    // MARK: V2.4 differentiation phase
+
+    /// RDE-driven cell-type transition (see typeTransition in Shaders.swift).
+    /// Encoded ONLY during the differentiation phase in rde mode: the phase
+    /// skips the division block (step()), so this kernel is the step's only
+    /// cellType writer and reads the freshly evolved chemV (the chemical
+    /// pass's double buffers swapped before the division block).
+    private func encodeTypeTransition(_ cb: MTLCommandBuffer, width: Int) {
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pTypeTransition)
+        enc.setBuffer(chemVBuffer, offset: 0, index: 0)
+        enc.setBuffer(cellTypeBuffer, offset: 0, index: 1)
+        enc.setBuffer(counterBuffer, offset: 0, index: 2)
+        enc.setBuffer(paramsBuffer, offset: 0, index: 3)
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         enc.endEncoding()
@@ -1554,8 +1624,9 @@ final class CellSim {
     //            |   clock]
     //            | SimParams (raw, appended-only: 128 B comment from v3's first
     //            |   draft was wrong — M6 files carry 144 B, V2.1 files 148 B,
-    //            |   V2.2 files 160 B, V2.3 files 176 B; the reader accepts
-    //            |   every prefix length and prefixes into the struct)
+    //            |   V2.2 files 160 B, V2.3 files 176 B, V2.4 files 192 B; the
+    //            |   reader accepts every prefix length and prefixes into the
+    //            |   struct)
     //            Loaded WITHOUT reset(): buffers installed directly, normals/
     //            radii/tint recomputed (deterministic functions of the state).
     //
@@ -1676,9 +1747,10 @@ final class CellSim {
                                  + MemoryLayout<UInt64>.stride)
         // Raw SimParams block lengths by writer era: 144 B (M6), 148 B (V2.1,
         // lightSoft), 160 B (V2.2: tintMode + heatScale + pulseDecay), 176 B
-        // (V2.3: lamelRate + dalRate + interiorDivider + phaseSwitchX). The
-        // appended-only layout makes every shorter block a compatible prefix
-        // of the current struct — the read below copies only the bytes
+        // (V2.3: lamelRate + dalRate + interiorDivider + phaseSwitchX), 192 B
+        // (V2.4: typeMode + differentiationPhase + typeCapV + typeStemV).
+        // The appended-only layout makes every shorter block a compatible
+        // prefix of the current struct — the read below copies only the bytes
         // present, leaving fields the file predates at their struct defaults.
         // (The list must be EXPLICIT: MemoryLayout<SimParams>.size alone
         // would drop the V2.2 160 B length every time the struct grows —
@@ -1687,8 +1759,8 @@ final class CellSim {
         // V2.3 writers append cell types (N x u32) + the division counter
         // (4 B) on top of that. count >= 12 for every real state (icosphere
         // minimum), so 4N > 16: the variable tails (>= 4N + 144) can never
-        // collide with a bare params length (<= 176).
-        let paramSizes: [Int] = [144, 148, 160, MemoryLayout<SimParams>.size]
+        // collide with a bare params length (<= 192).
+        let paramSizes: [Int] = [144, 148, 160, 176, MemoryLayout<SimParams>.size]
         var v3Sizes: [Int] = []
         for p in paramSizes {
             v3Sizes.append(baseSize + v3Payload + p)                  // pre-V2.2 (no pulse block)
@@ -1794,7 +1866,7 @@ final class CellSim {
         }
         // V2.3: optional cell types (N x u32) + the division counter (u32),
         // same detection pattern (remaining > the largest bare params block,
-        // 176 — the V2.3 tail is 4N + 4 >= 2604 for any real state, never
+        // 192 — the V2.3 tail is 4N + 4 >= 2604 for any real state, never
         // ambiguous).
         var types = [UInt32](repeating: 0, count: count)
         var divCount: UInt32 = 0

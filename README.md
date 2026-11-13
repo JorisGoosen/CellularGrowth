@@ -8,7 +8,7 @@ including the `bulgeDist` typo analysis) lives in
 [`docs/reference/lomas_cellular_forms_extraction.md`](docs/reference/lomas_cellular_forms_extraction.md),
 with page screenshots in `docs/reference/pages/`.
 
-## Status — V2.3 complete: cell types + two-phase growth (the mushroom)
+## Status — V2.4 complete: the differentiation phase (RDE typing + hysteresis)
 
 **M1–M6 base** (details in git history / docs/benchlog.md): over-damped
 spring/planar/bulge forces (paper §4, Fig. 3); food + cell division with
@@ -92,6 +92,49 @@ paper has no cell types, every value is a documented design choice):
   14 goldens byte-PASS, typed state round-trip (types + division counter
   persisted), decide/foodStep type-check bench ~nil at matched counts
   (benchlog V2.3).
+
+V2.4 additions — **the differentiation phase** (RDE-driven cell-type
+transitions with hysteresis; paper §8 names differentiation as the missing
+piece — "cell differentiation could be explored ... re-introduce
+reaction-diffusion equations to control the blending" — the mechanism below
+is a documented design where the paper is silent):
+- **The phase** (`--differentiate-at N [--differentiate-until M]`; GUI
+  button "Differentiate now" / "Resume growth"): from step N the WHOLE
+  division block is skipped — the division counter freezes AND food stops
+  accumulating (growth resumes without a synchronized burst: the pre-phase
+  food distribution is preserved) — while the RDE keeps stepping. `M` = 0
+  (or omitted) keeps the phase until the host/GUI ends it. The flag is a
+  SimParams field, so a CGST v3 state saved mid-phase resumes IN the phase
+  (verified: mid-diff state round-trip prints DIFFERENTIATING with the type
+  map intact).
+- **typeTransition** (new kernel, encoded in the division block's slot —
+  AFTER it, same family as cellTint; the transition's writes land for the
+  NEXT step's decide/foodStep, race-free — every thread reads only chemV[gid]
+  and writes only cellType[gid]): every UNDIFFERENTIATED cell (type 0)
+  transitions `v >= --type-cap-v` (default 0.30) → cap (4), `v <=
+  --type-stem-v` (default 0.10) → stem (1), else stays 0.
+- **Hysteresis = type memory**: a TYPED cell ignores the RDE entirely from
+  the step it transitions on (the kernel early-exits; rdeStep freezes its
+  u/v — "no reaction participation"). A cell's type changes AT MOST ONCE,
+  so patterns cannot flicker at a threshold boundary. (A full up/down
+  hysteresis band — typed cells re-reading with offset thresholds — is a
+  small extension; type memory is the minimal stable form.) Frozen values
+  are still READ by untyped neighbours' stencil, so v-high regions pin the
+  pattern and carry the regional growth drive.
+- **Rule-matrix MODE** (`--type-mode band|region`): the V2.3 matrix assumes
+  a polar band; an RDE type map has none. Region mode: every type divides
+  uniformly within its own region (the patterned rate is carried by the
+  frozen-v coupling in the food drive — cap regions grew ×8–13 per capita
+  vs stem ×1.5–6 in validation runs), and the two-phase machinery is not
+  applied. Auto: a requested differentiation phase → region, polar typing →
+  band; explicit flag wins; type-0 cells behave identically in both modes.
+- **Validation**: `--selftest` 6 phases (new phase F: static RDE settle →
+  differentiation phase with division ENABLED but frozen — cells/divisions
+  constant — → type partition 0/V → mixed, flip stream settles ≈ 0, only
+  0→1/0→4 transitions ever, then regional growth resumes: cap per-capita
+  growth ≫ stem) PASS, `--diff-probe` PASS (pattern R², mixed types,
+  flip-settle, type map PNG), `--lockstep` PASS, 14/14 goldens byte-PASS,
+  differentiation-pass bench ~2–3% at 655k cells (benchlog V2.4).
 
 V2.1b additions — **foam rendering** (`--style foam`, `--style foam-xray`):
 - Each cell renders as its **power-diagram chamber**:
@@ -307,3 +350,4 @@ repulsion, forces, run controls. Jitter and subdivision apply on Reset.
 | V2.2 ✅ | tint modes: food/nutrient heatmap (`--tint food`, `--heat-scale`), mitosis pulse visualization (`--tint pulse`, `--pulse-decay`) — division flashes trace the paper §7 growth wavefronts; CGST v3 persists the pulse buffer (byte-exact pulse replays); render-time illumination refresh made side-effect-free | `--selftest` 4 phases, `--lockstep`, 9/9 legacy goldens PASS, 3 new goldens capture+check (pulse + heatmap byte-exact snapshot replays), state round-trip byte-identical, tint-mode bench ~nil (benchlog), pulse ring-R² wavefront metric: light 0.33–0.36 vs uniform 0.18–0.22 |
 | V2.1b ✅ | foam rendering: cells as power-diagram chambers (flat power-bisector walls + curved caps), translucent front-to-back composite ("walls behind walls") in the ray tracer (`--style foam`) and the interactive impostors (sorted premultiplied blend); foam X-ray with wall-crossing membranes (`--style foam-xray`); painted edge layer RETIRED (`--edges`/`--edge-width` removed, v21-solid-edges golden retired) | `--selftest` 4 phases, `--lockstep`, 11/11 surviving goldens byte-PASS, 3 new foam goldens capture+check, cross-renderer consistency (impostor-foam vs ray-foam same state), 0.5-vs-0.7 radius-scale mechanism demo (walls degenerate at 0.5), foam cost bench (ray foam 3.6–5.3× solid, impostor ≈ solid + one-off sort) |
 | V2.3 ✅ | cell types + two-phase growth: `cellType` buffer (0 none = all existing behaviour, 1 stem, 2 lamel, 3 dal, 4 cap), phase-0 polar typing (`--type-poles/--type-t1/--type-t2`, one cyclic azimuthal walk for the lamel/dal band), type-dependent division rule matrix with a device-side phase switch (`--phase-x`): phase 1 stem edge-only + cap uniform + band dormant, phase 2 band-only (lamel/dal/interior rates); daughters inherit type; CGST v3 persists types + division counter; type colours (`--tint type|type-pulse`); preset `paddenstoel` (mushroom) | `--selftest` 5 phases (new phase E: typed run, Σ per-type = V, phase-1 freezes voeg / phase-2 freezes stem+cap, transition exactly once), `--lockstep`, 14/14 goldens byte-PASS, typed state round-trip (types + phase clock persisted), phase-2 pulse-in-the-band validation (per-type pulse means: lamel/dal > 0, stem/cap 0.000), decide/foodStep type-check bench ~nil at matched counts (benchlog V2.3), blocker-predicate fix documented (eligible-set independent set) |
+| V2.4 ✅ | the differentiation phase: division frozen (`--differentiate-at N [--differentiate-until M]`, GUI "Differentiate now"), RDE keeps stepping, new `typeTransition` kernel (division-block slot, race-free) types undifferentiated cells from the chemical field (`--type-cap-v` 0.30 → cap, `--type-stem-v` 0.10 → stem, dead band stays 0); hysteresis = type memory (typed cells ignore the RDE: rdeStep freezes their u/v — no reaction participation, patterns cannot flicker, a cell's type changes at most once); rule-matrix MODE `--type-mode band\|region` (region: every type divides uniformly in its region — patterned growth via the frozen-v food coupling; band: the V2.3 matrix; type-0 contract both modes); differentiationPhase persists in CGST v3 raw params (mid-phase states resume in the phase); GUI button + threshold sliders | `--selftest` 6 phases (new phase F: static RDE settle → differentiation with division enabled-but-frozen (cells/divisions constant) → 0/V → mixed partition, flip stream settles ≈ 0 (gate ≤ 0.5% V/window), type memory (only 0→1/0→4 ever), regional growth resumes: cap per-capita ×94.9 vs stem ×6.14) PASS, `--diff-probe` PASS (pattern R² 0.68, stem 32.5%/cap 27.6%, flips 1439-burst → 0–4/window tail, type map PNG), `--lockstep` PASS, 14/14 goldens byte-PASS (typing off by default), mid-diff state round-trip resumes DIFFERENTIATING, differentiation-pass bench ~2–3% at 655k cells / regional-vs-uniform growth bench count-confounded as designed (benchlog V2.4) |

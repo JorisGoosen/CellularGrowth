@@ -92,7 +92,15 @@ edge layer removed in V2.1b). V2.3: `--type-poles "x,y,z"` (polar cell-type
 typing axis; default vertical), `--type-t1 F`, `--type-t2 F` (stem/cap
 thresholds; between them the lamel/dal band), `--phase-x N` (division
 counter switching to phase 2; 0 = never), `--tint type|type-pulse` (type
-colours: stem white, lamel warm white, dal cool white, cap red).
+colours: stem white, lamel warm white, dal cool white, cap red),
+`--lamel-rate F`, `--dal-rate F`, `--interior-divider F` (phase-2 band
+growth rates). V2.4: `--differentiate-at N` (step at which the
+differentiation phase starts: division frozen, RDE typing active),
+`--differentiate-until M` (growth resumes; 0 = stay in the phase),
+`--type-mode band|region` (rule matrix: polar band vs RDE regions; auto =
+region iff `--differentiate-at` given), `--type-cap-v F`, `--type-stem-v F`
+(typeTransition thresholds), `--diff-probe` (static-ball differentiation
+validation).
 
 Scratch-artefact policy: screenshots, test renders and debug dumps go under
 `/private/tmp/opencode/cellulargrowth/` (pre-approved scratch) — NOT generic
