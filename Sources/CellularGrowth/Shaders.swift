@@ -39,13 +39,14 @@ enum Shaders {
     #include <metal_stdlib>
     using namespace metal;
 
-    // NOTE: layout must mirror Swift struct SimParams exactly (48 x 4 bytes =
-    // 192). New fields are APPENDED at the end on both sides (AGENTS.md
+    // NOTE: layout must mirror Swift struct SimParams exactly (51 x 4 bytes =
+    // 204). New fields are APPENDED at the end on both sides (AGENTS.md
     // SimParams rule). Size history: 144 B through M6, 148 B in V2.1
     // (lightSoft), 160 B from V2.2 (tintMode + heatScale + pulseDecay),
     // 176 B from V2.3 (lamelRate + dalRate + interiorDivider + phaseSwitchX),
     // 192 B from V2.4 (typeMode + differentiationPhase + typeCapV +
-    // typeStemV) — the CGST v3 reader accepts every prefix length.
+    // typeStemV), 204 B from V2.5 (deathEnabled + deathThreshold +
+    // deathSteps) — the CGST v3 reader accepts every prefix length.
     struct SimParams {
         float linkRestLength;
         float springFactor;
@@ -147,6 +148,18 @@ enum Shaders {
                                  // (type 1); between the thresholds the cell
                                  // stays undifferentiated (type 0). Host
                                  // validates typeStemV < typeCapV.
+        // --- V2.5 (appended; struct grows 192 -> 204 bytes) ---
+        uint  deathEnabled;      // 0/1 flag — the starvation-death block
+                                 // (starvationStep + deathDecide + deathExecute)
+        float deathThreshold;    // starvation signal (the accumulated FOOD
+                                 // ledger — see starvationStep) below this =
+                                 // starving this step
+        uint  deathSteps;        // consecutive starving steps before death;
+                                 // 0 = never. A GROWTH-RATE detector: fed
+                                 // cells re-cross the threshold within ~20
+                                 // steps and reset their counter, shaded
+                                 // cells need hundreds — the window separates
+                                 // the two (the pruning knob).
     };
     // (alignment 16!). Links are stored strided per cell (cell * maxValence + k)
     // in CYCLIC RING ORDER (neighbors consecutive around the vertex), so the
@@ -561,7 +574,7 @@ enum Shaders {
     }
     """
 
-    // MARK: - `simKernels`: simulation kernels (M1 forces; M2 food + division; M3 grid; M5 chemicals; V2.2 tint/pulse)
+    // MARK: - `simKernels`: simulation kernels (M1 forces; M2 food + division; M3 grid; M5 chemicals; V2.2 tint/pulse; V2.4 differentiation; V2.5 starvation death)
 
     static let simKernels = """
 
@@ -602,17 +615,25 @@ enum Shaders {
     // to that slot — collisions are harmless (a spuriously set bit only
     // disables the skip, never mis-skips).
     //
+    // V2.5: DEAD slots are skipped — a dead cell's stale position must not
+    // enter the grid, or it would (a) repel live cells and (b) block light /
+    // render rays as a ghost sphere. The same guard MUST be in gridScatter
+    // (the scatter's fill cursor is the count pass's arithmetic: a scattered
+    // dead index would underflow a bin the count pass never incremented).
+    //
     // Buffer table:
     //   0 positions (const)    1 binCounts (atomic add)   2 occupancy (atomic or)
-    //   3 cellCounter   4 params
+    //   3 cellCounter   4 params   5 deadFlags (const; V2.5)
     kernel void gridCount(device const float3* positions [[buffer(0)]],
                           device atomic_uint* binCounts  [[buffer(1)]],
                           device atomic_uint* occupancy  [[buffer(2)]],
                           device const uint*  cellCounter [[buffer(3)]],
                           constant SimParams& params      [[buffer(4)]],
+                          device const uint*  deadFlags   [[buffer(5)]],
                           uint gid [[thread_position_in_grid]])
     {
         if (gid >= cellCounter[0]) return;
+        if (deadFlags[gid] != 0u) return;   // V2.5: dead slot — no grid presence
         int3 bc = int3((int)floor(positions[gid].x / params.roi),
                        (int)floor(positions[gid].y / params.roi),
                        (int)floor(positions[gid].z / params.roi));
@@ -753,20 +774,25 @@ enum Shaders {
     // principle; on a fixed device/driver it is stable in practice, and the
     // golden-image check is the canary for that assumption. Cross-
     // implementation equality is handled by the --lockstep tolerances.
+    // V2.5: the deadFlags guard MUST mirror gridCount's exactly — the cursor
+    // arithmetic assumes every scattered index was counted first.
     //
     // Buffer table:
     //   0 positions (const)            1 binCounts (atomic sub)
     //   2 binStarts (const)            3 particleIndices (write)
     //   4 cellCounter                  5 params
+    //   6 deadFlags (const; V2.5)
     kernel void gridScatter(device const float3* positions [[buffer(0)]],
                             device atomic_uint* binCounts  [[buffer(1)]],
                             device const uint*  binStarts  [[buffer(2)]],
                             device uint*        particleIndices [[buffer(3)]],
                             device const uint*  cellCounter [[buffer(4)]],
                             constant SimParams& params      [[buffer(5)]],
+                            device const uint*  deadFlags   [[buffer(6)]],
                             uint gid [[thread_position_in_grid]])
     {
         if (gid >= cellCounter[0]) return;
+        if (deadFlags[gid] != 0u) return;   // V2.5: not counted in pass 1
         uint h = binHashOfPos(float3(positions[gid]), params);
         uint slot = atomic_fetch_sub_explicit(&binCounts[h], 1u, memory_order_relaxed) - 1u;
         particleIndices[binStarts[h] + slot] = gid;
@@ -798,10 +824,16 @@ enum Shaders {
     //     in the hot integrate kernel low. Cost: one extra full-size float3
     //     buffer + one extra pass (measured in benchlog M3).
     //
+    // V2.5: dead slots are skipped as QUERIES (their field is never consumed;
+    // their stale ring is zeroed so the loop body would be empty anyway — the
+    // guard just saves the 27-bin walk). Dead cells never appear as
+    // CANDIDATES: they are not scattered into the grid (gridCount/gridScatter).
+    //
     // Buffer table:
     //   0 positions (const)       1 normals (const)      2 links (const)
     //   3 linkCounts (const)      4 binStarts (const)    5 particleIndices (const)
     //   6 collisionOffset (write) 7 cellCounter          8 params
+    //   9 deadFlags (const; V2.5)
     kernel void repulsionAccumulate(device const float3* positions [[buffer(0)]],
                                     device const float3* normals   [[buffer(1)]],
                                     device const uint*   links     [[buffer(2)]],
@@ -811,9 +843,11 @@ enum Shaders {
                                     device float3*       collisionOffset [[buffer(6)]],
                                     device const uint*   cellCounter [[buffer(7)]],
                                     constant SimParams&  params      [[buffer(8)]],
+                                    device const uint*   deadFlags   [[buffer(9)]],
                                     uint gid [[thread_position_in_grid]])
     {
         if (gid >= cellCounter[0]) return;
+        if (deadFlags[gid] != 0u) { collisionOffset[gid] = float3(0.0); return; }
         float3 P = float3(positions[gid]);
         float3 N = float3(normals[gid]);
         uint   n = linkCounts[gid];
@@ -1142,6 +1176,7 @@ enum Shaders {
     //   6 cellCounter             7 params               8 litFraction (write)
     //   9 occupancy (const; M6 coarse skip map — written by gridCount in the
     //     SAME rebuild this step, cleared by the blit fill before it)
+    //  10 deadFlags (const; V2.5 — dead slots neither march nor produce)
     kernel void illuminate(device const float3* positions [[buffer(0)]],
                            device const float*   radii    [[buffer(1)]],
                            device const uint*    binStarts [[buffer(2)]],
@@ -1152,9 +1187,11 @@ enum Shaders {
                            constant SimParams&   params   [[buffer(7)]],
                            device float*         litFraction [[buffer(8)]],
                            device const uint*    occupancy [[buffer(9)]],
+                           device const uint*    deadFlags [[buffer(10)]],
                            uint gid [[thread_position_in_grid]])
     {
         if (gid >= cellCounter[0]) return;
+        if (deadFlags[gid] != 0u) return;   // V2.5: dead tissue is opaque-free space
         float n = nutrient[gid];
 
         float3 P = float3(positions[gid]);
@@ -1368,6 +1405,15 @@ enum Shaders {
     //                and nowhere else — a direct visual proof of the rule
     //                matrix (checked quantitatively by the per-type pulse
     //                means in the typed checkpoint stats).
+    //   7 starve   — V2.5 the starvation-death front: live cells blend toward
+    //                a dark red proportional to starvingCount / deathSteps —
+    //                the pending-death probability mass. DEAD cells are not
+    //                rendered at all (deathExecute zeroes their radius; a
+    //                zero-area impostor rasterizes nothing — the splice
+    //                closed the surface behind them). With death disabled the
+    //                counter stays 0 and the mode is the neutral albedo.
+    //                Documented visualization for the prune-demo: the red
+    //                band creeps up the shaded side before each death burst.
     //
     // In rde mode the chemicals tint the cells: base GREEN, shifted toward
     // BLUE proportional to u and toward RED proportional to v (documented
@@ -1431,6 +1477,7 @@ enum Shaders {
     //   5 food (const; V2.2 food heatmap)  6 nutrient (const; V2.2)
     //   7 pulse (const; V2.2 mitosis pulse)
     //   8 cellType (const; V2.3 type colours, modes 5/6)
+    //   9 starving (const; V2.5 starve mode — the death-front counter)
     kernel void cellTint(device const float* chemU    [[buffer(0)]],
                          device const float* chemV    [[buffer(1)]],
                          device float3*      tint     [[buffer(2)]],
@@ -1440,6 +1487,7 @@ enum Shaders {
                          device const float* nutrient [[buffer(6)]],
                          device const float* pulse    [[buffer(7)]],
                          device const uint*  cellType [[buffer(8)]],
+                         device const uint*  starving [[buffer(9)]],
                          uint gid [[thread_position_in_grid]])
     {
         if (gid >= cellCounter[0]) return;
@@ -1485,6 +1533,15 @@ enum Shaders {
                 : (t == 3u) ? float3(0.72, 0.86, 1.00)    // dal: cool white
                 : (t == 4u) ? float3(0.80, 0.10, 0.10)    // cap: red
                 : float3(0.87, 0.85, 0.82);               // type 0: neutral
+        }
+        // V2.5 starve mode: the death front (blend weight = the starving
+        // counter's progress toward deathSteps; death off => counter 0 =>
+        // bit-identical neutral). Death-hue dark red reads against every
+        // base tint (complement of the neutral albedo and the rde green).
+        if (mode == 7u) {
+            float sd = clamp(float(starving[gid])
+                             / float(max(params.deathSteps, 1u)), 0.0f, 1.0f);
+            col = mix(col, float3(0.45, 0.03, 0.03), 0.85f * sd);
         }
         // V2.2 pulse blend (over the base tint of every mode); V2.3 mode 6
         // (type-pulse) shares it.
@@ -1729,6 +1786,36 @@ enum Shaders {
         return -1;
     }
 
+    // V2.5: the cleavage-arc classification, factored out of divisionExecute
+    // so the plane-pair retry (below) can re-run it. Classifies the ring in
+    // cyclic order rotated to start at k1: the daughter side (B) = the entries
+    // strictly between k1 and k2 (rotated) with dot(L - P, m) > 0; the parent
+    // side (A) = the rest, all with dot <= 0. Returns false on any violation
+    // (the split with THIS pair order is not cleanly defined — caller defers
+    // or retries with the swapped pair).
+    static inline bool classifyCleavageArc(thread const float3* ringPos,
+                                           thread const uint* ringCell,
+                                           uint n, uint k1, uint k2, float3 P, float3 m,
+                                           thread uint* bIdx, thread float3* bVec,
+                                           thread uint* bCount, thread uint* aCount) {
+        *bCount = 0u;
+        *aCount = 0u;
+        uint k2rot = (k2 + n - k1) % n;
+        for (uint t = 1; t < k2rot; ++t) {
+            uint r = (k1 + t) % n;
+            if (dot(ringPos[r] - P, m) <= 0.0f) return false;
+            bIdx[*bCount] = ringCell[r];
+            bVec[*bCount] = ringPos[r] - P;
+            *bCount += 1u;
+        }
+        for (uint t = k2rot + 1; t < n; ++t) {
+            uint r = (k1 + t) % n;
+            if (dot(ringPos[r] - P, m) > 0.0f) return false;
+            *aCount += 1u;
+        }
+        return true;
+    }
+
     // Insert `value` at linear position `slot`, shifting the tail up. The ring
     // is stored linearly with the cyclic wrap implicit, so a mid-array insert
     // preserves the cyclic order.
@@ -1841,12 +1928,16 @@ enum Shaders {
         float3 P = positions[gid];
         float3 ringPos[kMaxValence];
         uint   ringCell[kMaxValence];
+        float3 dirs[kMaxValence];   // normalized ring directions (pair scoring)
         float3 acc = float3(0.0);
         float3 prev = positions[links[base + n - 1]] - P;
         for (uint k = 0; k < n; ++k) {
             ringCell[k] = links[base + k];
             ringPos[k] = positions[ringCell[k]];
             float3 cur = ringPos[k] - P;
+            float l = length(cur);
+            if (l < 1e-9f) { splitFlags[gid] = 0u; return; }
+            dirs[k] = cur / l;
             acc += cross(prev, cur);
             prev = cur;
         }
@@ -1854,84 +1945,130 @@ enum Shaders {
         if (acc2 < 1e-20f) { splitFlags[gid] = 0u; return; }
         float3 N = acc * rsqrt(acc2);
 
-        // Choose the plane-of-cleavage links: the most nearly opposite pair.
-        float bestDot = 2.0f;
-        uint k1 = 0, k2 = 1;
+        // Plane-of-cleavage link candidates: the pairs (k1, k2) by DECREASING
+        // opposition (ascending dot), best 8 kept (insertion-sorted). The
+        // first pair is the M2 most-opposite rule verbatim; the rest are the
+        // V2.5 fallbacks (see the retry loop below).
+        float candDot[8];
+        uint candK1[8], candK2[8], candCount = 0;
+        const uint kMaxCandPairs = 8u;   // fallback pairs tried after the first
         for (uint a = 0; a < n; ++a) {
-            float3 da = ringPos[a] - P;
-            float la = length(da);
-            if (la < 1e-9f) { splitFlags[gid] = 0u; return; }
-            da /= la;
             for (uint b = a + 1; b < n; ++b) {
-                float3 db = ringPos[b] - P;
-                float lb = length(db);
-                if (lb < 1e-9f) { splitFlags[gid] = 0u; return; }
-                float dt = dot(da, db / lb);
-                if (dt < bestDot) { bestDot = dt; k1 = a; k2 = b; }
+                float dt = dot(dirs[a], dirs[b]);
+                if (candCount < kMaxCandPairs) {
+                    uint p = candCount++;
+                    while (p > 0u && candDot[p - 1u] > dt) {
+                        candDot[p] = candDot[p - 1u]; candK1[p] = candK1[p - 1u]; candK2[p] = candK2[p - 1u];
+                        --p;
+                    }
+                    candDot[p] = dt; candK1[p] = a; candK2[p] = b;
+                } else if (dt < candDot[kMaxCandPairs - 1u]) {
+                    uint p = kMaxCandPairs - 1u;
+                    while (p > 0u && candDot[p - 1u] > dt) {
+                        candDot[p] = candDot[p - 1u]; candK1[p] = candK1[p - 1u]; candK2[p] = candK2[p - 1u];
+                        --p;
+                    }
+                    candDot[p] = dt; candK1[p] = a; candK2[p] = b;
+                }
             }
         }
 
-        // Cleavage plane normal (tangential): m = normalize(cross(N, w)).
-        float3 h1 = normalize(ringPos[k1] - P);
-        float3 h2 = normalize(ringPos[k2] - P);
-        float3 w = h1 - h2;
-        float wLen = length(w);
-        if (wLen < 1e-5f) { splitFlags[gid] = 0u; return; }   // chosen links parallel
-        w /= wLen;
-        float3 m = cross(N, w);
-        float m2 = dot(m, m);
-        if (m2 < 1e-12f) { splitFlags[gid] = 0u; return; }    // N parallel to axis
-        m *= rsqrt(m2);
-
-        // Classify the ring in cyclic order rotated to start at k1.
-        // Daughter side (B): dot(L - P, m) > 0; parent side (A): <= 0. k2 sits
-        // at rotated offset k2rot; entries between k1 and k2 must all be B,
-        // entries after k2 must all be A — otherwise the arc is not contiguous
-        // and the split would break ring validity: defer.
-        uint k2rot = (k2 + n - k1) % n;
+        // V2.5 MULTI-PAIR RETRY (the jam fix — see the V2.5 report): try the
+        // candidate pairs in most-opposite order; the FIRST pair whose full
+        // classification + guards + ring pre-scans pass wins. Without the
+        // fallbacks, two defer classes were PERMANENT on the post-death mesh
+        // and their hoarded food jammed the min-index claim rule (a blocker
+        // set smaller than the candidate set would unsound the race argument,
+        // so the defers themselves had to go):
+        //   1. EMPTY DAUGHTER ARC: the most-opposite pair ring-ADJACENT
+        //      (k2rot == 1 — every symmetric valence-3 trihedral, where all
+        //      pairs are equally opposite, lands here). The SAME two links in
+        //      the opposite order put the OTHER arc between them and flip
+        //      w -> -w hence m -> -m, so the side test stays consistent: the
+        //      daughter is born on the arc that has entries. The swapped
+        //      B-side test is equivalent to the original A-side test (negated
+        //      dot against negated m) — it succeeds exactly when the original
+        //      classification reached this point without an A-side failure.
+        //   2. PLANE-NEIGHBOUR VALENCE GUARD / ARC NON-CONTIGUITY on locally
+        //      folded or saturated rings: a different (less opposite) pair
+        //      often splits the same ring cleanly.
+        // Healthy rings take the FIRST pair — the M2 semantics verbatim — so
+        // the fallbacks only fire where the old code deferred.
         uint   bIdx[kMaxValence];
         float3 bVec[kMaxValence];
-        uint bCount = 0;
-        for (uint t = 1; t < k2rot; ++t) {
-            uint r = (k1 + t) % n;
-            if (dot(ringPos[r] - P, m) <= 0.0f) { splitFlags[gid] = 0u; return; }
-            bIdx[bCount] = ringCell[r];
-            bVec[bCount] = ringPos[r] - P;
-            ++bCount;
+        uint   bSlot[kMaxValence];
+        uint bCount = 0, aCount = 0;
+        uint plane1 = 0, plane2 = 0;
+        uint effK1 = 0, effK2 = 0;
+        int p1At = -1, p2At = -1;
+        bool ready = false;
+        for (uint p = 0; p < candCount && !ready; ++p) {
+            uint ek1 = candK1[p], ek2 = candK2[p];
+            float3 w = dirs[ek1] - dirs[ek2];
+            float wLen = length(w);
+            if (wLen < 1e-5f) continue;                    // chosen links parallel
+            float3 m = cross(N, w / wLen);
+            float m2 = dot(m, m);
+            if (m2 < 1e-12f) continue;                     // N parallel to axis
+            m *= rsqrt(m2);
+            uint ebCount = 0, eaCount = 0;
+            uint ebIdx[kMaxValence];
+            float3 ebVec[kMaxValence];
+            // Effective pair: the empty-arc retry below swaps it, and the
+            // commit (plane links, kept arc, daughter ring) must use the
+            // EFFECTIVE pair — the swapped classification's daughter arc is
+            // the entries between (ek2 -> ek1), so plane1' = ring[ek2] etc.
+            // (Forgetting this propagates the original pair into the parent's
+            // ring reconstruction, which then KEEPS entries the retargeting
+            // already handed to the daughter — unidirectional links. Found by
+            // the CGDBG local-consistency check: claimant 675, pair (2,3),
+            // k2rot == 1.)
+            uint ck1 = ek1, ck2 = ek2;
+            bool ok = classifyCleavageArc(ringPos, ringCell, n, ck1, ck2, P, m,
+                                          ebIdx, ebVec, &ebCount, &eaCount);
+            if (ok && ebCount == 0u) {
+                // Empty between-arc: retry with the REVERSED pair — m flips
+                // sign with w, the between-arc becomes the other side (see
+                // the comment above).
+                ck1 = ek2; ck2 = ek1;
+                ok = classifyCleavageArc(ringPos, ringCell, n, ck1, ck2, P, -m,
+                                         ebIdx, ebVec, &ebCount, &eaCount);
+            }
+            if (!ok || ebCount == 0u) continue;
+            uint eplane1 = ringCell[ck1], eplane2 = ringCell[ck2];
+            if (eplane1 == eplane2) continue;              // duplicated ring entry
+            // Valence guards (parent keeps eaCount+3, daughter gets
+            // ebCount+3, each plane neighbour gains one link).
+            if (eaCount + 3u > params.maxValence) continue;
+            if (ebCount + 3u > params.maxValence) continue;
+            if (linkCounts[eplane1] + 1u > params.maxValence) continue;
+            if (linkCounts[eplane2] + 1u > params.maxValence) continue;
+            // Pre-scan neighbour rings (read-only) before allocating anything.
+            uint ebSlot[kMaxValence];
+            bool scanOK = true;
+            for (uint b = 0; b < ebCount; ++b) {
+                int s = findSlot(links, linkCounts, ebIdx[b], gid, params.maxValence);
+                if (s < 0) { scanOK = false; break; }      // asymmetric link
+                ebSlot[b] = (uint)s;
+            }
+            if (!scanOK) continue;
+            int ep1 = findSlot(links, linkCounts, eplane1, gid, params.maxValence);
+            int ep2 = findSlot(links, linkCounts, eplane2, gid, params.maxValence);
+            if (ep1 < 0 || ep2 < 0) continue;
+            int ep1At = insertionSlot(links, linkCounts, eplane1, (uint)ep1, ebIdx, ebCount, params.maxValence);
+            int ep2At = insertionSlot(links, linkCounts, eplane2, (uint)ep2, ebIdx, ebCount, params.maxValence);
+            if (ep1At < 0 || ep2At < 0) continue;
+            // Commit the winning candidate (the EFFECTIVE pair).
+            bCount = ebCount; aCount = eaCount;
+            plane1 = eplane1; plane2 = eplane2;
+            effK1 = ck1; effK2 = ck2;
+            p1At = ep1At; p2At = ep2At;
+            for (uint b = 0; b < ebCount; ++b) {
+                bIdx[b] = ebIdx[b]; bVec[b] = ebVec[b]; bSlot[b] = ebSlot[b];
+            }
+            ready = true;
         }
-        if (bCount == 0u) { splitFlags[gid] = 0u; return; }   // no daughter arc
-        uint aCount = 0;
-        for (uint t = k2rot + 1; t < n; ++t) {
-            uint r = (k1 + t) % n;
-            if (dot(ringPos[r] - P, m) > 0.0f) { splitFlags[gid] = 0u; return; }
-            ++aCount;
-        }
-
-        uint plane1 = ringCell[k1];
-        uint plane2 = ringCell[k2];
-        if (plane1 == plane2) { splitFlags[gid] = 0u; return; }   // duplicated ring entry
-
-        // Valence guards (parent keeps aCount+3, daughter gets bCount+3, each
-        // plane neighbour gains one link).
-        if (aCount + 3u > params.maxValence) { splitFlags[gid] = 0u; return; }
-        if (bCount + 3u > params.maxValence) { splitFlags[gid] = 0u; return; }
-        if (linkCounts[plane1] + 1u > params.maxValence) { splitFlags[gid] = 0u; return; }
-        if (linkCounts[plane2] + 1u > params.maxValence) { splitFlags[gid] = 0u; return; }
-
-        // Pre-scan neighbour rings (read-only) before allocating anything, so a
-        // failed scan leaves no partial state behind.
-        uint bSlot[kMaxValence];
-        for (uint b = 0; b < bCount; ++b) {
-            int s = findSlot(links, linkCounts, bIdx[b], gid, params.maxValence);
-            if (s < 0) { splitFlags[gid] = 0u; return; }   // asymmetric link: defer
-            bSlot[b] = (uint)s;
-        }
-        int p1Slot = findSlot(links, linkCounts, plane1, gid, params.maxValence);
-        int p2Slot = findSlot(links, linkCounts, plane2, gid, params.maxValence);
-        if (p1Slot < 0 || p2Slot < 0) { splitFlags[gid] = 0u; return; }
-        int p1At = insertionSlot(links, linkCounts, plane1, (uint)p1Slot, bIdx, bCount, params.maxValence);
-        int p2At = insertionSlot(links, linkCounts, plane2, (uint)p2Slot, bIdx, bCount, params.maxValence);
-        if (p1At < 0 || p2At < 0) { splitFlags[gid] = 0u; return; }
+        if (!ready) { splitFlags[gid] = 0u; return; }
 
         // Daughter placement. Scope suggestion: bisector of the daughter-side
         // arc at ~0.5 * linkRestLength. Tested alternative (kept here): radial
@@ -2006,12 +2143,15 @@ enum Shaders {
         linkCounts[d] = di;                                // bCount + 3
 
         // Parent ring: the B-arc collapsed to the daughter, cyclic order kept.
+        // (V2.5: the effective plane pair — possibly the empty-arc swap —
+        // determines the kept A-side arc.)
+        uint k2rotEff = (effK2 + n - effK1) % n;
         uint pi = 0;
         links[base + pi++] = plane1;
         links[base + pi++] = d;
         links[base + pi++] = plane2;
-        for (uint t = k2rot + 1; t < n; ++t) {
-            links[base + pi++] = ringCell[(k1 + t) % n];
+        for (uint t = k2rotEff + 1; t < n; ++t) {
+            links[base + pi++] = ringCell[(effK1 + t) % n];
         }
         linkCounts[gid] = pi;                              // aCount + 3
 
@@ -2048,6 +2188,373 @@ enum Shaders {
     {
         if (gid >= cellCounter[0]) return;
         if (splitFlags[gid] != 0u) food[gid] *= 0.5f;
+    }
+
+    // ---- V2.5: starvation death — the INVERSE of division (paper §8: "cell
+    // ---- death as well as cell growth, with appropriate topological changes
+    // ---- to the surface when cells die") -------------------------------
+    //
+    // Three kernels, mirroring the division machinery (counter/decide/execute):
+    //
+    //   starvationStep — per-cell consecutive-starving counter. The signal is
+    //     the accumulated FOOD LEDGER, compared against deathThreshold,
+    //     counted in CONSECUTIVE steps below the threshold (reset when above).
+    //     Design choice — food, NOT food + nutrient: in light mode the
+    //     nutrient steady state (lightNutrient/lightDecay ~ 2.5) dwarfs the
+    //     food scale (<= splitThreshold) and would read "fed" everywhere; the
+    //     food LEDGER integrates the per-cell drive over time, so a shaded
+    //     cell's slow climb is exactly what the consecutive-step window
+    //     measures. In rde mode the v coupling likewise reaches food through
+    //     the drive (foodStep), so food alone works there too. The PRUNING
+    //     mechanism (the paper is silent on death rules — documented design):
+    //     the window deathSteps acts as a GROWTH-RATE detector. A fed cell's
+    //     food climbs from its post-division reset (~0.5 x splitThreshold) to
+    //     the threshold in ~20 steps at the default light-gate values, so its
+    //     counter resets long before reaching deathSteps; a shaded cell
+    //     (drive ~ lightBase) needs hundreds of steps for the same climb and
+    //     dies first. deathThreshold is kept at splitThreshold by the preset:
+    //     a cell is "starving" while it cannot climb to its own division
+    //     threshold fast enough. Per-type death is parked (death is
+    //     type-agnostic by design — any cell starves).
+    //
+    //   deathDecide — the claim pass. Candidates: alive, starvingCount >=
+    //     deathSteps, valence in [3, maxValence], NOT divided this step
+    //     (splitFlags still holds this step's successful claims — no
+    //     divide-and-die in one step; the cell retries next step). Claims
+    //     form a deterministic independent set at ring-distance 2, min index
+    //     wins — the division rule VERBATIM on the death-candidate set. The
+    //     race argument is the same shape: a splice writes the RINGS of the
+    //     dying cell's ring neighbours (removals shift tails; the pivot's
+    //     insertions shift them again), so two claimants sharing any ring
+    //     (distance <= 2) would race on it. Claims at pairwise ring-distance
+    //     >= 3 have disjoint distance-1 neighbourhoods, and BOTH the reads
+    //     (own ring, neighbours' rings via findSlot/chord scan) and the
+    //     writes (neighbours' rings) of a splice stay within that
+    //     neighbourhood — no shared memory, no CAS. Unlike splitFlags (which
+    //     persist until the next decide), deathClaims are RECOMPUTED and
+    //     cleared every step: a deferred death (guards below) simply retries.
+    //
+    //   deathExecute — the splice. Removing a valence-k vertex from a closed
+    //     triangulated surface leaves a k-gon hole bounded by the dying
+    //     cell's ring cycle (consecutive ring pairs are already edges — each
+    //     was a face with the dying cell). Closing the hole WITHOUT new
+    //     vertices needs a triangulation of the k-gon: k-3 diagonals, k-2
+    //     faces. Euler bookkeeping (independent of the triangulation chosen):
+    //       dV = -1, dE = -k + (k-3) = -3, dF = -k + (k-2) = -2  =>  dChi = 0
+    //       d(sum valence) = -2k (the dying ring, both endpoints) + 2(k-3)
+    //       (the new diagonals) = -6 = 6 * dV — sum valence = 6(V-2) stays
+    //       EXACT with V = LIVE cells.
+    //
+    //     THE TRIANGULATION — BALANCED EAR-CLIPPING (not a fan; see the
+    //     report for the failure that forced this): the first design fanned
+    //     the hole from ONE pivot neighbour, which absorbs k-3 diagonals
+    //     (net valence +k-4). Sustained pruning then piles valence onto
+    //     pivot cells up to maxValence, where they deadlock: a valence-16
+    //     cell can neither divide (parent/daughter guards) nor accept the
+    //     daughter insertion its neighbours' splits need, and its hoarded
+    //     food blocks every higher-indexed candidate within ring-distance 2
+    //     FOREVER (the min-index claim rule must count every above-threshold
+    //     cell as a blocker — shrinking the blocker set would unsound the
+    //     race argument). Ear-clipping instead adds the k-3 diagonals ONE
+    //     PER CLIP: repeatedly pick a boundary ear (a, b, c) — three
+    //     consecutive hole-boundary vertices — add the diagonal a-c, and the
+    //     ear triangle (a, b, c) closes b's wedge. Each clip: +1 valence to
+    //     a and c only; b gains nothing but must have valence >= 4 (it ends
+    //     at val-1). Ear choice: among ears passing the caps (diagonal a-c
+    //     must NOT already exist — a chord would be doubled, 3 faces on one
+    //     edge; val(a)+1 <= maxValence; val(c)+1 <= maxValence), pick the
+    //     SHORTEST diagonal (geometric locality — local triangles keep the
+    //     rings star-shaped, which divisionExecute's arc classification
+    //     requires; the fan's long diagonals were the second freeze cause),
+    //     tie -> lowest boundary position (deterministic). If no ear passes,
+    //     the death defers and the cell keeps starving (retry discipline).
+    //     Per-vertex valence drift under sustained pruning: -1 + (a few
+    //     endpoint gains) — no concentration, no deadlock.
+    //
+    //     INSERTION RULE (orientation-exact, derived once for the whole
+    //     splice): the new face (a, b, c) is CCW, so around a the interior
+    //     wedge runs from b's direction to c's — c is inserted into a's ring
+    //     IMMEDIATELY AFTER b's slot; around c the wedge runs from a's
+    //     direction to b's — a is inserted into c's ring IMMEDIATELY BEFORE
+    //     b's slot. One-sided, no probing (the same orientation discipline
+    //     the division mechanics rely on). The boundary cycle stays
+    //     consecutive-pair-consistent in the rings after every clip, so the
+    //     final 3-cycle closes IMPLICITLY (no face list exists — the
+    //     triangulation IS the rings).
+    //
+    //     All-or-defer: the whole clip sequence is PRE-COMPUTED against
+    //     simulated state (post-removal valences + the created-diagonal
+    //     list) before ANY write; a mid-sequence impossibility revokes the
+    //     claim with no partial state (the division discipline).
+    //
+    //     GUARDS: every ring neighbour must have valence >= 4 BEFORE the
+    //     death (the brief's min-valence rule, conservative form: vertices
+    //     that end up never-endpoints finish at val-1, so val >= 4 keeps
+    //     them >= 3; endpoints only gain). The VALENCE-3 DEATH (k = 3) is
+    //     the degenerate case the loop handles natively: zero clips, the
+    //     hole is one triangle, the three neighbours each just lose their
+    //     link to the dying cell and the face (n0, n1, n2) closes the hole
+    //     implicitly. Chords (existing edges between non-consecutive hole
+    //     vertices — impossible on locally convex patches, possible in
+    //     folded regions) are skipped per-ear; a hole whose every ear is
+    //     chord-blocked defers the death.
+    //
+    //     DEAD SLOTS: mark + leave. The cell counter is an allocation
+    //     high-water mark and cannot shrink (division hands out slots with
+    //     atomic_fetch_add against it); a death therefore sets deadFlags[gid],
+    //     zeroes starving[gid]/radii[gid]/linkCounts[gid] and leaves the rest
+    //     of the slot stale. Every consumer either skips dead slots
+    //     (gridCount/gridScatter/repulsionAccumulate/illuminate/
+    //     starvationStep/typeTransition/death kernels) or reads only live
+    //     rings (live rings never reference a dead cell after the splice).
+    //     The renderer skips them for free: radius 0 => zero-area impostor
+    //     quads; the ray tracer never sees them (not in the grid; radii 0
+    //     fails the big-cell filter). TRADE-OFF (documented, per scope):
+    //     dead slots FRAGMENT the buffers — the cell count is a high-water
+    //     mark, live count = counter - deathCounter. Memory cost is deaths x
+    //     slot size (~64 B/cell); a periodic compaction kernel (reindex +
+    //     swap-removal with ring rewrite) is a follow-up, NOT in scope.
+    //
+    //     PIPELINE SLOT: the death block runs AFTER the division block (the
+    //     splice must read the topology division just rebuilt — decide and
+    //     execute are later encoders, so post-division rings are what they
+    //     see) and BEFORE typeTransition. It runs whenever deathEnabled,
+    //     INCLUDING during the differentiation phase: the phase freezes the
+    //     DIVISION block, not death — food is frozen there, so a cell frozen
+    //     below the threshold starves steadily (documented semantics; the
+    //     frozen-data race argument extends V2.4's verbatim: in the phase,
+    //     food/links are written by NO kernel between the step start and the
+    //     death block, so deathDecide's reads are of frozen data — the same
+    //     guarantee typeTransition's chemV read relies on; deathExecute's
+    //     writes and typeTransition's reads/writes are encoder-ordered and
+    //     per-cell disjoint).
+    //
+    //     COUNTERS: deathCounter[0] (atomic) counts deaths since reset — the
+    //     host derives liveCount = counter - deathCounter from it; the
+    //     dying cell's starvingCount is reset so a dead slot can never
+    //     re-candidate.
+
+    // Per-cell consecutive-starving counter (see the block comment above).
+    // Separate from deathDecide ON PURPOSE: the counter write (starving[gid])
+    // and the claim read (starving[j] for ring-distance <= 2 neighbours j)
+    // must not share a kernel — a same-kernel read/write pair on another
+    // thread's counter is a race (the division analogue: foodStep writes
+    // food, divisionDecide reads it, two kernels).
+    //
+    // Buffer table:
+    //   0 food (const)      1 deadFlags (const)   2 starving (read + write)
+    //   3 cellCounter       4 params
+    kernel void starvationStep(device const float* food [[buffer(0)]],
+                               device const uint* deadFlags [[buffer(1)]],
+                               device uint* starving [[buffer(2)]],
+                               device const uint* cellCounter [[buffer(3)]],
+                               constant SimParams& params [[buffer(4)]],
+                               uint gid [[thread_position_in_grid]])
+    {
+        if (gid >= cellCounter[0]) return;
+        if (deadFlags[gid] != 0u) return;              // dead slots never starve
+        if (params.deathEnabled == 0u || params.deathSteps == 0u) return;
+        // Consecutive-steps-below-threshold (reset above the threshold —
+        // including the crossing step itself: foodStep ran earlier in this
+        // command buffer, so the ledger is current).
+        starving[gid] = (food[gid] < params.deathThreshold)
+                      ? (starving[gid] + 1u) : 0u;
+    }
+
+    // Claim pass (see the block comment above for the independent-set rule).
+    //
+    // Buffer table:
+    //   0 starving (const)      1 links (const)        2 linkCounts (const)
+    //   3 deadFlags (const)     4 splitFlags (const; divided-this-step defer)
+    //   5 deathClaims (write)   6 cellCounter          7 params
+    kernel void deathDecide(device const uint* starving [[buffer(0)]],
+                            device const uint* links    [[buffer(1)]],
+                            device const uint* linkCounts [[buffer(2)]],
+                            device const uint* deadFlags [[buffer(3)]],
+                            device const uint* splitFlags [[buffer(4)]],
+                            device uint*       deathClaims [[buffer(5)]],
+                            device const uint* cellCounter [[buffer(6)]],
+                            constant SimParams& params [[buffer(7)]],
+                            uint gid [[thread_position_in_grid]])
+    {
+        if (gid >= cellCounter[0]) { deathClaims[gid] = 0u; return; }
+        deathClaims[gid] = 0u;             // recomputed every step (retry rule)
+        if (params.deathEnabled == 0u || params.deathSteps == 0u) return;
+        if (deadFlags[gid] != 0u) return;
+        if (splitFlags[gid] != 0u) return;   // divided this step: no divide-and-die
+        if (starving[gid] < params.deathSteps) return;
+        uint n = linkCounts[gid];
+        if (n < 3u || n > params.maxValence) return;   // degenerate ring: defer
+
+        // Ring-distance-2 independent set, min index wins (division's rule on
+        // the death-candidate set — the splice race argument is in the block
+        // comment). All reads are of FROZEN data: links/linkCounts/food/
+        // starving/deadFlags are written by no kernel between the step start
+        // and this pass (divisionExecute's ring writes happened in an EARLIER
+        // encoder; starvationStep's counter writes too).
+        uint base = gid * params.maxValence;
+        for (uint k = 0; k < n; ++k) {
+            uint j = links[base + k];
+            if (j == gid) return;               // corrupt ring: defer
+            if (deadFlags[j] != 0u) return;     // dead in a live ring: defer
+            if (starving[j] >= params.deathSteps && j < gid) return;
+            uint jn = linkCounts[j];
+            if (jn > params.maxValence) return; // corrupt neighbour: defer
+            uint jbase = j * params.maxValence;
+            for (uint k2 = 0; k2 < jn; ++k2) {
+                uint l = links[jbase + k2];
+                if (l != gid && deadFlags[l] == 0u
+                    && starving[l] >= params.deathSteps && l < gid) return;
+            }
+        }
+        deathClaims[gid] = 1u;
+    }
+
+    // Mechanics (see the block comment above for the full splice derivation).
+    // All-or-defer: the clip sequence is pre-computed against simulated
+    // state; the first impossibility revokes the claim and leaves NO partial
+    // state behind (the division discipline).
+    //
+    // Buffer table:
+    //   0 positions (const; ear-diagonal length scoring)
+    //   1 links (read + write)        2 linkCounts (read + write)
+    //   3 deathClaims (read + write)  4 deadFlags (write)
+    //   5 starving (write: reset on death)
+    //   6 radii (write 0: the renderer's free dead-slot skip)
+    //   7 deathCounter (atomic add)   8 cellCounter (atomic load)   9 params
+    kernel void deathExecute(device const float3* positions [[buffer(0)]],
+                             device uint*  links      [[buffer(1)]],
+                             device uint*  linkCounts [[buffer(2)]],
+                             device uint*  deathClaims [[buffer(3)]],
+                             device uint*  deadFlags  [[buffer(4)]],
+                             device uint*  starving   [[buffer(5)]],
+                             device float* radii      [[buffer(6)]],
+                             device atomic_uint* deathCounter [[buffer(7)]],
+                             device atomic_uint* cellCounter [[buffer(8)]],
+                             constant SimParams& params [[buffer(9)]],
+                             uint gid [[thread_position_in_grid]])
+    {
+        if (gid >= atomic_load_explicit(&cellCounter[0], memory_order_relaxed)) return;
+        if (deathClaims[gid] == 0u) return;
+
+        uint n = linkCounts[gid];
+        if (n < 3u || n > kMaxValence) { deathClaims[gid] = 0u; return; }
+        uint base = gid * params.maxValence;
+
+        // Stage the dying cell's ring (the hole's boundary cycle, in cyclic
+        // order) and validate it: no self/duplicate entries, every member
+        // alive with valence >= 4 (the min-valence guard: vertices that end
+        // up never-endpoints finish at val - 1; endpoints only gain).
+        uint ring[kMaxValence];
+        uint count = atomic_load_explicit(&cellCounter[0], memory_order_relaxed);
+        for (uint k = 0; k < n; ++k) {
+            uint j = links[base + k];
+            if (j == gid || j >= count || deadFlags[j] != 0u
+                || linkCounts[j] < 4u || linkCounts[j] > kMaxValence) {
+                deathClaims[gid] = 0u; return;
+            }
+            ring[k] = j;
+        }
+        for (uint a = 0; a < n; ++a) {
+            for (uint b = a + 1; b < n; ++b) {
+                if (ring[a] == ring[b]) { deathClaims[gid] = 0u; return; }
+            }
+        }
+
+        // Pre-scan: the dying cell's slot in every neighbour's ring (for the
+        // removal pass; read-only).
+        uint slot[kMaxValence];
+        for (uint k = 0; k < n; ++k) {
+            int s = findSlot(links, linkCounts, ring[k], gid, params.maxValence);
+            if (s < 0) { deathClaims[gid] = 0u; return; }   // asymmetric link
+            slot[k] = (uint)s;
+        }
+
+        // ---- Ear-clip pre-computation (NO writes; see the block comment) --
+        // boundary: the hole polygon as ORIGINAL ring positions (0..<n);
+        // valSim: simulated post-removal valences per original position;
+        // clips: the recorded (a, b, c) triples as original positions.
+        uint boundary[kMaxValence];
+        uint valSim[kMaxValence];
+        uint clipA[kMaxValence], clipB[kMaxValence], clipC[kMaxValence];
+        uint clipCount = 0u;
+        for (uint k = 0; k < n; ++k) {
+            boundary[k] = k;                       // original position k
+            valSim[k] = linkCounts[ring[k]] - 1u;  // loses the dying link
+        }
+        uint m = n;
+        while (m > 3u) {
+            // Best ear: shortest diagonal among the ears passing the caps.
+            int best = -1;
+            float bestLen = 0.0f;
+            for (uint i = 0; i < m; ++i) {
+                uint pa = boundary[(i + m - 1u) % m];
+                uint pb = boundary[i];
+                uint pc = boundary[(i + 1u) % m];
+                // Cap: the endpoints gain one each.
+                if (valSim[pa] + 1u > params.maxValence) continue;
+                if (valSim[pc] + 1u > params.maxValence) continue;
+                // Chord check: the diagonal must NOT already exist (real
+                // pre-removal rings + the clips recorded so far).
+                uint ca = ring[pa], cc = ring[pc];
+                if (findSlot(links, linkCounts, ca, cc, params.maxValence) >= 0) continue;
+                bool created = false;
+                for (uint t = 0; t < clipCount; ++t) {
+                    uint ta = ring[clipA[t]], tc = ring[clipC[t]];
+                    if ((ta == ca && tc == cc) || (ta == cc && tc == ca)) { created = true; break; }
+                }
+                if (created) continue;
+                float len = distance(float3(positions[ca]), float3(positions[cc]));
+                if (best < 0 || len < bestLen) { best = (int)i; bestLen = len; }
+            }
+            if (best < 0) { deathClaims[gid] = 0u; return; }   // no clip-able ear: defer
+            uint i = (uint)best;
+            uint pa = boundary[(i + m - 1u) % m];
+            uint pb = boundary[i];
+            uint pc = boundary[(i + 1u) % m];
+            clipA[clipCount] = pa; clipB[clipCount] = pb; clipC[clipCount] = pc;
+            ++clipCount;
+            valSim[pa] += 1u;
+            valSim[pc] += 1u;
+            // Remove the tip from the boundary (order preserved).
+            for (uint k = i; k < m - 1u; ++k) boundary[k] = boundary[k + 1u];
+            --m;
+        }
+
+        // ---- Write phase (all checks passed; claims are ring-distance >= 3
+        // ---- apart, so the touched rings are exclusively ours) ----
+        atomic_fetch_add_explicit(&deathCounter[0], 1u, memory_order_relaxed);
+        deadFlags[gid] = 1u;
+        starving[gid] = 0u;
+        radii[gid] = 0.0f;
+        linkCounts[gid] = 0u;   // gates every read of the dead slot's stale ring
+        deathClaims[gid] = 0u;
+
+        // (1) The removal pass: every neighbour loses its link to the dying
+        // cell (the hole opens; the boundary cycle's consecutive pairs close
+        // up in each neighbour's ring — v's slot-neighbours become adjacent).
+        for (uint k = 0; k < n; ++k) {
+            uint cell = ring[k];
+            uint s = slot[k];
+            uint v = linkCounts[cell];
+            uint cbase = cell * params.maxValence;
+            for (uint t = s; t < v - 1u; ++t) links[cbase + t] = links[cbase + t + 1u];
+            linkCounts[cell] = v - 1u;
+        }
+
+        // (2) The clips in recorded order. Fresh slot lookups (the removals
+        // and earlier clips shifted the rings). Insertion rule (orientation-
+        // exact, see the block comment): c right after b in a's ring; a
+        // right before b in c's ring. The a-b and b-c ring adjacencies are
+        // guaranteed: boundary edges are original cycle edges (bidirectional
+        // invariant) or earlier clips' diagonals (inserted into both ends).
+        for (uint t = 0; t < clipCount; ++t) {
+            uint a = ring[clipA[t]], b = ring[clipB[t]], c = ring[clipC[t]];
+            int sa = findSlot(links, linkCounts, a, b, params.maxValence);
+            int sc = findSlot(links, linkCounts, c, b, params.maxValence);
+            insertIntoRing(links, linkCounts, a, (uint)sa + 1u, c, params.maxValence);
+            insertIntoRing(links, linkCounts, c, (uint)sc, a, params.maxValence);
+        }
     }
 
     // ---- V2.4: the differentiation phase — RDE-driven cell-type transition
@@ -2098,15 +2605,27 @@ enum Shaders {
     // then. In uniform/light modes the differentiation phase is a pure growth
     // pause — the seeded chemical field is static and would type from noise.
     //
+    // V2.5: dead slots are skipped (a dead cell's stale chemV must not type
+    // it — the type-partition invariant counts LIVE cells only, and the death
+    // pass runs immediately BEFORE this kernel in the same command buffer, so
+    // a cell that died this step is already flagged; the later-encoder order
+    // makes the flag visible here — the same frozen-data argument as V2.4,
+    // extended: deathExecute's writes (links/linkCounts/deadFlags/starving/
+    // radii) and this kernel's reads (chemV[gid], deadFlags[gid]) + writes
+    // (cellType[gid]) are encoder-ordered, and per-cell disjoint regardless).
+    //
     // Buffer table:
     //   0 chemV (const)   1 cellType (read + write)   2 cellCounter   3 params
+    //   4 deadFlags (const; V2.5)
     kernel void typeTransition(device const float* chemV    [[buffer(0)]],
                                device uint*        cellType [[buffer(1)]],
                                device const uint*  cellCounter [[buffer(2)]],
                                constant SimParams& params   [[buffer(3)]],
+                               device const uint*  deadFlags [[buffer(4)]],
                                uint gid [[thread_position_in_grid]])
     {
         if (gid >= cellCounter[0]) return;
+        if (deadFlags[gid] != 0u) return;   // V2.5: the dead are past typing
         uint t = cellType[gid];
         if (t != 0u) return;               // hysteresis = type memory (above)
         float v = chemV[gid];

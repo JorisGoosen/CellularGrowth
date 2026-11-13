@@ -31,7 +31,7 @@ struct SimPreset {
     /// s > typeT2 -> cap (type 4); the lamel/dal band sits between.
     var typeT2: Float = 0.30
 
-    static let all: [SimPreset] = [ball, brain, plant, coral, degenerateDemo, paddenstoel]
+    static let all: [SimPreset] = [ball, brain, plant, coral, degenerateDemo, paddenstoel, pruneDemo]
 
     static func named(_ name: String) -> SimPreset? {
         all.first { $0.name == name }
@@ -150,4 +150,36 @@ struct SimPreset {
         typeAxis: SIMD3<Float>(0, 1, 0),
         typeT1: -0.4,
         typeT2: 0.9)
+
+    /// V2.5 "prune-demo": light-grown growth WITH starvation death — the
+    /// paper §8 future-work dynamic ("cell death as well as cell growth, with
+    /// appropriate topological changes to the surface"). The form grows
+    /// toward the light; as it thickens, the shaded underside's food ledger
+    /// climbs too slowly to re-cross deathThreshold within deathSteps, so
+    /// those cells die and their ring neighbours are re-spliced (the hole
+    /// closes, Euler-exact) — the form PRUNES ITSELF FROM BELOW, shedding
+    /// shaded tissue like a real coral/tree crown on a progressively thinner
+    /// base. Tuning rationale (the death window is a GROWTH-RATE detector —
+    /// see starvationStep in Shaders.swift): fed cells re-cross the threshold
+    /// ~every 20 steps at the plant preset's gate values (climb 0.5 ->
+    /// 1.0 at drive ~2.65), so their counter resets long before 80; shaded
+    /// cells (drive ~ lightBase 0.15) need ~300 steps for the same climb and
+    /// die at 80. The pruning front sits at the shade iso-line where the
+    /// climb time crosses the window. deathThreshold = splitThreshold: a
+    /// cell starves while it cannot reach its own division threshold fast
+    /// enough. Watch with --tint starve (the red death front) and --anim.
+    static let pruneDemo = SimPreset(
+        name: "prune-demo",
+        summary: "Light growth + starvation death — the shaded underside prunes off (paper §8 death)",
+        subdivision: 3,
+        jitter: 0.25,
+        params: SimParams(
+            springFactor: 1.0 / 3.0, planarFactor: 1.0 / 3.0, bulgeFactor: 1.0 / 3.0,
+            foodIncrement: 0.01, splitThreshold: 1.0, divisionEnabled: 1,
+            roi: 1.6, repulsionStrength: 0.1,
+            growthMode: 1,
+            lightDirX: 0, lightDirY: 1, lightDirZ: 0,
+            lightDiffusionRate: 0.02, lightNutrient: 0.05,
+            lightDecay: 0.02, lightBase: 0.15, lightInterval: 8,
+            deathEnabled: 1, deathThreshold: 1.0, deathSteps: 250))
 }

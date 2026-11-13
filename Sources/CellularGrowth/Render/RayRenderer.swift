@@ -243,7 +243,8 @@ final class RayRenderer {
         var hi = SIMD3<Float>(-Float.greatestFiniteMagnitude, 0, 0)
         let pos = sim.positionsBuffer.contents().assumingMemoryBound(to: SIMD3<Float>.self)
         let rad = sim.radiiBuffer.contents().assumingMemoryBound(to: Float.self)
-        for i in 0..<sim.cellCount {
+        let deadFlags = sim.deadFlagsPointer   // V2.5: dead slots are not scene content
+        for i in 0..<sim.cellCount where deadFlags[i] == 0 {
             let p = pos[i]
             maxRad = max(maxRad, rad[i])
             lo = simd_min(lo, p)
@@ -251,7 +252,7 @@ final class RayRenderer {
         }
         let centre = (lo + hi) * 0.5
         var boundingRadius: Float = 0
-        for i in 0..<sim.cellCount {
+        for i in 0..<sim.cellCount where deadFlags[i] == 0 {
             boundingRadius = max(boundingRadius, simd_distance(pos[i], centre) + rad[i])
         }
         boundingRadius += maxRad + 1e-3
@@ -306,9 +307,11 @@ final class RayRenderer {
         }
         // Big-cell supplement: radii >= roi live outside the grid traversal's
         // correctness domain (crossing point > 1 bin from the centre bin).
+        // V2.5: dead slots are excluded (their zeroed radius fails the filter
+        // anyway — the explicit flag check keeps the two passes consistent).
         let roi = sim.params.roi
         var bigList: [UInt32] = []
-        for i in 0..<sim.cellCount where rad[i] >= roi {
+        for i in 0..<sim.cellCount where rad[i] >= roi && deadFlags[i] == 0 {
             bigList.append(UInt32(i))
         }
         // Buffer always exists (the kernel binds it unconditionally; a nil

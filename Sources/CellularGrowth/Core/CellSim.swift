@@ -53,7 +53,7 @@ import Foundation
 import Metal
 import simd
 
-/// Must mirror MSL `struct SimParams` exactly (48 x 4 bytes = 192).
+/// Must mirror MSL `struct SimParams` exactly (51 x 4 bytes = 204).
 /// Fields are only ever APPENDED at the end, on both sides.
 struct SimParams {
     var linkRestLength: Float = 1.0
@@ -220,6 +220,28 @@ struct SimParams {
     /// typeTransition stem threshold: v <= typeStemV differentiates into a
     /// stem cell (type 1). Host validates typeStemV < typeCapV.
     var typeStemV: Float = 0.10
+    // --- V2.5 (appended; struct grows 192 -> 204 bytes) ---
+    /// Starvation death (paper §8 future work — the inverse of division): a
+    /// cell whose accumulated food stays below deathThreshold for deathSteps
+    /// CONSECUTIVE steps dies; its ring neighbours are re-spliced to close
+    /// the hole (Euler-exact: dV −1, dE −3, dF −2 — sum valence = 6(V−2) with
+    /// V = LIVE cells). 0 = off (every historical behaviour byte-identical).
+    var deathEnabled: UInt32 = 0
+    /// Starvation threshold on the accumulated FOOD ledger (see starvationStep
+    /// in Shaders.swift for why the signal is food, not food + nutrient: the
+    /// light-mode nutrient steady state would mask the food dynamics).
+    /// Default = splitThreshold: a cell starves while it cannot climb to its
+    /// own division threshold fast enough.
+    var deathThreshold: Float = 1.0
+    /// Consecutive starving steps before death; 0 = never. The pruning knob —
+    /// a GROWTH-RATE detector: fed cells re-cross the threshold in ~5-10
+    /// steps (default light gate values — the pulsed nutrient steady state
+    /// puts the lit drive at ~20), shaded cells need hundreds. The window
+    /// must sit between the two. Tuned (probe runs, V2.5 report): window 250
+    /// puts the pruning front at nutrient ~0.25 (deep shade); window 80 was
+    /// measured to prune at nutrient ~1.1 — half the form (too aggressive;
+    /// the death rate then crumples the mesh and division jams).
+    var deathSteps: UInt32 = 100
 }
 
 enum ShaderError: Error {
@@ -251,6 +273,11 @@ final class CellSim {
     private let foodBuffer: MTLBuffer       // Float per cell
     private let rngBuffer: MTLBuffer        // UInt64 PCG32-style state per cell
     private let splitFlagsBuffer: MTLBuffer // UInt32 per cell (division claims)
+    /// V2.5 death claims (UInt32 per cell): deathDecide writes, deathExecute
+    /// consumes — dispatched with the SAME width (the division contract).
+    /// Recomputed/cleared every step (a deferred death retries), unlike
+    /// splitFlags which persist until the next decide.
+    private let deathClaimsBuffer: MTLBuffer
     let counterBuffer: MTLBuffer            // UInt32: authoritative live cell count
     let radiiBuffer: MTLBuffer              // Float per cell (read by the renderer)
     let paramsBuffer: MTLBuffer             // SimParams mirror (read by the M4 ray renderer for roi + hash bits)
@@ -327,11 +354,32 @@ final class CellSim {
     /// restored from CGST v3 (V2.3 files) so a loaded state continues in its
     /// own phase.
     let divisionCounterBuffer: MTLBuffer
+    // --- V2.5 starvation death ---
+    /// Dead-slot flags (UInt32 0/1 per cell). A death MARKS the slot and
+    /// leaves it allocated: the cell counter is a division-allocation
+    /// high-water mark and cannot shrink. Consumers either skip flagged slots
+    /// or read only live rings (which never reference a dead cell after the
+    /// splice); the renderer skips them for free via the zeroed radius.
+    /// Trade-off documented in Shaders.swift: dead slots fragment the buffers
+    /// (live = counter - deathCounter); compaction is a follow-up.
+    let deadFlagsBuffer: MTLBuffer
+    /// Per-cell consecutive-starving counter (starvationStep; reset when the
+    /// food ledger re-crosses deathThreshold, reset on death).
+    let starvingBuffer: MTLBuffer
+    /// Global DEATH counter (device-side, atomic): incremented once per
+    /// executed death in deathExecute. liveCount = cellCount - deathCount.
+    /// Zeroed at reset; persisted in CGST v3 from V2.5 on.
+    let deathCounterBuffer: MTLBuffer
     private var usingNutA = true
     private var usingChemA = true
 
     var params = SimParams()
-    private(set) var cellCount = 0          // host mirror of counterBuffer[0]
+    private(set) var cellCount = 0          // host mirror of counterBuffer[0] (HIGH-WATER mark)
+    /// V2.5: executed deaths since reset (host mirror of deathCounterBuffer).
+    /// LIVE cells = cellCount - deathCount — dead slots stay allocated.
+    private(set) var deathCount = 0
+    /// Live cell count (dead slots excluded).
+    var liveCount: Int { cellCount - deathCount }
     private var usingA = true
     /// Step counter for the light-march scheduler (lightInterval); reset with
     /// the state.
@@ -375,6 +423,10 @@ final class CellSim {
     private var pPulseDecay: MTLComputePipelineState!
     // --- V2.4 differentiation phase ---
     private var pTypeTransition: MTLComputePipelineState!
+    // --- V2.5 starvation death ---
+    private var pStarvationStep: MTLComputePipelineState!
+    private var pDeathDecide: MTLComputePipelineState!
+    private var pDeathExecute: MTLComputePipelineState!
     // TEMPORARY DEBUG (CELLDBG; remove after M3 gates are green):
     private var pParamEcho: MTLComputePipelineState!
     private var pQueryFingerprint: MTLComputePipelineState!
@@ -419,6 +471,10 @@ final class CellSim {
             pPulseDecay = try pipeline("pulseDecayStep")
             // V2.4 differentiation phase
             pTypeTransition = try pipeline("typeTransition")
+            // V2.5 starvation death
+            pStarvationStep = try pipeline("starvationStep")
+            pDeathDecide = try pipeline("deathDecide")
+            pDeathExecute = try pipeline("deathExecute")
             // TEMPORARY DEBUG (CELLDBG; remove after M3 gates are green):
             pParamEcho = try pipeline("paramEcho")
             pQueryFingerprint = try pipeline("queryFingerprint")
@@ -429,8 +485,8 @@ final class CellSim {
 
         // Layout drift guard: the MSL SimParams mirror is appended-only; a
         // mismatch here corrupts every kernel silently.
-        precondition(MemoryLayout<SimParams>.size == 192,
-                     "SimParams layout drift: \(MemoryLayout<SimParams>.size) != 192 (see Shaders.swift)")
+        precondition(MemoryLayout<SimParams>.size == 204,
+                     "SimParams layout drift: \(MemoryLayout<SimParams>.size) != 204 (see Shaders.swift)")
 
         let f3 = MemoryLayout<SIMD3<Float>>.stride
         positionsA = device.makeBuffer(length: maxCells * f3, options: .storageModeShared)!
@@ -454,6 +510,9 @@ final class CellSim {
         splitFlagsBuffer = device.makeBuffer(length: maxCells * MemoryLayout<UInt32>.stride,
                                              options: .storageModeShared)!
         splitFlagsBuffer.label = "splitFlags"
+        deathClaimsBuffer = device.makeBuffer(length: maxCells * MemoryLayout<UInt32>.stride,
+                                              options: .storageModeShared)!
+        deathClaimsBuffer.label = "deathClaims"
         counterBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride,
                                           options: .storageModeShared)!
         counterBuffer.label = "cellCounter"
@@ -540,6 +599,17 @@ final class CellSim {
         divisionCounterBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride,
                                                   options: .storageModeShared)!
         divisionCounterBuffer.label = "divisionCounter"
+        // V2.5 starvation death: dead-slot flags + per-cell starving counters
+        // (both UInt32 per cell) + the global death counter (one UInt32).
+        deadFlagsBuffer = device.makeBuffer(length: maxCells * MemoryLayout<UInt32>.stride,
+                                            options: .storageModeShared)!
+        deadFlagsBuffer.label = "deadFlags"
+        starvingBuffer = device.makeBuffer(length: maxCells * MemoryLayout<UInt32>.stride,
+                                           options: .storageModeShared)!
+        starvingBuffer.label = "starvingCount"
+        deathCounterBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride,
+                                               options: .storageModeShared)!
+        deathCounterBuffer.label = "deathCounter"
         memset(binCountsBuffer.contents(), 0, binCountsBuffer.length)
         memset(collisionOffsetBuffer.contents(), 0, collisionOffsetBuffer.length)
         memset(nutrientA.contents(), 0, nutrientA.length)
@@ -548,6 +618,11 @@ final class CellSim {
         memset(pulseBuffer.contents(), 0, pulseBuffer.length)
         memset(cellTypeBuffer.contents(), 0, cellTypeBuffer.length)
         memset(divisionCounterBuffer.contents(), 0, divisionCounterBuffer.length)
+        // V2.5: no dead slots, nobody starving, no deaths (full length — a
+        // previous run's flags must not survive a reset).
+        memset(deadFlagsBuffer.contents(), 0, deadFlagsBuffer.length)
+        memset(starvingBuffer.contents(), 0, starvingBuffer.length)
+        memset(deathCounterBuffer.contents(), 0, deathCounterBuffer.length)
         fillLitFraction(1.0, count: maxCells)   // neutral: no illumination verdict yet
         memset(occupancyBuffer.contents(), 0, occupancyBuffer.length)
     }
@@ -567,6 +642,7 @@ final class CellSim {
         precondition(positions.count <= maxCells, "cell set exceeds maxCells")
         precondition(positions.count == links.count, "positions/links mismatch")
         cellCount = positions.count
+        deathCount = 0   // V2.5: a fresh cell set has no dead slots
         params.cellCount = UInt32(cellCount)
         // M3: size the hash for the initial count (shrink allowed here — the
         // counts are re-zeroed below, so bins dropped by a smaller T are clean),
@@ -645,6 +721,11 @@ final class CellSim {
         // applyPolarTypes is called by the host; the phase clock restarts.
         memset(cellTypeBuffer.contents(), 0, cellTypeBuffer.length)
         memset(divisionCounterBuffer.contents(), 0, divisionCounterBuffer.length)
+        // V2.5: fresh death state (full length — a previous run's flags must
+        // not survive a reset).
+        memset(deadFlagsBuffer.contents(), 0, deadFlagsBuffer.length)
+        memset(starvingBuffer.contents(), 0, starvingBuffer.length)
+        memset(deathCounterBuffer.contents(), 0, deathCounterBuffer.length)
         fillLitFraction(1.0, count: cellCount)   // neutral until the first light march
 
         guard let cb = queue.makeCommandBuffer() else { fatalError("no command buffer") }
@@ -726,10 +807,18 @@ final class CellSim {
     /// repulsionStrength > 0] -> [M5 chemical passes: boundMax + illuminate +
     /// clearBound + nutrientDiffuse (light mode) | rdeStep (rde mode)] ->
     /// [V2.2 pulseDecayStep] -> integrate -> food -> division (decide,
-    /// execute, finalize) -> cellTint -> radii.
+    /// execute, finalize) -> [V2.5 death: starvationStep, deathDecide,
+    /// deathExecute (+ re-tint), when deathEnabled] -> [typeTransition +
+    /// cellTint (V2.4 differentiation phase)] -> radii.
     /// The pulse decay runs BEFORE the division block: a division this step
     /// flashes at pulse = 1.0 and the decay starts next step. cellTint runs
-    /// after division so this step's daughters are tinted (M6).
+    /// after division so this step's daughters are tinted (M6). The death
+    /// block runs after the division block (the splice must read the
+    /// post-division topology) and before typeTransition (the type pass sees
+    /// the post-death flags — encoder order; see the death-kernel block
+    /// comment in Shaders.swift). Death runs whenever deathEnabled, including
+    /// during the differentiation phase (the phase freezes DIVISION, not
+    /// death).
     /// All kernels bound on the device cell counter; the dispatch width is a
     /// benign over-estimate (see class docs). Buffers swap on the CPU side;
     /// GPU execution order is fixed within the CB (Metal hazard-tracks the
@@ -818,6 +907,22 @@ final class CellSim {
         // skipped), RDE typing active — the transition runs in the division
         // block's slot (after integrate; see the step() doc comment), then
         // one extra tint pass so the new type colours render immediately.
+        // V2.5 starvation death slots BETWEEN the division block and
+        // typeTransition (the splice must read the post-division topology;
+        // the type pass must see the post-death flags — encoder order fixes
+        // both). It runs whenever deathEnabled, including during the
+        // differentiation phase (the phase freezes DIVISION, not death; food
+        // is frozen there, so a cell frozen below the threshold starves
+        // steadily — documented in the death-kernel block comment).
+        if params.deathEnabled != 0 {
+            encodeStarvationStep(cb, width: width)
+            encodeDeathDecide(cb, width: width)
+            encodeDeathExecute(cb, width: width)
+            // Re-tint so the starve mode (tintMode 7) reflects this step's
+            // counter updates; every other mode re-derives identical values
+            // (the death block writes no tint input except starving).
+            encodeCellTint(cb, width: width)
+        }
         if params.differentiationPhase != 0 && params.growthMode == 2 {
             encodeTypeTransition(cb, width: width)
             encodeCellTint(cb, width: width)
@@ -887,6 +992,7 @@ final class CellSim {
         enc.setBuffer(occupancyBuffer, offset: 0, index: 2)   // M6 coarse occupancy bits
         enc.setBuffer(counterBuffer, offset: 0, index: 3)
         enc.setBuffer(paramsBuffer, offset: 0, index: 4)
+        enc.setBuffer(deadFlagsBuffer, offset: 0, index: 5)   // V2.5: dead slots stay out of the grid
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         enc.endEncoding()
@@ -946,6 +1052,7 @@ final class CellSim {
         enc.setBuffer(particleIndicesBuffer, offset: 0, index: 3)
         enc.setBuffer(counterBuffer, offset: 0, index: 4)
         enc.setBuffer(paramsBuffer, offset: 0, index: 5)
+        enc.setBuffer(deadFlagsBuffer, offset: 0, index: 6)   // V2.5: mirrors gridCount exactly
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         enc.endEncoding()
@@ -963,6 +1070,7 @@ final class CellSim {
         enc.setBuffer(collisionOffsetBuffer, offset: 0, index: 6)
         enc.setBuffer(counterBuffer, offset: 0, index: 7)
         enc.setBuffer(paramsBuffer, offset: 0, index: 8)
+        enc.setBuffer(deadFlagsBuffer, offset: 0, index: 9)   // V2.5: skip dead queries
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         enc.endEncoding()
@@ -1194,6 +1302,7 @@ final class CellSim {
         enc.setBuffer(paramsBuffer, offset: 0, index: 7)
         enc.setBuffer(litFractionBuffer, offset: 0, index: 8)
         enc.setBuffer(occupancyBuffer, offset: 0, index: 9)   // M6 coarse occupancy skip
+        enc.setBuffer(deadFlagsBuffer, offset: 0, index: 10)  // V2.5: dead slots don't march
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         enc.endEncoding()
@@ -1239,6 +1348,7 @@ final class CellSim {
         enc.setBuffer(nutrientBuffer, offset: 0, index: 6)  // V2.2 food heatmap (light mode)
         enc.setBuffer(pulseBuffer, offset: 0, index: 7)     // V2.2 mitosis pulse
         enc.setBuffer(cellTypeBuffer, offset: 0, index: 8)  // V2.3 type colours (modes 5/6)
+        enc.setBuffer(starvingBuffer, offset: 0, index: 9)  // V2.5 starve mode (the death front)
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         enc.endEncoding()
@@ -1280,6 +1390,8 @@ final class CellSim {
     /// skips the division block (step()), so this kernel is the step's only
     /// cellType writer and reads the freshly evolved chemV (the chemical
     /// pass's double buffers swapped before the division block).
+    /// V2.5: binds the dead flags (the death block runs immediately before —
+    /// encoder order — so freshly dead slots are skipped here).
     private func encodeTypeTransition(_ cb: MTLCommandBuffer, width: Int) {
         guard let enc = cb.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pTypeTransition)
@@ -1287,6 +1399,61 @@ final class CellSim {
         enc.setBuffer(cellTypeBuffer, offset: 0, index: 1)
         enc.setBuffer(counterBuffer, offset: 0, index: 2)
         enc.setBuffer(paramsBuffer, offset: 0, index: 3)
+        enc.setBuffer(deadFlagsBuffer, offset: 0, index: 4)   // V2.5: the dead are past typing
+        enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    // MARK: V2.5 starvation death
+
+    /// The death block's three encoders (see the death-kernel block comment
+    /// in Shaders.swift): counter -> decide -> execute, all at the shared
+    /// dispatch width (decide and execute MUST share it — the claim-consumption
+    /// contract, same as division). Encoded only when deathEnabled != 0, so
+    /// death-off runs are untouched (goldens byte-identical).
+    private func encodeStarvationStep(_ cb: MTLCommandBuffer, width: Int) {
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pStarvationStep)
+        enc.setBuffer(foodBuffer, offset: 0, index: 0)
+        enc.setBuffer(deadFlagsBuffer, offset: 0, index: 1)
+        enc.setBuffer(starvingBuffer, offset: 0, index: 2)
+        enc.setBuffer(counterBuffer, offset: 0, index: 3)
+        enc.setBuffer(paramsBuffer, offset: 0, index: 4)
+        enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    private func encodeDeathDecide(_ cb: MTLCommandBuffer, width: Int) {
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pDeathDecide)
+        enc.setBuffer(starvingBuffer, offset: 0, index: 0)
+        enc.setBuffer(linksBuffer, offset: 0, index: 1)
+        enc.setBuffer(linkCountsBuffer, offset: 0, index: 2)
+        enc.setBuffer(deadFlagsBuffer, offset: 0, index: 3)
+        enc.setBuffer(splitFlagsBuffer, offset: 0, index: 4)   // divided-this-step defer
+        enc.setBuffer(deathClaimsBuffer, offset: 0, index: 5)
+        enc.setBuffer(counterBuffer, offset: 0, index: 6)
+        enc.setBuffer(paramsBuffer, offset: 0, index: 7)
+        enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    private func encodeDeathExecute(_ cb: MTLCommandBuffer, width: Int) {
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pDeathExecute)
+        enc.setBuffer(positionsBuffer, offset: 0, index: 0)    // ear-diagonal scoring
+        enc.setBuffer(linksBuffer, offset: 0, index: 1)
+        enc.setBuffer(linkCountsBuffer, offset: 0, index: 2)
+        enc.setBuffer(deathClaimsBuffer, offset: 0, index: 3)
+        enc.setBuffer(deadFlagsBuffer, offset: 0, index: 4)
+        enc.setBuffer(starvingBuffer, offset: 0, index: 5)
+        enc.setBuffer(radiiBuffer, offset: 0, index: 6)        // zeroed: the renderer's free skip
+        enc.setBuffer(deathCounterBuffer, offset: 0, index: 7)
+        enc.setBuffer(counterBuffer, offset: 0, index: 8)
+        enc.setBuffer(paramsBuffer, offset: 0, index: 9)
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         enc.endEncoding()
@@ -1498,6 +1665,9 @@ final class CellSim {
         let p = counterBuffer.contents().assumingMemoryBound(to: UInt32.self)
         cellCount = Int(min(p[0], UInt32(maxCells)))
         params.cellCount = UInt32(cellCount)
+        // V2.5: the death counter is the live-count delta (dead slots stay
+        // allocated — the counter is a high-water mark).
+        deathCount = Int(deathCounterBuffer.contents().assumingMemoryBound(to: UInt32.self)[0])
         if allowGridGrowth {
             let old = params.gridBitsX + params.gridBitsY + params.gridBitsZ
             setGridBits(forCellCount: cellCount)
@@ -1523,6 +1693,10 @@ final class CellSim {
     }
     var collisionOffsetPointer: UnsafeMutablePointer<SIMD3<Float>> {
         collisionOffsetBuffer.contents().assumingMemoryBound(to: SIMD3<Float>.self)
+    }
+    /// V2.5: division-claim readback (decide-side diagnostics; GPU idle).
+    var splitFlagsPointer: UnsafeMutablePointer<UInt32> {
+        splitFlagsBuffer.contents().assumingMemoryBound(to: UInt32.self)
     }
     var binCountsPointer: UnsafeMutablePointer<UInt32> {
         binCountsBuffer.contents().assumingMemoryBound(to: UInt32.self)
@@ -1572,6 +1746,13 @@ final class CellSim {
     var cellTypePointer: UnsafeMutablePointer<UInt32> {
         cellTypeBuffer.contents().assumingMemoryBound(to: UInt32.self)
     }
+    /// V2.5 death-state readbacks (validation/probe; GPU must be idle).
+    var deadFlagsPointer: UnsafeMutablePointer<UInt32> {
+        deadFlagsBuffer.contents().assumingMemoryBound(to: UInt32.self)
+    }
+    var starvingPointer: UnsafeMutablePointer<UInt32> {
+        starvingBuffer.contents().assumingMemoryBound(to: UInt32.self)
+    }
     var radiiPointer: UnsafeMutablePointer<Float> {
         radiiBuffer.contents().assumingMemoryBound(to: Float.self)
     }
@@ -1591,10 +1772,23 @@ final class CellSim {
     func readTypes() -> [UInt32] {
         Array(UnsafeBufferPointer(start: cellTypePointer, count: cellCount))
     }
+    /// V2.5 death-state readbacks (only for small cell counts / validation).
+    func readDeadFlags() -> [UInt32] {
+        Array(UnsafeBufferPointer(start: deadFlagsPointer, count: cellCount))
+    }
+    func readStarving() -> [UInt32] {
+        Array(UnsafeBufferPointer(start: starvingPointer, count: cellCount))
+    }
+
     /// V2.3: executed divisions since reset (the device phase clock; GPU
     /// must be idle).
     var divisionCounter: Int {
         Int(divisionCounterBuffer.contents().assumingMemoryBound(to: UInt32.self)[0])
+    }
+    /// V2.5: executed deaths since reset (the device counter; GPU must be
+    /// idle). liveCount = cellCount - deathCounter.
+    var deathCounter: Int {
+        Int(deathCounterBuffer.contents().assumingMemoryBound(to: UInt32.self)[0])
     }
 
     // MARK: - State snapshots (CGST; M6 unification)
@@ -1622,11 +1816,14 @@ final class CellSim {
     //            |   SimParams (same pattern as the pulse block); legacy
     //            |   files load with type 0 everywhere and a fresh phase
     //            |   clock]
+    //            | [V2.5: deadFlags (N x u32) + starving (N x u32) +
+    //            |   deathCounter (1 x u32) — the death state, same appended
+    //            |   pattern; legacy files load with no dead slots]
     //            | SimParams (raw, appended-only: 128 B comment from v3's first
     //            |   draft was wrong — M6 files carry 144 B, V2.1 files 148 B,
-    //            |   V2.2 files 160 B, V2.3 files 176 B, V2.4 files 192 B; the
-    //            |   reader accepts every prefix length and prefixes into the
-    //            |   struct)
+    //            |   V2.2 files 160 B, V2.3 files 176 B, V2.4 files 192 B,
+    //            |   V2.5 files 204 B; the reader accepts every prefix length
+    //            |   and prefixes into the struct)
     //            Loaded WITHOUT reset(): buffers installed directly, normals/
     //            radii/tint recomputed (deterministic functions of the state).
     //
@@ -1650,7 +1847,9 @@ final class CellSim {
                                              + MemoryLayout<UInt64>.stride
                                              + MemoryLayout<Float>.stride   // V2.2 pulse
                                              + MemoryLayout<UInt32>.stride  // V2.3 cellType
-                                             + MemoryLayout<UInt32>.stride) // V2.3 divisionCounter
+                                             + MemoryLayout<UInt32>.stride  // V2.3 divisionCounter
+                                             + 2 * MemoryLayout<UInt32>.stride // V2.5 deadFlags+starving
+                                             + MemoryLayout<UInt32>.stride) // V2.5 deathCounter
                               + MemoryLayout<SimParams>.size)
         func append(_ v: UInt32) {
             var x = v.littleEndian
@@ -1706,6 +1905,11 @@ final class CellSim {
         // same appended-block pattern (see the format comment above).
         for t in UnsafeBufferPointer(start: cellTypePointer, count: count) { append(t) }
         append(UInt32(divisionCounter))
+        // --- V2.5: the death state (deadFlags N x u32, starving N x u32,
+        // deathCounter 1 x u32), same appended-block pattern.
+        for d in UnsafeBufferPointer(start: deadFlagsPointer, count: count) { append(d) }
+        for s in UnsafeBufferPointer(start: starvingPointer, count: count) { append(s) }
+        append(UInt32(deathCounter))
         // Raw SimParams (the simulation contract; appended-only layout).
         withUnsafeBytes(of: &params) { src in
             bytes.append(contentsOf: src.prefix(MemoryLayout<SimParams>.size))
@@ -1748,7 +1952,8 @@ final class CellSim {
         // Raw SimParams block lengths by writer era: 144 B (M6), 148 B (V2.1,
         // lightSoft), 160 B (V2.2: tintMode + heatScale + pulseDecay), 176 B
         // (V2.3: lamelRate + dalRate + interiorDivider + phaseSwitchX), 192 B
-        // (V2.4: typeMode + differentiationPhase + typeCapV + typeStemV).
+        // (V2.4: typeMode + differentiationPhase + typeCapV + typeStemV),
+        // 204 B (V2.5: deathEnabled + deathThreshold + deathSteps).
         // The appended-only layout makes every shorter block a compatible
         // prefix of the current struct — the read below copies only the bytes
         // present, leaving fields the file predates at their struct defaults.
@@ -1757,15 +1962,18 @@ final class CellSim {
         // found by the v21b/v22 golden replay failing the size check.)
         // V2.2 writers ALSO append a pulse block (N x f32) before the params;
         // V2.3 writers append cell types (N x u32) + the division counter
-        // (4 B) on top of that. count >= 12 for every real state (icosphere
-        // minimum), so 4N > 16: the variable tails (>= 4N + 144) can never
-        // collide with a bare params length (<= 192).
+        // (4 B) on top of that; V2.5 writers append the death state
+        // (deadFlags N x u32 + starving N x u32 + the death counter 4 B).
+        // count >= 12 for every real state (icosphere minimum), so 4N > 16:
+        // the variable tails (>= 4N + 144) can never collide with a bare
+        // params length (<= 204).
         let paramSizes: [Int] = [144, 148, 160, 176, MemoryLayout<SimParams>.size]
         var v3Sizes: [Int] = []
         for p in paramSizes {
             v3Sizes.append(baseSize + v3Payload + p)                  // pre-V2.2 (no pulse block)
             v3Sizes.append(baseSize + v3Payload + 4 * count + p)      // V2.2 (+ pulse block)
             v3Sizes.append(baseSize + v3Payload + 8 * count + 4 + p)  // V2.3 (+ pulse + types + div counter)
+            v3Sizes.append(baseSize + v3Payload + 16 * count + 8 + p) // V2.5 (+ death state)
         }
         let expected = version == 2 ? [baseSize + 56]      // v2 block: 1 uint + 13 floats
                      : version == 3 ? v3Sizes
@@ -1865,15 +2073,31 @@ final class CellSim {
             pulse = readFloats(count)
         }
         // V2.3: optional cell types (N x u32) + the division counter (u32),
-        // same detection pattern (remaining > the largest bare params block,
-        // 192 — the V2.3 tail is 4N + 4 >= 2604 for any real state, never
-        // ambiguous).
+        // same detection pattern (remaining > the largest bare params block —
+        // MemoryLayout<SimParams>.size, 192 B in the V2.4 era, 204 B from
+        // V2.5; the variable tails 4N + 4 >= 2604 for any real state are
+        // never ambiguous against it).
         var types = [UInt32](repeating: 0, count: count)
         var divCount: UInt32 = 0
         if data.count - off > MemoryLayout<SimParams>.size {
             for i in 0..<count { types[i] = u32(off + i * 4) }
             off += count * 4
             divCount = u32(off)
+            off += 4
+        }
+        // V2.5: optional death state (deadFlags N x u32 + starving N x u32 +
+        // the death counter u32), same detection pattern (a pre-V2.5 file's
+        // remaining bytes after the types block are exactly its raw params
+        // block, <= 204 B, never misread; a V2.5 file's tail is 8N + 4 + 204).
+        var dead = [UInt32](repeating: 0, count: count)
+        var starve = [UInt32](repeating: 0, count: count)
+        var deathCtr: UInt32 = 0
+        if data.count - off > MemoryLayout<SimParams>.size {
+            for i in 0..<count { dead[i] = u32(off + i * 4) }
+            off += count * 4
+            for i in 0..<count { starve[i] = u32(off + i * 4) }
+            off += count * 4
+            deathCtr = u32(off)
             off += 4
         }
         // Raw SimParams.
@@ -1892,7 +2116,8 @@ final class CellSim {
         installFullState(positions: positions, flatLinks: flatLinks, counts: counts,
                          food: food, nutrient: nutrient, chemU: chemU, chemV: chemV,
                          tint: tint, rng: rng, pulse: pulse, types: types,
-                         divCount: divCount)
+                         divCount: divCount, dead: dead, starving: starve,
+                         deathCtr: deathCtr)
         return (version, params.growthMode)
     }
 
@@ -1905,8 +2130,9 @@ final class CellSim {
 
     /// Install a COMPLETE state snapshot (v3) without reseeding anything:
     /// positions/links/counts/food/nutrient/u/v/tint/rng (+ V2.2 pulse,
-    /// V2.3 types + division counter) + params, then recompute the derived
-    /// per-cell data (normals, radii, tint) in a waited command buffer.
+    /// V2.3 types + division counter, V2.5 dead flags + starving counters +
+    /// death counter) + params, then recompute the derived per-cell data
+    /// (normals, radii, tint) in a waited command buffer.
     /// Derived state that only render paths consume (litFraction) is
     /// neutralized to 1.0 — directional renders call encodeIlluminationRefresh,
     /// and the next light-mode step re-marches.
@@ -1914,7 +2140,9 @@ final class CellSim {
                                   counts: [UInt32], food: [Float], nutrient: [Float],
                                   chemU: [Float], chemV: [Float], tint: [SIMD3<Float>],
                                   rng: [UInt64], pulse: [Float],
-                                  types: [UInt32], divCount: UInt32) {
+                                  types: [UInt32], divCount: UInt32,
+                                  dead: [UInt32], starving: [UInt32],
+                                  deathCtr: UInt32) {
         precondition(positions.count <= maxCells, "state exceeds maxCells")
         cellCount = positions.count
         params.cellCount = UInt32(cellCount)
@@ -1950,6 +2178,13 @@ final class CellSim {
         memset(cellTypeBuffer.contents(), 0, cellTypeBuffer.length)
         copy(types, to: cellTypeBuffer)
         divisionCounterBuffer.contents().assumingMemoryBound(to: UInt32.self)[0] = divCount
+        // V2.5 death state (legacy files pass all zeros + a zero counter).
+        memset(deadFlagsBuffer.contents(), 0, deadFlagsBuffer.length)
+        copy(dead, to: deadFlagsBuffer)
+        memset(starvingBuffer.contents(), 0, starvingBuffer.length)
+        copy(starving, to: starvingBuffer)
+        deathCounterBuffer.contents().assumingMemoryBound(to: UInt32.self)[0] = deathCtr
+        deathCount = Int(deathCtr)
         counterBuffer.contents().assumingMemoryBound(to: UInt32.self)[0] = UInt32(cellCount)
         memset(boundBuffer.contents(), 0, boundBuffer.length)
         fillLitFraction(1.0, count: cellCount)   // neutral until encodeIlluminationRefresh

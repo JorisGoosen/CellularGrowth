@@ -65,6 +65,13 @@ enum HeadlessRunner {
             || args.contains("--differentiate-at") || args.contains("--differentiate-until")
             || args.contains("--type-mode") || args.contains("--type-cap-v")
             || args.contains("--type-stem-v") || args.contains("--diff-probe")
+            // --- V2.5 (pitfall 10: every new flag routes to the headless path) ---
+            || args.contains("--death") || args.contains("--death-threshold")
+            || args.contains("--death-steps")
+            // V2.5: --state-load was only ever routed headless via its
+            // --render/--screenshot companions (a bare --state-load silently
+            // launched the GUI event loop and hung — pitfall 10 verbatim).
+            || args.contains("--state-load")
     }
 
     struct Options {
@@ -185,6 +192,19 @@ enum HeadlessRunner {
         var typeStemV: Float = 0.10
         /// Static-ball differentiation validation mode (like --rde-probe).
         var diffProbe = false
+        // --- V2.5 (starvation death — the inverse of division) ---
+        /// Death on (--death). Default off: every historical behaviour and
+        /// every golden is death-free.
+        var death = false
+        /// Starvation threshold on the accumulated food ledger (default =
+        /// splitThreshold: a cell starves while it cannot climb to its own
+        /// division threshold fast enough).
+        var deathThreshold: Float = 1.0
+        /// Consecutive starving steps before death (default 100 — safely
+        /// above the ~20-step food climb of fed cells at the default light
+        /// gate values, well below the hundreds of steps a shaded cell needs;
+        /// see starvationStep in Shaders.swift).
+        var deathSteps = 100
     }
 
     private static func parseOptions() -> Options {
@@ -228,6 +248,10 @@ enum HeadlessRunner {
             o.rdeDv = preset.params.rdeDv
             o.rdeBase = preset.params.rdeBase
             o.rdeGain = preset.params.rdeGain
+            // V2.5: presets can carry the death knobs (explicit flags win).
+            o.death = preset.params.deathEnabled != 0
+            o.deathThreshold = preset.params.deathThreshold
+            o.deathSteps = Int(preset.params.deathSteps)
             // V2.3: presets can carry the two-phase growth rates + the
             // polar typing knobs (explicit flags below still win).
             o.lamelRate = preset.params.lamelRate
@@ -355,6 +379,10 @@ enum HeadlessRunner {
             case "--type-cap-v": o.typeCapV = Float(value("--type-cap-v") ?? "") ?? o.typeCapV
             case "--type-stem-v": o.typeStemV = Float(value("--type-stem-v") ?? "") ?? o.typeStemV
             case "--diff-probe": o.diffProbe = true
+            // --- V2.5 (starvation death) ---
+            case "--death": o.death = true
+            case "--death-threshold": o.deathThreshold = Float(value("--death-threshold") ?? "") ?? o.deathThreshold
+            case "--death-steps": o.deathSteps = Int(value("--death-steps") ?? "") ?? o.deathSteps
             default: break
             }
         }
@@ -477,6 +505,10 @@ enum HeadlessRunner {
         sim.params.typeCapV = o.typeCapV
         sim.params.typeStemV = o.typeStemV
         sim.params.differentiationPhase = 0   // the phase starts via the step range (growAndReport/bench)
+        // --- V2.5 starvation death ---
+        sim.params.deathEnabled = o.death ? 1 : 0
+        sim.params.deathThreshold = max(o.deathThreshold, 0)
+        sim.params.deathSteps = UInt32(max(o.deathSteps, 0))
 
         if o.diffProbe {
             runDiffProbe(queue: queue, sim: sim, o: o)   // exits
@@ -572,6 +604,8 @@ enum HeadlessRunner {
             print("t=\(step): differentiation phase \(on ? "STARTED — division frozen, RDE typing active (\(sim.params.growthMode == 2 ? "rde" : "non-rde: growth pause only"))" : "ENDED — growth resumed")")
         }
         var lastTypes: [Int]? = nil   // for the per-type Δ (typing vs division)
+        var lastDeaths: Int? = nil    // V2.5: for the deaths-per-window cascade
+        var lastDeathStep = 0
         while done < o.steps {
             var batch = min(100, o.steps - done)
             // Split the batch at the next phase boundary inside it.
@@ -601,8 +635,18 @@ enum HeadlessRunner {
                 print("t=\(done): division disabled (diagnostic --div-stop)")
             }
             if done % 500 == 0 || done == o.steps {
-                print("t=\(done)   cells=\(sim.cellCount)  meanLinkLength=\(meanLinkLength())")
+                // V2.5: with death on the headline count is the LIVE count —
+                // dead slots stay allocated (the counter is a high-water mark).
+                let liveLabel = sim.params.deathEnabled != 0
+                    ? " live=\(sim.liveCount) dead=\(sim.deathCount)"
+                    : ""
+                print("t=\(done)   cells=\(sim.cellCount)\(liveLabel)  meanLinkLength=\(meanLinkLength())")
                 printGrowthCheckpoint(sim: sim)
+                if sim.params.deathEnabled != 0 {
+                    lastDeaths = printDeathCheckpoint(sim: sim, previousDeaths: lastDeaths,
+                                                      windowSteps: done - lastDeathStep)
+                    lastDeathStep = done
+                }
                 if isTyped(sim) || diffPhase {
                     lastTypes = printTypedCheckpoint(sim: sim, previous: lastTypes)
                 }
@@ -620,6 +664,13 @@ enum HeadlessRunner {
                 maxAbs = max(maxAbs, simd_length(p))
             }
             print("NaN cells: \(nanCount)   max |P|: \(maxAbs)")
+        }
+        // CG_CHECK=1: the full invariant harness at the end of a headless run
+        // (fast topology bisect loop without the whole selftest).
+        if ProcessInfo.processInfo.environment["CG_CHECK"] != nil {
+            let (pass, lines) = checkInvariants(sim: sim, settled: false, meanLimit: 10)
+            for l in lines { print("   \(l)") }
+            print("CG_CHECK: \(pass ? "PASS" : "FAIL")")
         }
 
         // M5 directional-growth diagnostics (the paper-gate metric: does the
@@ -763,8 +814,9 @@ enum HeadlessRunner {
         case "pulse": return 4
         case "type": return 5          // V2.3 type colours
         case "type-pulse": return 6    // V2.3 type colours + mitosis-pulse overlay
+        case "starve": return 7        // V2.5 the starvation-death front
         default:
-            print("--tint '\(s)' unknown (auto | none | chemical | food | pulse | type | type-pulse)")
+            print("--tint '\(s)' unknown (auto | none | chemical | food | pulse | type | type-pulse | starve)")
             exit(1)
         }
     }
@@ -1169,15 +1221,16 @@ enum HeadlessRunner {
         let v = sim.cellCount
         guard v > 0 else { return [] }
         let types = sim.readTypes()
+        let dead = sim.readDeadFlags()   // V2.5: dead slots carry stale types — excluded
         var counts = [Int](repeating: 0, count: 5)
         var badType = 0
-        for t in types {
-            let k = Int(t)
+        for i in 0..<v where dead[i] == 0 {
+            let k = Int(types[i])
             if k < 5 { counts[k] += 1 } else { badType += 1 }
         }
         let pulse = sim.readPulse()
         var pulseSum = [Float](repeating: 0, count: 5)
-        for i in 0..<v {
+        for i in 0..<v where dead[i] == 0 {
             let t = Int(min(types[i], 4))
             pulseSum[t] += pulse[i]
         }
@@ -1195,8 +1248,8 @@ enum HeadlessRunner {
         let countsBuf = UnsafeBufferPointer(start: sim.linkCountsPointer, count: v)
         var valenceHist = [Int](repeating: 0, count: Int(CellSim.maxValence) + 1)
         var maxVal = 0
-        for c in countsBuf {
-            let k = Int(c)
+        for i in 0..<v where dead[i] == 0 {
+            let k = Int(countsBuf[i])
             if k <= Int(CellSim.maxValence) { valenceHist[k] += 1 }
             maxVal = max(maxVal, k)
         }
@@ -1205,17 +1258,17 @@ enum HeadlessRunner {
         // cannot relieve their own valence by dividing — the suspected
         // saturation mechanism.)
         var satByType = [Int](repeating: 0, count: 5)
-        for i in 0..<v where Int(countsBuf[i]) >= Int(CellSim.maxValence) {
+        for i in 0..<v where dead[i] == 0 && Int(countsBuf[i]) >= Int(CellSim.maxValence) {
             let t = Int(min(types[i], 4))
             satByType[t] += 1
         }
-        print("      valence: max=\(maxVal) at cap(\(CellSim.maxValence))=\(atCap) (\(String(format: "%.1f%%", 100 * Float(atCap) / Float(v))))  v14+ = \(valenceHist[14] + valenceHist[15] + valenceHist[16])  sat by type: none=\(satByType[0]) stem=\(satByType[1]) lamel=\(satByType[2]) dal=\(satByType[3]) cap=\(satByType[4])")
+        print("      valence: max=\(maxVal) at cap(\(CellSim.maxValence))=\(atCap) (\(String(format: "%.1f%%", 100 * Float(atCap) / Float(max(sim.liveCount, 1))))))  v14+ = \(valenceHist[14] + valenceHist[15] + valenceHist[16])  sat by type: none=\(satByType[0]) stem=\(satByType[1]) lamel=\(satByType[2]) dal=\(satByType[3]) cap=\(satByType[4])")
         let diff = sim.params.differentiationPhase != 0
         let deltaLabel = diff ? "Δ typing" : "Δ divisions"
         let deltas = previous != nil
             ? "  \(deltaLabel): none=\(counts[0] - previous![0]) stem=\(counts[1] - previous![1]) lamel=\(counts[2] - previous![2]) dal=\(counts[3] - previous![3]) cap=\(counts[4] - previous![4])"
             : ""
-        print("      types: none=\(counts[0]) stem=\(counts[1]) lamel=\(counts[2]) dal=\(counts[3]) cap=\(counts[4]) Σ=\(v)\(badType == 0 ? "" : " BAD=\(badType)")  divisions=\(div) phase=\(phase)\(diff ? " DIFFERENTIATING" : "")\(deltas)")
+        print("      types: none=\(counts[0]) stem=\(counts[1]) lamel=\(counts[2]) dal=\(counts[3]) cap=\(counts[4]) Σ=\(sim.liveCount)\(badType == 0 ? "" : " BAD=\(badType)")  divisions=\(div) phase=\(phase)\(diff ? " DIFFERENTIATING" : "")\(deltas)")
         print("      pulse/type: none \(avg(pulseSum[0], counts[0]))  stem \(avg(pulseSum[1], counts[1]))  lamel \(avg(pulseSum[2], counts[2]))  dal \(avg(pulseSum[3], counts[3]))  cap \(avg(pulseSum[4], counts[4]))")
         return counts
     }
@@ -1226,6 +1279,212 @@ enum HeadlessRunner {
         sim.readTypes().contains { $0 != 0 }
     }
 
+    /// Decide-replay helper: walks divisionExecute's FULL precondition chain
+    /// for one would-claim cell — the multi-pair retry included (top-8
+    /// most-opposite pairs, each with the empty-arc swap) — and returns
+    /// "none (would execute)" when some pair passes, else the last failing
+    /// reason. Debug-only (the death checkpoint's decide replay).
+    private static func replayExecutePrecondition(sim: CellSim, cell: Int,
+                                                  linksBuf: UnsafeBufferPointer<UInt32>,
+                                                  countsBuf: UnsafeBufferPointer<UInt32>,
+                                                  foodBuf: UnsafeBufferPointer<Float>,
+                                                  dead: [UInt32]) -> String {
+        let maxV = CellSim.maxValence
+        let posBuf = UnsafeBufferPointer(start: sim.positionsPointer, count: sim.cellCount)
+        let n = Int(countsBuf[cell])
+        let base = cell * maxV
+        var ringPos = [SIMD3<Float>](repeating: .zero, count: n)
+        var ringCell = [Int](repeating: 0, count: n)
+        var dirs = [SIMD3<Float>](repeating: .zero, count: n)
+        for k in 0..<n {
+            ringCell[k] = Int(linksBuf[base + k])
+            ringPos[k] = posBuf[ringCell[k]]
+            let d = ringPos[k] - posBuf[cell]
+            let l = simd_length(d)
+            if l < 1e-9 { return "zero-length link" }
+            dirs[k] = d / l
+        }
+        var acc = SIMD3<Float>.zero
+        var prev = ringPos[n - 1] - posBuf[cell]
+        for k in 0..<n {
+            let cur = ringPos[k] - posBuf[cell]
+            acc += simd_cross(prev, cur)
+            prev = cur
+        }
+        if simd_dot(acc, acc) < 1e-20 { return "degenerate ring normal" }
+        let N = simd_normalize(acc)
+        // All pairs, most-opposite first (the GPU keeps the best 8; the
+        // replay walks all — a superset, so "none" here implies "none" there).
+        var pairs: [(dot: Float, a: Int, b: Int)] = []
+        for a in 0..<n {
+            for b in (a + 1)..<n { pairs.append((simd_dot(dirs[a], dirs[b]), a, b)) }
+        }
+        pairs.sort { $0.dot != $1.dot ? $0.dot < $1.dot : ($0.a != $1.a ? $0.a < $1.a : $0.b < $1.b) }
+        var lastFail = "no pairs"
+        for pr in pairs {
+            let w0 = dirs[pr.a] - dirs[pr.b]
+            let wLen = simd_length(w0)
+            if wLen < 1e-5 { lastFail = "plane links parallel"; continue }
+            let m0 = simd_cross(N, w0 / wLen)
+            let m2 = simd_dot(m0, m0)
+            if m2 < 1e-12 { lastFail = "N parallel to axis"; continue }
+            let m = m0 / sqrt(m2)
+            var reason = ""
+            var res = classifyHost(ringPos, ringCell, n, pr.a, pr.b, posBuf[cell], m, &reason)
+            if !res.ok && reason == "empty daughter arc" {
+                // Empty between-arc: the reversed pair (m flips with w).
+                var reason2 = ""
+                res = classifyHost(ringPos, ringCell, n, pr.b, pr.a, posBuf[cell], -m, &reason2)
+                reason = reason2
+            }
+            if !res.ok { lastFail = reason; continue }
+            // Valence guards (the pre-scans are skipped in the replay — the
+            // classification + guards are the observed jam causes).
+            let p1 = ringCell[pr.a], p2 = ringCell[pr.b]
+            if res.aCount + 3 > maxV || res.bCount + 3 > maxV {
+                lastFail = "parent/daughter valence guard"; continue
+            }
+            if Int(countsBuf[p1]) + 1 > maxV || Int(countsBuf[p2]) + 1 > maxV {
+                lastFail = "plane-neighbour valence guard"; continue
+            }
+            return "none (would execute)"
+        }
+        return lastFail
+    }
+
+    /// Host twin of classifyCleavageArc (see Shaders.swift): returns
+    /// (ok, bCount, aCount); on !ok the reason string says why.
+    private static func classifyHost(_ ringPos: [SIMD3<Float>], _ ringCell: [Int], _ n: Int,
+                                     _ k1: Int, _ k2: Int, _ P: SIMD3<Float>, _ m: SIMD3<Float>,
+                                     _ reason: inout String) -> (ok: Bool, bCount: Int, aCount: Int) {
+        let k2rot = (k2 + n - k1) % n
+        var bCount = 0
+        for t in 1..<k2rot {
+            let r = (k1 + t) % n
+            if simd_dot(ringPos[r] - P, m) <= 0 {
+                reason = "arc not contiguous (B-side entry at rotated offset \(t), plane \(k1)/\(k2) of \(n))"
+                return (false, 0, 0)
+            }
+            bCount += 1
+        }
+        if bCount == 0 {
+            reason = "empty daughter arc"
+            return (false, 0, 0)
+        }
+        var aCount = 0
+        for t in (k2rot + 1)..<n {
+            let r = (k1 + t) % n
+            if simd_dot(ringPos[r] - P, m) > 0 {
+                reason = "arc not contiguous (A-side entry at rotated offset \(t), plane \(k1)/\(k2) of \(n))"
+                return (false, bCount, aCount)
+            }
+            aCount += 1
+        }
+        reason = ""
+        return (true, bCount, aCount)
+    }
+
+    /// V2.5 death-dynamics checkpoint (printed when death is enabled): the
+    /// deaths-per-window cascade (sparse at first, bursts where starvation
+    /// clusters — the shaded regions die together once their climb time
+    /// exceeds the window), the starving-counter distribution over LIVE
+    /// cells, and the current candidate count. Returns the cumulative death
+    /// count for the next window's delta.
+    @discardableResult
+    private static func printDeathCheckpoint(sim: CellSim, previousDeaths: Int?,
+                                             windowSteps: Int) -> Int {
+        let deaths = sim.deathCounter
+        var window = ""
+        if let prev = previousDeaths, windowSteps > 0 {
+            let d = deaths - prev
+            window = "  deaths/window \(d) (\(String(format: "%.2f", Double(d) / Double(windowSteps)))/step)"
+        }
+        let starving = sim.readStarving()
+        let dead = sim.readDeadFlags()
+        let steps = max(Int(sim.params.deathSteps), 1)
+        var sum = 0; var mx = 0; var half = 0; var cand = 0; var liveN = 0
+        for i in 0..<sim.cellCount where dead[i] == 0 {
+            liveN += 1
+            let s = Int(starving[i])
+            sum += s; mx = max(mx, s)
+            if s >= steps / 2 { half += 1 }
+            if s >= steps { cand += 1 }
+        }
+        let mean = liveN > 0 ? Float(sum) / Float(liveN) : 0
+        // Live food ledger stats: the division fuel. A frozen form with
+        // nobody starving and no divisions shows up here (e.g. everything
+        // pinned AT the threshold — a decide-side stall).
+        let foodBuf = UnsafeBufferPointer(start: sim.foodPointer, count: sim.cellCount)
+        var fSum: Float = 0, fMin: Float = .infinity, fMax: Float = -.infinity, above = 0
+        for i in 0..<sim.cellCount where dead[i] == 0 {
+            let f = foodBuf[i]
+            fSum += f; fMin = min(fMin, f); fMax = max(fMax, f)
+            if f > sim.params.splitThreshold { above += 1 }
+        }
+        print("      death: total \(deaths)  live \(sim.liveCount)/\(sim.cellCount)  divisions=\(sim.divisionCounter)\(window)")
+        print("      food(live): mean \(String(format: "%.3f", fSum / Float(max(liveN, 1)))) min \(String(format: "%.3f", fMin)) max \(String(format: "%.3f", fMax))  above splitThreshold \(above)")
+        // Decide-side state: live valence histogram + how many claims the
+        // division decide currently holds (a frozen form with everyone above
+        // the threshold and zero claims = a decide-side stall).
+        let countsBuf = UnsafeBufferPointer(start: sim.linkCountsPointer, count: sim.cellCount)
+        var hist = [Int](repeating: 0, count: Int(CellSim.maxValence) + 1)
+        var vMax = 0
+        for i in 0..<sim.cellCount where dead[i] == 0 {
+            let k = Int(countsBuf[i])
+            if k <= Int(CellSim.maxValence) { hist[k] += 1 }
+            vMax = max(vMax, k)
+        }
+        let splitSum = UnsafeBufferPointer(start: sim.splitFlagsPointer, count: sim.cellCount)
+            .reduce(0) { $0 + Int($1) }
+        let histLine = (3...min(16, CellSim.maxValence)).map { "v\($0)=\(hist[$0])" }.joined(separator: " ")
+        print("      valence(live): max=\(vMax) \(histLine)  splitFlags set: \(splitSum)  divEnabled=\(sim.params.divisionEnabled) diffPhase=\(sim.params.differentiationPhase)")
+        // Decide replay on the CPU for the 3 lowest-indexed live cells: why
+        // does the global index minimum not claim? Walks the SAME predicate
+        // (food > threshold, lower index, distance <= 2) and reports the
+        // blocking cell + its dead/alive state.
+        let linksBuf = UnsafeBufferPointer(start: sim.linksPointer, count: sim.cellCount * CellSim.maxValence)
+        let thr = sim.params.splitThreshold
+        // Decide replay (one summary line): walks the division decide's
+        // predicate + the execute preconditions for the lowest-indexed live
+        // cells. In a healthy state everything is below threshold or blocked;
+        // an anomaly (a would-claim cell whose execute preconditions fail on
+        // ALL candidate pairs) prints its reason — that is the jam signature.
+        var replayNote = "all below threshold"
+        var liveSeen = 0
+        for i in 0..<sim.cellCount {
+            guard dead[i] == 0 else { continue }
+            liveSeen += 1
+            if liveSeen > 3 { break }
+            let n = Int(countsBuf[i])
+            guard foodBuf[i] > thr else { continue }
+            var blocker: (idx: Int, dead: Bool, dist: Int)? = nil
+            let base = i * CellSim.maxValence
+            scan: for k in 0..<n {
+                let j = Int(linksBuf[base + k])
+                if foodBuf[j] > thr && j < i { blocker = (j, dead[j] != 0, 1); break scan }
+                let jn = Int(countsBuf[j])
+                let jbase = j * CellSim.maxValence
+                for k2 in 0..<jn {
+                    let l = Int(linksBuf[jbase + k2])
+                    if l != i && foodBuf[l] > thr && l < i { blocker = (l, dead[l] != 0, 2); break scan }
+                }
+            }
+            if let b = blocker {
+                replayNote = "cell \(i) blocked by \(b.idx) (dead=\(b.dead), dist \(b.dist))"
+            } else {
+                let why = replayExecutePrecondition(sim: sim, cell: i, linksBuf: linksBuf,
+                                                    countsBuf: countsBuf, foodBuf: foodBuf, dead: dead)
+                replayNote = why == "none (would execute)"
+                    ? "cell \(i) would claim+execute (healthy)"
+                    : "JAM: cell \(i) would claim, execute stuck: \(why)"
+            }
+            break   // the lowest-indexed above-threshold cell tells the story
+        }
+        print("      decide-replay: \(replayNote)")
+        print("      starving: mean \(String(format: "%.1f", mean)) max \(mx)  >=50% of window \(half) (\(String(format: "%.1f%%", 100 * Float(half) / Float(max(liveN, 1)))))  candidates(>=\(steps)) \(cand)")
+        return deaths
+    }
+
     private static func runHeadless(queue: MTLCommandQueue, sim: CellSim, o: Options) -> Never {
         // M6: --state-load works in the headless path too — render/screenshot
         // a stored state instead of growing (matches the --render workflow).
@@ -1234,6 +1493,11 @@ enum HeadlessRunner {
                 let snap = try sim.loadState(from: loadPath)
                 let modes = ["uniform", "light", "rde"]
                 print("state loaded: \(loadPath) (CGST v\(snap.version), \(sim.cellCount) cells, mode \(modes[Int(min(snap.growthMode, 2))]))")
+                // V2.5: a death-era state restores its dead slots + starving
+                // counters + death counter; live = counter - deaths.
+                if sim.deathCount > 0 {
+                    print("   death state: \(sim.deathCount) dead slots, \(sim.liveCount) live, deathCounter \(sim.deathCounter)")
+                }
                 applyTintOverrideAfterLoad(sim: sim, o: o)
                 applyRadiusScaleAfterLoad(sim: sim, o: o)
                 // V2.3: --type-poles re-bands a LOADED state (the GUI re-type
@@ -1306,6 +1570,11 @@ enum HeadlessRunner {
                 let snap = try sim.loadState(from: loadPath)
                 let modes = ["uniform", "light", "rde"]
                 print("state loaded: \(loadPath) (CGST v\(snap.version), \(sim.cellCount) cells, mode \(modes[Int(min(snap.growthMode, 2))]))")
+                // V2.5: a death-era state restores its dead slots + starving
+                // counters + death counter; live = counter - deaths.
+                if sim.deathCount > 0 {
+                    print("   death state: \(sim.deathCount) dead slots, \(sim.liveCount) live, deathCounter \(sim.deathCounter)")
+                }
                 applyTintOverrideAfterLoad(sim: sim, o: o)
                 applyRadiusScaleAfterLoad(sim: sim, o: o)
                 applyTypingIfRequested(sim: sim, o: o)   // V2.3: re-band on request
@@ -1680,6 +1949,11 @@ enum HeadlessRunner {
         print("repulsion: roi \(sim.params.roi), strength \(sim.params.repulsionStrength) (\(sim.params.repulsionStrength > 0 ? "grid rebuilt every step" : "off"))")
         let modeNames = ["uniform", "light", "rde"]
         print("growth mode: \(modeNames[Int(min(sim.params.growthMode, 2))]) (food \(sim.params.foodIncrement), threshold \(sim.params.splitThreshold))")
+        // V2.5: the death block's cost arm is a --bench run with --death and a
+        // huge --death-steps (the counter + decide passes run every step, no
+        // deaths execute — the delta vs the death-off baseline is the block
+        // cost at matched counts).
+        print("death: \(sim.params.deathEnabled != 0 ? "on (threshold \(sim.params.deathThreshold), window \(sim.params.deathSteps))" : "off")")
         // V2.3: typing is applied per level (after each reset) when requested
         // — the typed sweep measures the decide-kernel rule matrix + the
         // foodStep rate classification against the untyped baseline.
@@ -1820,6 +2094,9 @@ enum HeadlessRunner {
         // comparison would stay valid even in light/rde mode — but the force
         // + repulsion semantics under test must be the M1-M4 path, unchanged.
         sim.params.growthMode = 0
+        // V2.5: force death off — the CPU reference models neither division
+        // nor death (both change topology; the comparison is index-labelled).
+        sim.params.deathEnabled = 0
         sim.syncParams()
 
         let (base, links) = Icosphere.generate(subdivisions: subdiv, spacing: sim.params.linkRestLength)
@@ -2274,6 +2551,11 @@ enum HeadlessRunner {
         sim.params.differentiationPhase = v24.differentiationPhase
         sim.params.typeCapV = v24.typeCapV
         sim.params.typeStemV = v24.typeStemV
+        // V2.5 death knobs: same leak-guard — goldens are DEATH-FREE (the
+        // death block changes topology, which no golden tolerates).
+        sim.params.deathEnabled = v24.deathEnabled
+        sim.params.deathThreshold = v24.deathThreshold
+        sim.params.deathSteps = v24.deathSteps
         guard let r = cfg.render else {
             sim.params.divisionEnabled = 0
             sim.params.springFactor = cfg.spring
@@ -2889,6 +3171,63 @@ enum HeadlessRunner {
         sim.params.differentiationPhase = 0
         sim.syncParams()
 
+        // --- Phase G: starvation death (V2.5) — V rises then falls ---------
+        // Light-mode growth + death (the prune dynamics, paper §8: cell death
+        // "with appropriate topological changes to the surface"): the lit
+        // side grows (V rises) while the shaded side starves — its food
+        // ledger climbs too slowly to re-cross deathThreshold within the
+        // window — and dies off (V falls). The death splice is the inverse of
+        // division and Euler-exact: sum valence = 6(V-2) with V = LIVE cells
+        // must hold EXACTLY at every checkpoint (the invariants), and the
+        // mesh must stay ONE connected component (the flood-fill invariant —
+        // a death splice must never disconnect). Gates beyond the invariants:
+        //   1. V strictly rises then strictly falls across the checkpoints
+        //      (the pruning overtakes the growth);
+        //   2. deaths actually happened (deathCounter > 0).
+        sim.params.growthMode = 1
+        sim.params.deathEnabled = 1
+        sim.params.deathThreshold = sim.params.splitThreshold
+        sim.params.deathSteps = 250
+        sim.syncParams()
+        (base, links) = Icosphere.generate(subdivisions: max(o.subdiv, 4), spacing: sim.params.linkRestLength)
+        let gSteps = min(steps, 4000)
+        print("selftest phase G (starvation death): light growth + death, \(base.count) cells, threshold \(sim.params.deathThreshold), window \(sim.params.deathSteps) steps, \(gSteps) steps")
+        sim.reset(positions: base, links: links)
+        var gPrev: Int? = nil          // previous checkpoint's LIVE count
+        var roseG = false, fellG = false
+        var gDeaths = 0
+        func deathCheckpoint(_ step: Int) {
+            checkpoint(step)   // the full invariant set (dead-aware + connectivity)
+            let live = sim.liveCount
+            if let p = gPrev {
+                if live > p { roseG = true }
+                if live < p { fellG = true }
+            }
+            gPrev = live
+            gDeaths = sim.deathCounter
+            let starve = sim.readStarving()
+            let dead = sim.readDeadFlags()
+            var mx = 0
+            for i in 0..<sim.cellCount where dead[i] == 0 { mx = max(mx, Int(starve[i])) }
+            print("   t=\(step) live=\(live) deadSlots=\(sim.deathCount) deaths=\(gDeaths) starving max \(mx)/\(sim.params.deathSteps)")
+        }
+        deathCheckpoint(0)
+        var doneG2 = 0
+        while doneG2 < gSteps {
+            let batch = min(100, gSteps - doneG2)
+            runSteps(queue: queue, sim: sim, count: batch)
+            doneG2 += batch
+            if doneG2 % 500 == 0 || doneG2 == gSteps { deathCheckpoint(doneG2) }
+        }
+        let vRiseFallOK = roseG && fellG
+        let deathsOK = gDeaths > 0
+        print("   death dynamics: V rose \(roseG) then fell \(fellG) (gate: both) \(vRiseFallOK ? "PASS" : "FAIL"), deaths \(gDeaths) (gate > 0) \(deathsOK ? "PASS" : "FAIL")")
+        if !vRiseFallOK || !deathsOK { allPass = false }
+        // Restore the death-off defaults (the shared sim object).
+        sim.params.deathEnabled = 0
+        sim.params.deathSteps = 100
+        sim.syncParams()
+
         print(allPass ? "SELFTEST PASS" : "SELFTEST FAIL")
         exit(allPass ? 0 : 1)
     }
@@ -2931,6 +3270,12 @@ enum HeadlessRunner {
     /// Returns per-invariant PASS/FAIL lines. `settled` selects the strict
     /// two-sided settle gate (control phase); otherwise `meanLimit` bounds the
     /// mean link length from above (growing phase; see runSelftest docs).
+    /// V2.5: dead-aware — every invariant is computed over the LIVE cells
+    /// (dead slots stay allocated with stale data; their linkCounts were
+    /// zeroed at death), so Euler's sum valence = 6(V−2) uses V = liveCount,
+    /// and a NEW invariant was added: the mesh must be ONE connected
+    /// component (CPU flood-fill over the live links — a death splice must
+    /// never disconnect the surface).
     private static func checkInvariants(sim: CellSim, settled: Bool, meanLimit: Float) -> (pass: Bool, lines: [String]) {
         let v = sim.cellCount
         guard v > 2 else { return (false, ["FAIL: no cells"]) }
@@ -2939,7 +3284,10 @@ enum HeadlessRunner {
         let links = UnsafeBufferPointer(start: sim.linksPointer, count: v * maxValence)
         let pos = UnsafeBufferPointer(start: sim.positionsPointer, count: v)
         let food = UnsafeBufferPointer(start: sim.foodPointer, count: v)
+        let dead = UnsafeBufferPointer(start: sim.deadFlagsPointer, count: v)   // V2.5
 
+        var liveN = 0
+        var deadWithLinks = 0       // dead slots that kept links (must be 0)
         var sumValence = 0
         var minValence = Int.max
         var maxVal = 0
@@ -2949,11 +3297,17 @@ enum HeadlessRunner {
         var lenSum: Float = 0
         var lenCount: Float = 0
 
-        // Pass 1: ring bounds + duplicate entries, valence range, finite
-        // positions/food, link lengths, max |P|.
+        // Pass 1 (LIVE cells only): ring bounds + duplicate entries, valence
+        // range, finite positions/food, link lengths, max |P|. Dead slots:
+        // their linkCounts must be 0 (deathExecute zeroes them).
         var seen = [UInt32](repeating: UInt32.max, count: v)
         var ringsOK = true
         for i in 0..<v {
+            if dead[i] != 0 {
+                if counts[i] != 0 { deadWithLinks += 1 }
+                continue
+            }
+            liveN += 1
             let n = Int(counts[i])
             if n < 3 || n > maxValence { ringsOK = false }
             if n < minValence { minValence = n }
@@ -2967,6 +3321,7 @@ enum HeadlessRunner {
                     ringsOK = false
                     continue
                 }
+                if dead[j] != 0 { ringsOK = false }   // live ring -> dead slot
                 if seen[j] == gen { ringsOK = false }   // duplicate ring entry
                 seen[j] = gen
                 let d = simd_distance(pos[i], pos[j])
@@ -2984,25 +3339,34 @@ enum HeadlessRunner {
         // the chemical buffers untouched; still checked — harmless).
         var badChem = 0
         if sim.params.growthMode == 1 {
-            for x in UnsafeBufferPointer(start: sim.nutrientPointer, count: v) where !x.isFinite { badChem += 1 }
+            for i in 0..<v where dead[i] == 0
+                && !sim.nutrientPointer[i].isFinite { badChem += 1 }
         }
         if sim.params.growthMode == 2 {
-            for x in UnsafeBufferPointer(start: sim.chemUPointer, count: v) where !x.isFinite { badChem += 1 }
-            for x in UnsafeBufferPointer(start: sim.chemVPointer, count: v) where !x.isFinite { badChem += 1 }
+            for i in 0..<v where dead[i] == 0
+                && !sim.chemUPointer[i].isFinite { badChem += 1 }
+            for i in 0..<v where dead[i] == 0
+                && !sim.chemVPointer[i].isFinite { badChem += 1 }
         }
         // V2.2: the pulse buffer is maintained every step (decay pass); a NaN
         // there would leak into the tint (pulse mode blends by it).
-        for x in UnsafeBufferPointer(start: sim.pulsePointer, count: v) where !x.isFinite { badChem += 1 }
-        // V2.3: every cell's type must be a valid type code (0-4); the
-        // per-type counts then partition V by construction (Σ counts = V).
+        for i in 0..<v where dead[i] == 0 && !sim.pulsePointer[i].isFinite { badChem += 1 }
+        // V2.3: every LIVE cell's type must be a valid type code (0-4); the
+        // per-type counts then partition the LIVE population by construction.
+        // (Dead slots keep stale types — excluded, they are past the rule
+        // matrix and the render.)
         var badType = 0
-        for t in UnsafeBufferPointer(start: sim.cellTypePointer, count: v) where t > 4 { badType += 1 }
+        for i in 0..<v where dead[i] == 0 && sim.cellTypePointer[i] > 4 { badType += 1 }
 
-        // Pass 2: bidirectionality — every directed link (i -> j) must have
-        // its reverse (j -> i). O(links * max valence) with early exit.
+        // Pass 2 (LIVE cells): bidirectionality — every directed link (i -> j)
+        // must have its reverse (j -> i). O(links * max valence) with early
+        // exit. This also catches a live ring entry pointing at a dead slot
+        // (a dead slot's ring was zeroed, so the reverse cannot exist).
         var bidirOK = ringsOK
+        var badLinks: [String] = []
         if bidirOK {
             for i in 0..<v {
+                if dead[i] != 0 { continue }
                 let n = Int(counts[i])
                 let base = i * maxValence
                 for k in 0..<n {
@@ -3013,20 +3377,31 @@ enum HeadlessRunner {
                     for k2 in 0..<jn {
                         if links[jbase + k2] == UInt32(i) { found = true; break }
                     }
-                    if !found { bidirOK = false; break }
+                    if !found {
+                        bidirOK = false
+                        if badLinks.count < 4 {
+                            // Diagnostic: the asymmetric pair + both rings
+                            // (topology-bisect aid; see the V2.5 report).
+                            let ri = (0..<n).map { Int(links[base + $0]) }
+                            let rj = (0..<jn).map { Int(links[jbase + $0]) }
+                            badLinks.append("i=\(i)->j=\(j) missing reverse | ring(i)=\(ri) ring(j)=\(rj)")
+                        }
+                        break
+                    }
                 }
                 if !bidirOK { break }
             }
         }
 
-        // Closed triangulated sphere: sum valence == 6 * (V - 2)
-        // (Euler: V - E + F = 2 with E = sum val / 2, F = sum val / 3; the
-        // equality forces every face to be a triangle).
-        let eulerTarget = 6 * (v - 2)
+        // Closed triangulated sphere: sum valence == 6 * (V - 2) — V = LIVE
+        // cells (V2.5: a death splice is Euler-exact — dV −1, dE −3, dF −2 —
+        // so the identity holds EXACTLY across deaths; dead slots are out).
+        let eulerTarget = 6 * (liveN - 2)
         let eulerOK = sumValence == eulerTarget
         let valenceOK = minValence >= 3 && maxVal <= maxValence
         let finiteOK = nanCount == 0 && badFood == 0 && badChem == 0
         let typesOK = badType == 0
+        let deadOK = deadWithLinks == 0
         let meanLen = lenCount > 0 ? lenSum / lenCount : 0
         let rest = sim.params.linkRestLength
         let lenOK = settled
@@ -3034,24 +3409,57 @@ enum HeadlessRunner {
             : meanLen <= meanLimit * rest
         let boundOK = maxAbs.isFinite && maxAbs <= 10_000
 
+        // V2.5: connectivity — ONE component (CPU flood-fill over the live
+        // links, O(V + E)). Death closes the hole behind every removal, so
+        // the mesh must never disconnect; a failed splice or a stale ring
+        // shows up here immediately.
+        var connOK = true
+        var connDetail = "n/a"
+        if liveN > 0 {
+            var visited = [Bool](repeating: false, count: v)
+            var stack: [Int] = []
+            for i in 0..<v where dead[i] == 0 {
+                visited[i] = true
+                stack.append(i)
+                break
+            }
+            var reached = 0
+            while let i = stack.popLast() {
+                reached += 1
+                let base = i * maxValence
+                for k in 0..<Int(counts[i]) {
+                    let j = Int(links[base + k])
+                    if j >= 0 && j < v && !visited[j] && dead[j] == 0 {
+                        visited[j] = true
+                        stack.append(j)
+                    }
+                }
+            }
+            connOK = reached == liveN
+            connDetail = "reached \(reached)/\(liveN)"
+        }
+
         var lines: [String] = []
         func add(_ name: String, _ ok: Bool, _ detail: String) {
             lines.append("\(ok ? "PASS" : "FAIL"): \(name)  (\(detail))")
         }
-        add("links bidirectional", bidirOK, "every ring entry has its reverse")
-        add("closed triangulation (sum valence == 6(V-2))", eulerOK, "sum=\(sumValence) target=\(eulerTarget)")
+        add("links bidirectional", bidirOK, badLinks.isEmpty ? "every ring entry has its reverse" : badLinks.joined(separator: " || "))
+        add("closed triangulation (sum valence == 6(V-2), V = live)", eulerOK, "sum=\(sumValence) target=\(eulerTarget) live=\(liveN) dead=\(v - liveN)")
         add("valence in [3, maxValence]", valenceOK, "min=\(minValence == Int.max ? 0 : minValence) max=\(maxVal)")
         add("no NaN/Inf (positions, food, chemicals, pulse)", finiteOK, "bad positions=\(nanCount) food=\(badFood) chem=\(badChem)")
-        add("cell types valid (0-4, Σ per-type = V)", typesOK, "bad type codes=\(badType)")
+        add("cell types valid (0-4, Σ per-type = live V)", typesOK, "bad type codes=\(badType)")
+        add("dead slots clean (linkCounts 0, no live ring references)", deadOK, "dead slots with links=\(deadWithLinks)")
+        add("one connected component (flood-fill)", connOK, connDetail)
         add(settled ? "mean link length ~ rest (settle)" : "mean link length bounded (growing)",
             lenOK, "mean=\(String(format: "%.4f", meanLen)) rest=\(rest) \(settled ? "(tolerance 2%)" : "(limit \(meanLimit)x)")")
         add("max |P| bounded", boundOK, "max=\(String(format: "%.2f", maxAbs)) limit=10000")
 
-        // Structure diagnostics: link length distribution + valence histogram.
+        // Structure diagnostics: link length distribution + valence histogram
+        // (LIVE cells only).
         var lens = [Float]()
         lens.reserveCapacity(Int(lenCount))
         var valenceHist = [Int](repeating: 0, count: maxValence + 1)
-        for i in 0..<v {
+        for i in 0..<v where dead[i] == 0 {
             valenceHist[Int(counts[i])] += 1
             let base = i * maxValence
             for k in 0..<Int(counts[i]) {
@@ -3067,7 +3475,7 @@ enum HeadlessRunner {
         let hist = (3...min(9, maxValence)).map { "v\($0)=\(valenceHist[$0])" }.joined(separator: " ")
         lines.append("diag: len p10=\(String(format: "%.2f", pct(0.10))) p50=\(String(format: "%.2f", pct(0.50))) p90=\(String(format: "%.2f", pct(0.90))) p99=\(String(format: "%.2f", pct(0.99))) max=\(String(format: "%.2f", pct(1.0)))  valences: \(hist)")
 
-        let pass = bidirOK && eulerOK && valenceOK && finiteOK && typesOK && lenOK && boundOK
+        let pass = bidirOK && eulerOK && valenceOK && finiteOK && typesOK && deadOK && connOK && lenOK && boundOK
         return (pass, lines)
     }
 

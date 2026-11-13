@@ -117,10 +117,11 @@ final class SimViewModel: ObservableObject, ViewInput {
         case pulse = 4      // magenta division-pulse flashes over the base tint
         case type = 5       // V2.3 type colours (stem/lamel/dal/cap)
         case typePulse = 6  // V2.3 type colours + the mitosis-pulse overlay
+        case starve = 7     // V2.5 the starvation-death front (red = starving)
         var id: Int { rawValue }
         var label: String {
             ["Default", "None", "Chemical", "Food heat", "Mitosis pulse",
-             "Type", "Type + pulse"][rawValue]
+             "Type", "Type + pulse", "Starving"][rawValue]
         }
     }
     @Published var tintMode: TintMode = .auto {
