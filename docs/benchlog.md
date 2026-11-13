@@ -698,3 +698,53 @@ preallocated at maxCells):
 - Dead-slot compaction (reindex + swap-removal with ring rewrite) — the
   documented fragmentation trade-off, still open.
 - GUI death sliders (death parameters are CLI/preset-side for now).
+
+## V2.6 camera choreography + video export — 2026-11-13 — Apple M1 Pro
+
+Sim step UNCHANGED by construction: V2.6 touches no step-routine code, no
+shader, no SimParams field, no buffer — the camera choreography is pure
+host-side viewer state (target/yaw + a two-pass live-centroid read per
+frame). One confirmation sweep (same prescribed config as the V2.5 tables:
+50 steps/level, jitter 0, division off, repulsion on) — the floor matches
+the V2.5 baseline within session noise (655k: 12.77 vs 12.83 ms/step; only
+deltas are meaningful, absolute floors drift with system load):
+
+| cells | ms/step cpu | ms/step gpu | steps/s |
+|---|---|---|---|
+| 2 562 | 0.327 | 0.287 | 3060 |
+| 10 242 | 0.343 | 0.305 | 2920 |
+| 40 962 | 0.959 | 0.921 | 1043 |
+| 163 842 | 3.218 | 3.170 | 311 |
+| 655 362 | 12.765 | 12.717 | 78 |
+
+grid memory rows (T_max = 2^22 preallocated; live T per level; identical to
+V2.5 — no new buffers):
+
+```
+   grid T=8192: binCounts 32768B + binStarts 32772B + particleIndices 10248B + collisionOffsets 40992B = 116780B
+   grid T=32768: binCounts 131072B + binStarts 131076B + particleIndices 40968B + collisionOffsets 163872B = 466988B
+   grid T=131072: binCounts 524288B + binStarts 524292B + particleIndices 163848B + collisionOffsets 655392B = 1867820B
+   grid T=524288: binCounts 2097152B + binStarts 2097156B + particleIndices 655368B + collisionOffsets 2621472B = 7471148B
+   grid T=2097152: binCounts 8388608B + binStarts 8388612B + particleIndices 2621448B + collisionOffsets 10485792B = 29884460B
+```
+
+Video-export costs (reference config: `--anim` 8 frames × 150 steps, subdiv
+3, jitter 0.25, solid, 1600×1200, H.264 .mp4 @30 fps; the state GROWS
+642 → 185 797 cells across the frames, so the per-frame cost covers that
+range):
+
+- render (offline ray tracer, solid): 2.95 s GPU total ≈ **0.37 s/frame**
+  (frames 0.04–0.71 s, tracking the cell count)
+- movie encode (AVFoundation, BGRA→yuv420p): **0.30 s / 8 frames ≈ 38 ms/frame**
+- camera choreography (live-centroid + framing + orbit, host): **0.11 ms/frame**
+  at up to ~186k cells (two O(live) pointer passes, no allocation) — ~0.4 ms
+  extrapolated at 655k; the GUI follows every rendered frame, ~1% of its
+  frame budget at 60 fps
+- small-config cross-check (800×600, ~9k cells): ~0.05 s/frame render,
+  0.17–0.38 s encode per 8-frame movie; follow vs legacy arms differ by
+  <0.1 ms/frame in choreography (the framing pass runs in both arms)
+
+GUI launch check: app runs (12 s alive, no crash) with the new Camera +
+Video export groups; the button itself was not click-tested (no screen
+recording permission in the agent context) — it calls the same
+`exportAnimation` core the CLI runs validated above.

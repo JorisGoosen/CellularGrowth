@@ -244,6 +244,30 @@ final class SimViewModel: ObservableObject, ViewInput {
     @Published var foamOpacity: Double = 0.5 {
         didSet { renderer.foamOpacity = Float(foamOpacity) }
     }
+    // --- V2.6 camera choreography (host-side viewer state) ---
+    // GUI defaults: follow-centroid ON, circle OFF. The HEADLESS paths keep
+    // the legacy fixed-target camera (the goldens cover those paths; the GUI
+    // is not golden-covered) — the asymmetry is documented, deliberate.
+    @Published var followCentroid = true {
+        didSet { renderer.followCentroid = followCentroid }
+    }
+    /// Follow-target exponential smoothing per rendered frame (0 = snap).
+    @Published var followSmoothing: Double = 0.15 {
+        didSet { renderer.followSmoothing = Float(followSmoothing) }
+    }
+    /// Circle mode: yaw advances `orbitRate` rad EVERY rendered frame
+    /// (deterministic per-frame rate — export frames are equally spaced in
+    /// steps; at the GUI's ~60 fps 0.005 ≈ one full turn per 21 s).
+    @Published var orbitEnabled = false {
+        didSet { renderer.orbiting = orbitEnabled }
+    }
+    @Published var orbitRate: Double = 0.005 {
+        didSet { renderer.orbitRate = Float(orbitRate) }
+    }
+    // --- V2.6 video export (shares HeadlessRunner.exportAnimation with the
+    // CLI --anim path — ONE deterministic offscreen implementation) ---
+    @Published var exportFrames: Double = 60
+    @Published var exportStepsPerFrame: Double = 100
     // --- M6 presets (Core/Presets.swift) ---
     @Published var presetName: String? {
         didSet {
@@ -297,6 +321,14 @@ final class SimViewModel: ObservableObject, ViewInput {
             }
         }
 
+        // V2.6: the GUI follows the growing form by default (the @Published
+        // defaults above; didSet does not fire at init, so the renderer is
+        // synced explicitly once here).
+        renderer.followCentroid = followCentroid
+        renderer.followSmoothing = Float(followSmoothing)
+        renderer.orbiting = orbitEnabled
+        renderer.orbitRate = Float(orbitRate)
+
         reset()
     }
 
@@ -321,6 +353,9 @@ final class SimViewModel: ObservableObject, ViewInput {
         let ballRadius = positions.map { simd_length($0) }.max() ?? 1
         renderer.camera.target = .zero
         renderer.camera.distance = ballRadius * 2.6
+        // V2.6: clear the follow smoothing — the next frame snaps to the
+        // fresh ball's centroid (which is ~the origin here anyway).
+        renderer.resetChoreography()
     }
 
     /// Azimuth/elevation (degrees) -> unit light direction. Elevation 90 = straight up.
@@ -486,6 +521,97 @@ final class SimViewModel: ObservableObject, ViewInput {
         let ballRadius = sim.readPositions().map { simd_length($0) }.max() ?? 1
         renderer.camera.target = .zero
         renderer.camera.distance = ballRadius * 2.6
+        // V2.6: clear the follow smoothing — the next frame snaps to the
+        // loaded structure's live centroid.
+        renderer.resetChoreography()
+    }
+
+    // MARK: - V2.6 video export (GUI)
+
+    /// GUI "Export video…": pick a directory, then run the SAME
+    /// deterministic offscreen export the CLI --anim uses
+    /// (HeadlessRunner.exportAnimation — factored, not duplicated), rendered
+    /// with the CURRENT panel style/tint knobs and the current camera
+    /// choreography (follow-centroid / circle apply to the export exactly as
+    /// on screen). The export continues growing from the LIVE state.
+    ///
+    /// Threading: the export owns the sim + command queue for its duration —
+    /// the display link is paused (no draws) and the sim paused (no steps),
+    /// because two threads racing the same buffers would corrupt the frame
+    /// sequence. Both are restored afterwards.
+    func exportVideoPanel() {
+        let panel = NSOpenPanel()
+        panel.title = "Export video (PNG frames + H.264 .mp4)"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.directoryURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        guard panel.runModal() == .OK, let dir = panel.url?.path else { return }
+
+        let frames = max(1, Int(exportFrames))
+        let steps = max(0, Int(exportStepsPerFrame))
+        let wasPlaying = playing
+        playing = false            // no sim steps from the display link
+        metalView.isPaused = true  // no draws at all while the export owns the sim
+        statusMessage = "Exporting video: \(frames) frames × \(steps) steps…"
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                var cfg = HeadlessRunner.VideoExportConfig(
+                    dir: dir, frames: frames, stepsPerFrame: steps,
+                    settings: self.offlineExportSettings())
+                cfg.followCentroid = self.renderer.followCentroid
+                cfg.followSmoothing = self.renderer.followSmoothing
+                cfg.orbitRate = self.renderer.orbiting ? self.renderer.orbitRate : 0
+                cfg.onFrame = { done, total in
+                    DispatchQueue.main.async {
+                        self.statusMessage = "Exporting frame \(done)/\(total)…"
+                    }
+                }
+                let result = try HeadlessRunner.exportAnimation(queue: self.queue,
+                                                                sim: self.sim, config: cfg)
+                DispatchQueue.main.async {
+                    self.metalView.isPaused = false
+                    self.playing = wasPlaying
+                    self.statusMessage = result.moviePath != nil
+                        ? "Video exported: \(result.moviePath!) (\(result.frames) frames)"
+                        : "Video export: \(result.frames) PNG frames written — MP4 assembly FAILED (see console)"
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.metalView.isPaused = false
+                    self.playing = wasPlaying
+                    self.statusMessage = "Video export FAILED: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    /// Map the current panel knobs onto the offline render settings. Style
+    /// maps 1:1 (Solid/X-ray/Foam); tint needs NO mapping — the ray tracer
+    /// reads the same cellTint buffer the impostors use. The X-ray EXPOSURE
+    /// keeps its offline tuned default: the GUI xrayGain is the interactive
+    /// impostor premultiplier (a different knob on a different scale).
+    /// Light follows the CLI --render-light auto convention (directional iff
+    /// light-growth mode). Resolution: the CLI anim default 1600×1200 —
+    /// deterministic and independent of the window size (documented choice).
+    private func offlineExportSettings() -> RayRenderSettings {
+        var s = RayRenderSettings()
+        switch renderStyle {
+        case .solid: s.style = .solid
+        case .xray: s.style = .xray
+        case .foam: s.style = .foam
+        }
+        s.width = 1600
+        s.height = 1200
+        s.foamOpacity = Float(foamOpacity)
+        if growthMode == .light {
+            s.directionalLight = SIMD3<Float>(sim.params.lightDirX,
+                                              sim.params.lightDirY,
+                                              sim.params.lightDirZ)
+        }
+        return s
     }
 
     // MARK: - ViewInput (orbit / zoom)

@@ -1778,6 +1778,39 @@ final class CellSim {
         return Array(UnsafeBufferPointer(start: p, count: cellCount))
     }
 
+    // MARK: - V2.6 camera choreography readback
+
+    /// Live-cell geometric centroid (uniform cell mass — the paper assigns
+    /// no per-cell masses; documented design choice) plus the max live-cell
+    /// distance from that centroid (the follow-camera's framing radius).
+    /// TWO O(live) pointer passes over the shared positions buffer, NO
+    /// allocation (a readPositions() copy at 655k cells would be a 10 MB
+    /// per-frame allocation — forbidden by the no-per-step-alloc rule).
+    /// Dead slots (V2.5) are skipped: dead cells are not scene content.
+    /// Contract: GPU idle, or called from an encoding thread while the
+    /// frame's command buffer is NOT yet committed (the previous frame
+    /// completed — the same contract as the GUI's foam-order sort and the
+    /// camera-params read).
+    func liveCentroidAndRadius() -> (centroid: SIMD3<Float>, radius: Float) {
+        let n = cellCount
+        guard n > 0 else { return (SIMD3<Float>.zero, 0) }
+        let pos = positionsPointer
+        let dead = deadFlagsPointer
+        var sum = SIMD3<Float>.zero
+        var live = 0
+        for i in 0..<n where dead[i] == 0 {
+            sum += pos[i]
+            live += 1
+        }
+        guard live > 0 else { return (SIMD3<Float>.zero, 0) }
+        let c = sum / Float(live)
+        var radius: Float = 0
+        for i in 0..<n where dead[i] == 0 {
+            radius = max(radius, simd_distance(pos[i], c))
+        }
+        return (c, radius)
+    }
+
     /// Collision field readback (--lockstep probe; only for small cell counts).
     func readCollisionOffsets() -> [SIMD3<Float>] {
         let p = collisionOffsetBuffer.contents().assumingMemoryBound(to: SIMD3<Float>.self)

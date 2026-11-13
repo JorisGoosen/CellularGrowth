@@ -4,6 +4,51 @@
 
 import simd
 
+/// V2.6 camera choreography: follow-centroid + circle mode. Purely host-side
+/// VIEWER state — the no-momentum rule (paper §4, AGENTS.md hard rule 5)
+/// governs the integrator, not the observer; the exponential smoothing here
+/// is a display-side filter on the camera TARGET, not a simulated mass, and
+/// no simulation buffer is touched.
+struct CameraChoreography {
+    /// The camera target tracks the LIVE cells' geometric centroid (uniform
+    /// cell mass — the paper assigns no per-cell masses; documented design
+    /// choice). Defaults match the HEADLESS contract (OFF = the legacy
+    /// fixed-target framing the goldens cover); the GUI switches it ON in
+    /// SimViewModel.init — the asymmetry is deliberate and documented.
+    var followCentroid = false
+    /// Per-frame exponential smoothing of the followed target:
+    /// smoothed += (centroid − smoothed) · α. α 0 = snap, 1 = frozen. The
+    /// state snaps to the centroid when (re)initialized (nil) — a follow
+    /// that starts centered, then smooths the growth drift.
+    var followSmoothing: Float = 0.15
+    /// Circle mode: yaw advances by `orbitRate` radians EVERY rendered frame
+    /// around the (possibly following) target. Per-FRAME — not per-second —
+    /// because export frames are equally spaced in STEPS (the M6 convention),
+    /// so a per-frame rate keeps exports deterministic; the GUI renders at
+    /// ~60 fps (0.005 rad/frame ≈ one full turn per 21 s).
+    var orbiting = false
+    var orbitRate: Float = 0.005
+    /// Smoothed target state (nil = not initialized — the next advance
+    /// snaps to the current centroid).
+    private(set) var smoothedTarget: SIMD3<Float>? = nil
+
+    /// One rendered frame of follow-centroid smoothing. The RAW centroid of
+    /// the live cells comes from CellSim.liveCentroidAndRadius() (host-side
+    /// CPU pass — no GPU pass added).
+    mutating func advance(centroid: SIMD3<Float>) {
+        let a = min(max(followSmoothing, 0), 1)
+        if let s = smoothedTarget {
+            smoothedTarget = s + (centroid - s) * a
+        } else {
+            smoothedTarget = centroid   // snap on (re)init
+        }
+    }
+
+    /// Clear the smoothing state (reset / state load / follow switched off):
+    /// the next advance snaps to the current centroid.
+    mutating func reset() { smoothedTarget = nil }
+}
+
 struct OrbitCamera {
     var target = SIMD3<Float>.zero
     var distance: Float = 20

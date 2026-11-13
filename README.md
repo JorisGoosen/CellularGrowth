@@ -8,7 +8,7 @@ including the `bulgeDist` typo analysis) lives in
 [`docs/reference/lomas_cellular_forms_extraction.md`](docs/reference/lomas_cellular_forms_extraction.md),
 with page screenshots in `docs/reference/pages/`.
 
-## Status — V2.5 complete: starvation death — cell pruning, the inverse of division
+## Status — V2.6 complete: camera choreography + video export
 
 **M1–M6 base** (details in git history / docs/benchlog.md): over-damped
 spring/planar/bulge forces (paper §4, Fig. 3); food + cell division with
@@ -189,6 +189,52 @@ RULE below is a documented design where the paper is silent):
   before/after screenshots inspected (coral-crown pruning from below),
   death-block bench +0.5 ms/step ≈ +3.7% at 655k cells (benchlog V2.5).
 
+V2.6 additions — **camera choreography + video export** (host-side viewer
+state only — no sim buffer, shader or SimParams change; all 14 goldens
+byte-PASS unchanged):
+- **Follow centroid** (`--follow-centroid` headless, GUI default ON with a
+  panel toggle + smoothing slider): the orbit camera's `target` tracks the
+  LIVE cells' geometric centroid (uniform cell mass — the paper assigns no
+  per-cell masses; dead slots skipped per V2.5), smoothed per rendered frame
+  with exponential smoothing `t += (centroid − t)·α` (`--follow-smooth F`,
+  default 0.15; snap on start/reset — a follow that starts centered).
+  Purely host-side: two O(live) pointer passes over the shared positions
+  buffer, no allocation, no GPU pass (measured 0.11 ms/frame at ~180k cells;
+  ~0.4 ms extrapolated at 655k). Drag-orbit keeps rotating yaw/pitch around
+  the CO-MOVING target by construction (eye = target + distance·dir).
+  The camera distance follows only in the export (framed on the centroid,
+  max live distance × 2.6); in the GUI the user keeps zoom control.
+- **Circle mode** (`--orbit-rate F` headless, GUI toggle + speed slider):
+  yaw advances F radians EVERY rendered frame around the (possibly
+  following) target. Per-FRAME, not per-second: export frames are equally
+  spaced in STEPS (the M6 convention), so a per-frame rate keeps exports
+  deterministic; at the GUI's ~60 fps the 0.005 default ≈ one turn per 21 s.
+- **Documented asymmetry**: follow/orbit default OFF headless, default ON in
+  the GUI. The goldens and single-frame renders (`--screenshot`, `--render`)
+  keep the legacy fixed-target framing unconditionally (the choreography
+  applies only to the video paths: `--anim` and the GUI export); the GUI is
+  not golden-covered.
+- **Video export = MP4**: the M6 H.264 `.mov` container is REPLACED by
+  `.mp4` (`AVAssetWriter` fileType `.mp4`; codec H.264, 30 fps, BGRA→yuv420p
+  unchanged) — universal playback, one code path. The M6 animation routine
+  was FACTORED into `HeadlessRunner.exportAnimation(config:)`: the CLI
+  `--anim` and the GUI "Export video…" button share ONE deterministic
+  offscreen implementation (never duplicated). The GUI button grows on from
+  the LIVE state with the panel's style/tint knobs (style maps 1:1;
+  tint needs no mapping — both renderers read the same cellTint buffer; the
+  GUI X-ray gain stays an impostor-only knob — the offline exposure keeps
+  its tuned default) and the current follow/orbit settings; the display link
+  is paused for the duration (the export owns the sim + queue). Export
+  resolution is the CLI default 1600×1200 (deterministic, window-independent).
+- **Validation**: `swift build` (debug+release), `--selftest` 7 phases PASS,
+  `--lockstep` PASS, 14/14 goldens byte-PASS, follow+orbit `--anim` exports
+  visually inspected (form stays centered while growing 642→9 161 cells and
+  the azimuth visibly rotates; light-grown form drifting toward the light is
+  centered with follow ON vs. off-frame-top with follow OFF), sim-step bench
+  unchanged by construction (no step-routine/shader/buffer edit; 655k
+  forces-only 12.77 vs 12.83 ms/step V2.5 baseline — same floor), export
+  costs measured (benchlog V2.6).
+
 V2.1b additions — **foam rendering** (`--style foam`, `--style foam-xray`):
 - Each cell renders as its **power-diagram chamber**:
   `sphere(c_i, r_i) ∩ ⋂_{j∈ring(i)} {x : |x−c_i|²−r_i² ≤ |x−c_j|²−r_j²}` —
@@ -368,7 +414,13 @@ growth rates, defaults 1.0 / 0.5 / 10). V2.5: `--death` (starvation death
 on), `--death-threshold F` (default = splitThreshold), `--death-steps N`
 (consecutive starving steps before death, default 250; 0 = never),
 `--tint starve` (the red death front — blend weight = starving counter
-progress toward the window). Diagnostic:
+progress toward the window). V2.6: `--follow-centroid` (anim camera follows
+the live-cell centroid; GUI default ON, headless default OFF),
+`--follow-smooth F` (per-frame exponential smoothing, default 0.15, 0 =
+snap), `--orbit-rate F` (circle mode: yaw +F rad per rendered frame; both
+apply ONLY to `--anim`/GUI exports — `--screenshot`/`--render` keep the
+legacy framing), and the `--anim` movie container is now `.mp4` (H.264;
+the M6 `.mov` was replaced). Diagnostic:
 `--div-stop N` (disable division after step N); env `CG_NO_COARSE_SKIP=1`
 disables the light-march occupancy skip (A/B kill switch); env
 `CG_SHADOW_SAMPLES=N` overrides the 4 default shadow rays per pixel (bench
@@ -393,7 +445,13 @@ plant / coral / degenerate-demo / paddenstoel / prune-demo), Solid/X-ray/Foam
 render-style switch (+ X-ray gain, foam opacity + the foam radius-scale
 hint), tint picker
 (Default/None/Chemical/Food heat/Mitosis pulse/Type/Type + pulse/Starving),
-Save State…/Load State…, growth mode + light/RDE parameter groups, the V2.3
+the V2.6 Camera group (Follow centroid toggle — ON by default, smoothing
+slider, Circle toggle + orbit-speed slider) and the Video export group
+(frames + steps/frame sliders, "Export video…" writes PNG frames + an
+H.264 .mp4 via the same deterministic offscreen path as `--anim`, growing
+on from the live state with the panel's style/tint and the current camera
+choreography), Save State…/Load State…, growth mode + light/RDE parameter
+groups, the V2.3
 Type layout group (polar typing toggle + axis/threshold sliders — dragging a
 knob re-types the LIVE cells, Re-type button, phase switch X, lamel/dal
 rates), repulsion, forces, run controls. Jitter and subdivision apply on
@@ -416,3 +474,4 @@ pass `--death`; the GUI exposes the Starving tint but no death sliders yet.)
 | V2.3 ✅ | cell types + two-phase growth: `cellType` buffer (0 none = all existing behaviour, 1 stem, 2 lamel, 3 dal, 4 cap), phase-0 polar typing (`--type-poles/--type-t1/--type-t2`, one cyclic azimuthal walk for the lamel/dal band), type-dependent division rule matrix with a device-side phase switch (`--phase-x`): phase 1 stem edge-only + cap uniform + band dormant, phase 2 band-only (lamel/dal/interior rates); daughters inherit type; CGST v3 persists types + division counter; type colours (`--tint type|type-pulse`); preset `paddenstoel` (mushroom) | `--selftest` 5 phases (new phase E: typed run, Σ per-type = V, phase-1 freezes voeg / phase-2 freezes stem+cap, transition exactly once), `--lockstep`, 14/14 goldens byte-PASS, typed state round-trip (types + phase clock persisted), phase-2 pulse-in-the-band validation (per-type pulse means: lamel/dal > 0, stem/cap 0.000), decide/foodStep type-check bench ~nil at matched counts (benchlog V2.3), blocker-predicate fix documented (eligible-set independent set) |
 | V2.4 ✅ | the differentiation phase: division frozen (`--differentiate-at N [--differentiate-until M]`, GUI "Differentiate now"), RDE keeps stepping, new `typeTransition` kernel (division-block slot, race-free) types undifferentiated cells from the chemical field (`--type-cap-v` 0.30 → cap, `--type-stem-v` 0.10 → stem, dead band stays 0); hysteresis = type memory (typed cells ignore the RDE: rdeStep freezes their u/v — no reaction participation, patterns cannot flicker, a cell's type changes at most once); rule-matrix MODE `--type-mode band\|region` (region: every type divides uniformly in its region — patterned growth via the frozen-v food coupling; band: the V2.3 matrix; type-0 contract both modes); differentiationPhase persists in CGST v3 raw params (mid-phase states resume in the phase); GUI button + threshold sliders | `--selftest` 6 phases (new phase F: static RDE settle → differentiation with division enabled-but-frozen (cells/divisions constant) → 0/V → mixed partition, flip stream settles ≈ 0 (gate ≤ 0.5% V/window), type memory (only 0→1/0→4 ever), regional growth resumes: cap per-capita ×94.9 vs stem ×6.14) PASS, `--diff-probe` PASS (pattern R² 0.68, stem 32.5%/cap 27.6%, flips 1439-burst → 0–4/window tail, type map PNG), `--lockstep` PASS, 14/14 goldens byte-PASS (typing off by default), mid-diff state round-trip resumes DIFFERENTIATING, differentiation-pass bench ~2–3% at 655k cells / regional-vs-uniform growth bench count-confounded as designed (benchlog V2.4) |
 | V2.5 ✅ | starvation death — the inverse of division (paper §8): a cell below `--death-threshold` for `--death-steps` consecutive steps dies (food-LEDGER signal; the window is a growth-rate detector — the pruning front sits at the shade iso-line); Euler-exact ring splice (dV−1, dE−3, dF−2) via balanced ear-clipping under valence caps + chord checks (the fan design deadlocked on valence-hoarding pivots — documented); claims = the division independent-set rule (order-irrelevant, verified byte-identical); dead slots stay allocated (`liveCount = cellCount − deathCount`), every consumer skips them; CGST v3 persists the death state; `--tint starve` death front; preset `prune-demo` (coral-crown self-pruning); HOT/SPLICE split (guards+queue vs narrow-width splice) after the bench bimodality investigation | `--selftest` 7 phases (new phase G: grown run with death — V rises then falls, 168k deaths, invariants on the LIVE surface) PASS, `--lockstep` PASS, 14/14 goldens PASS, CGST v3 death round-trip byte-identical, seeded two-run state compares byte-identical, prune-demo before/after screenshots inspected, death-block bench +0.5 ms/step ≈ +3.7% at 655k cells, headless jitter seeding bug fixed (benchlog V2.5) |
+| V2.6 ✅ | camera choreography + video export: follow-centroid (orbit-camera target tracks the LIVE cells' smoothed geometric centroid — uniform cell mass, dead slots skipped; host-side two-pass read, no GPU pass, no buffers touched; GUI default ON with toggle + smoothing slider, headless `--follow-centroid`/`--follow-smooth` opt-in), circle mode (`--orbit-rate F` rad per rendered frame around the moving target; GUI toggle + speed slider), drag-orbit rotates around the moving target by construction; video export as MP4 (M6 `.mov` REPLACED by `.mp4`, H.264/30 fps unchanged; M6 anim routine factored into `HeadlessRunner.exportAnimation` shared by CLI `--anim` and the GUI "Export video…" button — live state, panel style/tint, current choreography, display link paused during export) | `swift build` (debug+release), `--selftest` 7 phases PASS, `--lockstep` PASS, 14/14 goldens byte-PASS (headless camera legacy by default; choreography only on the video paths), follow+orbit anim exports visually inspected (form centered while growing 642→9 161 cells + azimuth rotates; light-grown drift centered with follow ON vs off-frame legacy), sim-step bench unchanged (12.77 vs 12.83 ms/step at 655k — no step-routine edit), export costs: ~0.37 s/frame GPU at 1600×1200 (~186k cells), ~38 ms/frame encode, choreography 0.11 ms/frame (benchlog V2.6) |

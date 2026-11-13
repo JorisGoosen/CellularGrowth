@@ -60,6 +60,41 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     var camera = OrbitCamera()
 
+    // --- V2.6 camera choreography (host-side viewer state; see
+    // CameraChoreography in OrbitCamera.swift). Struct defaults match the
+    // HEADLESS contract (both OFF = the legacy fixed-target camera the
+    // goldens cover); the GUI switches follow ON in SimViewModel.init. The
+    // offscreen raster path (renderToBytes) calls encodeScene directly and
+    // never runs updateChoreography, so headless screenshots stay legacy
+    // byte-for-byte even if a future caller forgets the defaults.
+    var choreography = CameraChoreography()
+
+    var followCentroid: Bool {
+        get { choreography.followCentroid }
+        set {
+            choreography.followCentroid = newValue
+            if !newValue { choreography.reset() }   // re-enable snaps to the centroid
+        }
+    }
+    var followSmoothing: Float {
+        get { choreography.followSmoothing }
+        set { choreography.followSmoothing = newValue }
+    }
+    var orbiting: Bool {
+        get { choreography.orbiting }
+        set { choreography.orbiting = newValue }
+    }
+    var orbitRate: Float {
+        get { choreography.orbitRate }
+        set { choreography.orbitRate = newValue }
+    }
+
+    /// Clear the follow smoothing state (reset / state load): the next
+    /// frame's advance snaps to the current centroid.
+    func resetChoreography() {
+        choreography.reset()
+    }
+
     private var pCellRender: MTLRenderPipelineState!
     private var pCellRenderXray: MTLRenderPipelineState!
     private var pCellRenderFoam: MTLRenderPipelineState!
@@ -193,6 +228,14 @@ final class Renderer: NSObject, MTKViewDelegate {
             statsDue = true
         }
 
+        // V2.6 camera choreography (follow-centroid + circle mode), BEFORE
+        // the scene encode — the camera struct is read by updateCameraBuffer
+        // below. Host-side only. Positions are read on this encoding thread
+        // while THIS frame's command buffer is not yet committed; the
+        // previous frame's CB completed via present() throttling — the same
+        // contract as refreshFoamOrder's position read.
+        updateChoreography()
+
         encodeScene(into: rpd, commandBuffer: cb, aspect: aspect)
 
         let now = CFAbsoluteTimeGetCurrent()
@@ -215,6 +258,33 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     private func aspect(of size: CGSize) -> Float {
         Float(size.width / max(size.height, 1))
+    }
+
+    // MARK: - V2.6 camera choreography
+
+    /// One rendered frame of camera choreography: circle mode advances yaw
+    /// around the (possibly moving) target; follow-centroid pulls the target
+    /// toward the LIVE cells' smoothed geometric centroid. Drag-orbit
+    /// (MetalView → ViewInput.orbit) keeps writing yaw/pitch directly, so a
+    /// drag rotates around the CO-MOVING target by construction — the
+    /// eye is always target + distance·dir(yaw, pitch).
+    ///
+    /// Cost: one O(live) pointer pass per frame when follow is ON (two in
+    /// liveCentroidAndRadius), no allocation. At 655k cells measured ~1 ms
+    /// (benchlog V2.6); the GUI default steps/frame 4 costs far more.
+    private func updateChoreography() {
+        if choreography.orbiting {
+            camera.yaw += choreography.orbitRate
+        }
+        guard choreography.followCentroid else {
+            choreography.reset()   // follow off: cleared, re-enabling snaps
+            return
+        }
+        let (centroid, _) = sim.liveCentroidAndRadius()
+        choreography.advance(centroid: centroid)
+        if let t = choreography.smoothedTarget {
+            camera.target = t
+        }
     }
 
     private func updateCameraBuffer(aspect: Float) {

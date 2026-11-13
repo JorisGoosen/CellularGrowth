@@ -22,7 +22,7 @@ struct ContentView: View {
 
     private var controlPanel: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Cellular Growth — V2.4")
+            Text("Cellular Growth — V2.6")
                 .font(.headline)
 
             HStack(spacing: 8) {
@@ -80,11 +80,38 @@ struct ContentView: View {
                 }
             }
 
+            // V2.6 camera choreography: the target tracks the LIVE cells'
+            // centroid (exponentially smoothed, host-side); circle mode
+            // advances the yaw at a fixed per-frame rate. Drag-orbit keeps
+            // rotating yaw/pitch around the moving target by construction.
+            GroupBox("Camera (V2.6)") {
+                Toggle(isOn: $vm.followCentroid) { Text("Follow centroid") }
+                slider("Follow smoothing", $vm.followSmoothing, 0...0.9)
+                Toggle(isOn: $vm.orbitEnabled) { Text("Circle (orbit)") }
+                slider("Orbit speed (rad/frame)", $vm.orbitRate, 0...0.05, step: 0.001)
+                Text("Follow targets the live-cell centroid; drag orbits around the moving target.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             GroupBox("State") {
                 HStack(spacing: 8) {
                     Button("Save State…") { vm.saveStatePanel() }
                     Button("Load State…") { vm.loadStatePanel() }
                 }
+            }
+
+            // V2.6 video export: the CLI --anim offscreen path (ray tracer,
+            // deterministic) growing on from the CURRENT state, with the
+            // panel's style/tint and the current camera choreography.
+            GroupBox("Video export (V2.6)") {
+                slider("Frames", $vm.exportFrames, 2...300, step: 1)
+                slider("Steps / frame", $vm.exportStepsPerFrame, 0...600, step: 10)
+                Button("Export video…") { vm.exportVideoPanel() }
+                    .buttonStyle(.borderedProminent)
+                Text("Offscreen 1600×1200, H.264 .mp4 (30 fps) + frame PNGs; style/tint/follow/orbit as shown.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             GroupBox("Growth") {

@@ -68,6 +68,9 @@ enum HeadlessRunner {
             // --- V2.5 (pitfall 10: every new flag routes to the headless path) ---
             || args.contains("--death") || args.contains("--death-threshold")
             || args.contains("--death-steps")
+            // --- V2.6 (pitfall 10: every new flag routes to the headless path) ---
+            || args.contains("--follow-centroid") || args.contains("--follow-smooth")
+            || args.contains("--orbit-rate")
             // V2.5: --state-load was only ever routed headless via its
             // --render/--screenshot companions (a bare --state-load silently
             // launched the GUI event loop and hung — pitfall 10 verbatim).
@@ -127,7 +130,7 @@ enum HeadlessRunner {
         var renderLight = "auto"   // auto | growth | unbiased (M5 unified light)
         // --- M6 ---
         var preset: String?        // named parameter preset (Core/Presets.swift)
-        var animDir: String?       // animation export: numbered PNG frames + .mov
+        var animDir: String?       // animation export: numbered PNG frames + .mp4 (V2.6; the M6 .mov was replaced)
         var animSteps = 150        // steps between frames
         var animFrames = 20        // total frames (frame 0 = the initial state)
         var stereo = false         // ray tracer: side-by-side stereo pair
@@ -205,6 +208,20 @@ enum HeadlessRunner {
         /// gate values, well below the hundreds of steps a shaded cell needs;
         /// see starvationStep in Shaders.swift).
         var deathSteps = 250
+        // --- V2.6 (camera choreography + video export) ---
+        /// GUI-default-ON camera features are OPT-IN headless: follow-centroid
+        /// and circle mode apply ONLY to --anim exports (the video paths).
+        /// --screenshot/--render/goldens keep the legacy fixed-target framing
+        /// unconditionally — without the flags every byte of those outputs is
+        /// unchanged by V2.6. Documented asymmetry: the goldens cover the
+        /// headless paths, not the GUI.
+        var followCentroid = false
+        /// Follow-target exponential smoothing per rendered frame
+        /// (0 = snap, 1 = frozen; see CameraChoreography).
+        var followSmoothing: Float = 0.15
+        /// Circle mode: yaw advance in radians PER RENDERED FRAME (deterministic
+        /// — export frames are equally spaced in steps). 0 = off.
+        var orbitRate: Float = 0
     }
 
     private static func parseOptions() -> Options {
@@ -383,6 +400,10 @@ enum HeadlessRunner {
             case "--death": o.death = true
             case "--death-threshold": o.deathThreshold = Float(value("--death-threshold") ?? "") ?? o.deathThreshold
             case "--death-steps": o.deathSteps = Int(value("--death-steps") ?? "") ?? o.deathSteps
+            // --- V2.6 (camera choreography + video export) ---
+            case "--follow-centroid": o.followCentroid = true
+            case "--follow-smooth": o.followSmoothing = Float(value("--follow-smooth") ?? "") ?? o.followSmoothing
+            case "--orbit-rate": o.orbitRate = Float(value("--orbit-rate") ?? "") ?? o.orbitRate
             default: break
             }
         }
@@ -1731,25 +1752,166 @@ enum HeadlessRunner {
         exit(0)
     }
 
-    // MARK: - M6 animation export (paper §6: "High definition animations taken
-    // by rendering images at equally spaced time intervals")
+    // MARK: - M6 animation export / V2.6 video export (shared core)
+    //
+    // Paper §6: "High definition animations taken by rendering images at
+    // equally spaced time intervals".
 
-    /// --anim DIR --anim-steps N --anim-frames M: grow the configured state
-    /// and render a frame every N steps with the OFFLINE ray tracer (style /
-    /// size / samples from --style/--width/--height/--samples) into DIR as
-    /// frame_0000.png …, then assemble a H.264 .mov (AVFoundation, 30 fps).
-    /// Frame 0 is the initial state; frame f is at step f·N. The camera is
-    /// re-framed per frame (max |P| × 2.6, the shared convention) so the
-    /// growing structure stays in frame.
+    /// V2.6: the deterministic offscreen video-export core shared by the CLI
+    /// --anim and the GUI "Export video…" button (factored from the M6
+    /// routine — ONE implementation, two callers; never duplicate the frame
+    /// loop). The sim must already sit in the state to export (GPU idle):
+    /// the CLI caller resets it from the CLI config first, the GUI caller
+    /// exports the LIVE state. `stepsPerFrame` steps run between frames;
+    /// every frame is re-framed (legacy max|P|·2.6, or the V2.6
+    /// follow-centroid + circle choreography) and rendered with the OFFLINE
+    /// ray tracer; frames land as frame_0000.png … and ONE H.264 .mp4 is
+    /// assembled (the M6 .mov container was REPLACED in V2.6: .mp4 plays
+    /// everywhere and keeps a single code path; codec H.264 + 30 fps
+    /// cadence unchanged).
+    struct VideoExportConfig {
+        var dir: String
+        var frames: Int
+        var stepsPerFrame: Int
+        var fps: Int32 = 30
+        var settings: RayRenderSettings
+        // V2.6 choreography — deterministic per-frame increments, snap-on-start
+        // (frame 0 centers the form; smoothing takes over from frame 1).
+        var followCentroid = false
+        var followSmoothing: Float = 0.15
+        var orbitRate: Float = 0
+        /// GUI progress hook (frames done, total). Nil = CLI printing only.
+        var onFrame: ((Int, Int) -> Void)? = nil
+    }
+
+    struct VideoExportResult {
+        var dir: String
+        var frames: Int
+        var moviePath: String?      // nil = assembly failed (the PNG sequence IS complete)
+        var totalWall: Double
+        var totalGpu: Double
+        /// Camera-choreography (centroid + framing + orbit) host cost, ms/frame.
+        var choreographyMsPerFrame: Double
+        /// Wall time spent in the AVFoundation encode (movie only).
+        var movieEncodeWall: Double
+    }
+
+    /// The shared frame loop. Throws on PNG/prep failures; a failed movie
+    /// assembly is reported (print + moviePath nil) but NOT thrown — the
+    /// complete PNG sequence remains usable (the M6 fallback contract).
+    static func exportAnimation(queue: MTLCommandQueue, sim: CellSim,
+                                config: VideoExportConfig) throws -> VideoExportResult {
+        let cfg = config
+        let frames = max(1, cfg.frames)
+        let stepsPerFrame = max(0, cfg.stepsPerFrame)
+        try FileManager.default.createDirectory(atPath: cfg.dir, withIntermediateDirectories: true)
+        print("video export: \(frames) frames every \(stepsPerFrame) steps, style \(cfg.settings.style), \(cfg.settings.width)x\(cfg.settings.height), into \(cfg.dir)")
+
+        let renderer = RayRenderer(device: sim.device, queue: queue, sim: sim)
+        var settings = cfg.settings
+        var smoothedTarget: SIMD3<Float>? = nil   // V2.6 follow state (frame 0 snaps)
+        var totalGpu = 0.0
+        var choreoSeconds = 0.0
+        let totalWall = CFAbsoluteTimeGetCurrent()
+        let pngPaths = (0..<frames).map { "\(cfg.dir)/frame_\(String(format: "%04d", $0)).png" }
+
+        for f in 0..<frames {
+            if f > 0 && stepsPerFrame > 0 {
+                runSteps(queue: queue, sim: sim, count: stepsPerFrame)
+            }
+            // Render prep at the exact current count: fresh radii + ONE grid
+            // rebuild + (directional light) refreshed illumination verdicts.
+            if let cb = queue.makeCommandBuffer() {
+                sim.refreshRadii(cb)
+                sim.encodeGridRebuild(cb)
+                if settings.directionalLight != nil {
+                    sim.encodeIlluminationRefresh(cb)
+                }
+                cb.commit()
+                cb.waitUntilCompleted()
+                if let e = cb.error { print("export frame \(f) prep CB ERROR: \(e)") }
+            }
+            sim.syncCellCountFromDevice()
+
+            // Camera: legacy framing or the V2.6 choreography — both are
+            // pure functions of the frame index (deterministic exports).
+            let tChoreo = CFAbsoluteTimeGetCurrent()
+            if cfg.followCentroid {
+                // Follow-centroid: target = smoothed LIVE-cell centroid;
+                // distance frames on the CENTROID (max live distance from
+                // it) — max |P| from the ORIGIN would overestimate once the
+                // form grows/drifts away from its birthplace.
+                let (c, radius) = sim.liveCentroidAndRadius()
+                let a = min(max(cfg.followSmoothing, 0), 1)
+                smoothedTarget = smoothedTarget.map { $0 + (c - $0) * a } ?? c
+                settings.camera.target = smoothedTarget!
+                settings.camera.distance = radius * 2.6
+            } else {
+                // Legacy framing (M6): distance from max |P| over the LIVE
+                // cells, target = origin. Dead slots (V2.5) hold stale
+                // positions and are excluded — for death-free runs this is
+                // byte-identical to the pre-V2.6 loop over all cells.
+                var maxAbs: Float = 0
+                let pos = sim.positionsBuffer.contents().assumingMemoryBound(to: SIMD3<Float>.self)
+                let dead = sim.deadFlagsPointer
+                for i in 0..<sim.cellCount where dead[i] == 0 {
+                    maxAbs = max(maxAbs, simd_length(pos[i]))
+                }
+                settings.camera.distance = maxAbs * 2.6
+            }
+            if cfg.orbitRate != 0 { settings.camera.yaw += cfg.orbitRate }
+            choreoSeconds += CFAbsoluteTimeGetCurrent() - tChoreo
+
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let result = renderer.render(settings: settings)
+            let wall = CFAbsoluteTimeGetCurrent() - t0
+            totalGpu += result.gpuSeconds
+            do {
+                try writePNG(result.bytes, width: result.width, height: result.height, to: pngPaths[f])
+            } catch {
+                throw NSError(domain: "anim", code: 10,
+                              userInfo: [NSLocalizedDescriptionKey: "frame \(f) PNG: \(error)"])
+            }
+            cfg.onFrame?(f + 1, frames)
+            print("frame \(f)/\(frames - 1) t=\(f * stepsPerFrame) cells=\(sim.cellCount)  wall \(String(format: "%.2f", wall))s  gpu \(String(format: "%.2f", result.gpuSeconds))s")
+        }
+
+        // Assemble the H.264 movie (default 30 fps; frames at equally spaced
+        // step intervals = the paper's "equally spaced time intervals").
+        let movPath = "\(cfg.dir)/animation.mp4"
+        var moviePath: String? = nil
+        var encodeWall = 0.0
+        do {
+            let tEnc = CFAbsoluteTimeGetCurrent()
+            try assembleMovie(frames: pngPaths, width: settings.width, height: settings.height,
+                              fps: cfg.fps, to: movPath)
+            encodeWall = CFAbsoluteTimeGetCurrent() - tEnc
+            moviePath = movPath
+        } catch {
+            // Honest fallback: the PNG sequence is complete; say what failed.
+            print("MP4 assembly FAILED (\(error)) — the PNG sequence in \(cfg.dir) is complete; assemble manually e.g.:\n  ffmpeg -framerate \(cfg.fps) -i \(cfg.dir)/frame_%04d.png -c:v libx264 -pix_fmt yuv420p \(cfg.dir)/animation.mp4")
+        }
+        let total = CFAbsoluteTimeGetCurrent() - totalWall
+        print("video export done: \(frames) frames\(moviePath != nil ? " + \(movPath)" : "")  total wall \(String(format: "%.2f", total))s  render gpu \(String(format: "%.2f", totalGpu))s  choreography \(String(format: "%.2f", choreoSeconds * 1000 / Double(frames))) ms/frame  movie encode \(String(format: "%.2f", encodeWall))s")
+        return VideoExportResult(dir: cfg.dir, frames: frames, moviePath: moviePath,
+                                 totalWall: total, totalGpu: totalGpu,
+                                 choreographyMsPerFrame: choreoSeconds * 1000 / Double(frames),
+                                 movieEncodeWall: encodeWall)
+    }
+
+    /// --anim DIR --anim-steps N --anim-frames M [--follow-centroid]
+    /// [--orbit-rate F]: grow the configured state and render a frame every
+    /// N steps with the OFFLINE ray tracer (style / size / samples from
+    /// --style/--width/--height/--samples) into DIR as frame_0000.png …,
+    /// then assemble ONE H.264 .mp4 (AVFoundation, 30 fps). Frame 0 is the
+    /// initial state; frame f is at step f·N. Legacy camera: distance
+    /// re-framed per frame (max |P| × 2.6, the shared convention).
+    /// --follow-centroid follows the LIVE cells' smoothed centroid instead
+    /// (distance framed on the centroid), --orbit-rate F circles at F
+    /// radians per rendered frame. Both are V2.6 OPT-IN headless.
     private static func runAnimation(queue: MTLCommandQueue, sim: CellSim, o: Options) -> Never {
         let dir = o.animDir!
-        let frames = max(1, o.animFrames)
-        let stepsPerFrame = max(0, o.animSteps)
-        do { try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) } catch {
-            print("animation FAILED: cannot create \(dir): \(error)")
-            exit(1)
-        }
-        print("animation: \(frames) frames every \(stepsPerFrame) steps, style \(o.style), \(o.width)x\(o.height), into \(dir)")
+        print("animation: \(max(1, o.animFrames)) frames every \(max(0, o.animSteps)) steps, style \(o.style), \(o.width)x\(o.height), into \(dir)")
 
         // Same deterministic setup as --render (seeded jitter).
         let (base, links) = Icosphere.generate(subdivisions: o.subdiv, spacing: sim.params.linkRestLength)
@@ -1794,78 +1956,42 @@ enum HeadlessRunner {
             exit(1)
         }
 
-        let renderer = RayRenderer(device: sim.device, queue: queue, sim: sim)
-        var totalGpu = 0.0
-        let totalWall = CFAbsoluteTimeGetCurrent()
-        let pngPaths = (0..<frames).map { "\(dir)/frame_\(String(format: "%04d", $0)).png" }
-
-        for f in 0..<frames {
-            if f > 0 && stepsPerFrame > 0 {
-                runSteps(queue: queue, sim: sim, count: stepsPerFrame)
-            }
-            // Render prep at the exact current count: fresh radii + ONE grid
-            // rebuild + (light mode) refreshed illumination verdicts.
-            if let cb = queue.makeCommandBuffer() {
-                sim.refreshRadii(cb)
-                sim.encodeGridRebuild(cb)
-                if settings.directionalLight != nil {
-                    sim.encodeIlluminationRefresh(cb)
-                }
-                cb.commit()
-                cb.waitUntilCompleted()
-                if let e = cb.error { print("animation frame \(f) prep CB ERROR: \(e)") }
-            }
-            sim.syncCellCountFromDevice()
-            var maxAbs: Float = 0
-            for p in sim.readPositions() { maxAbs = max(maxAbs, simd_length(p)) }
-            settings.camera.distance = maxAbs * 2.6
-
-            let t0 = CFAbsoluteTimeGetCurrent()
-            let result = renderer.render(settings: settings)
-            let wall = CFAbsoluteTimeGetCurrent() - t0
-            totalGpu += result.gpuSeconds
-            do {
-                try writePNG(result.bytes, width: result.width, height: result.height, to: pngPaths[f])
-            } catch {
-                print("animation FAILED: frame \(f) PNG: \(error)")
-                exit(1)
-            }
-            print("frame \(f)/\(frames - 1) t=\(f * stepsPerFrame) cells=\(sim.cellCount)  wall \(String(format: "%.2f", wall))s  gpu \(String(format: "%.2f", result.gpuSeconds))s")
-        }
-
-        if let savePath = o.stateSave {
-            do {
-                try sim.saveState(to: savePath)
-                print("state saved: \(savePath) (\(sim.cellCount) cells, CGST v3 full state)")
-            } catch {
-                print("state save FAILED: \(error)")
-                exit(1)
-            }
-        }
-
-        // Assemble the H.264 movie (30 fps; frames at equally spaced times =
-        // equally spaced step intervals, per the paper).
-        let movPath = "\(dir)/animation.mov"
         do {
-            try assembleMOV(frames: pngPaths, width: o.width, height: o.height,
-                            fps: 30, to: movPath)
-            let total = CFAbsoluteTimeGetCurrent() - totalWall
-            print("animation done: \(frames) frames + \(movPath)  total wall \(String(format: "%.2f", total))s  render gpu \(String(format: "%.2f", totalGpu))s")
+            let result = try exportAnimation(queue: queue, sim: sim, config: VideoExportConfig(
+                dir: dir, frames: o.animFrames, stepsPerFrame: o.animSteps,
+                settings: settings,
+                followCentroid: o.followCentroid,
+                followSmoothing: o.followSmoothing,
+                orbitRate: o.orbitRate))
+            // The final grown state (post-frames) — saved even when the movie
+            // assembly failed (the PNG sequence is the primary artefact).
+            if let savePath = o.stateSave {
+                do {
+                    try sim.saveState(to: savePath)
+                    print("state saved: \(savePath) (\(sim.cellCount) cells, CGST v3 full state)")
+                } catch {
+                    print("state save FAILED: \(error)")
+                    exit(1)
+                }
+            }
+            _ = result
         } catch {
-            // Honest fallback: the PNG sequence is complete; say what failed.
-            print("MOV assembly FAILED (\(error)) — the PNG sequence in \(dir) is complete; assemble manually e.g.:\n  ffmpeg -framerate 30 -i \(dir)/frame_%04d.png -c:v libx264 -pix_fmt yuv420p \(dir)/animation.mp4")
+            print("animation FAILED: \(error)")
+            exit(1)
         }
         exit(0)
     }
 
-    /// Encode a numbered PNG sequence into an H.264 .mov via AVFoundation
+    /// Encode a numbered PNG sequence into an H.264 .mp4 via AVFoundation
     /// (AVAssetWriter + pixel-buffer adaptor; BGRA in, yuv420p out). Works
-    /// headless — no GUI/app bundle required.
-    private static func assembleMOV(frames: [String], width: Int, height: Int,
-                                    fps: Int32, to path: String) throws {
+    /// headless — no GUI/app bundle required. V2.6: the container is .mp4
+    /// (the M6 .mov was REPLACED — universal playback, one code path; the
+    /// H.264 codec and the frame cadence are unchanged).
+    private static func assembleMovie(frames: [String], width: Int, height: Int,
+                                      fps: Int32, to path: String) throws {
         let url = URL(fileURLWithPath: path)
         try? FileManager.default.removeItem(at: url)   // overwrite a previous run
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
         let settings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: width,
