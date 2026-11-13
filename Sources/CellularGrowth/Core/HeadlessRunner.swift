@@ -56,6 +56,11 @@ enum HeadlessRunner {
             || args.contains("--pulse-decay")
             // --- V2.1b (pitfall 10: every new flag routes to the headless path) ---
             || args.contains("--radius-scale")
+            // --- V2.3 (pitfall 10: every new flag routes to the headless path) ---
+            || args.contains("--type-poles") || args.contains("--type-t1")
+            || args.contains("--type-t2") || args.contains("--phase-x")
+            || args.contains("--lamel-rate") || args.contains("--dal-rate")
+            || args.contains("--interior-divider")
     }
 
     struct Options {
@@ -137,6 +142,24 @@ enum HeadlessRunner {
         /// changes the growth too (explicitly requested = fine).
         var radiusScale: Float = 0.5
         var radiusScaleGiven = false
+        // --- V2.3 (cell types + two-phase growth) ---
+        /// Polar typing axis (normalized at apply); nil = NO typing (all
+        /// cells type 0 — the historical behaviour). Presence of ANY of
+        /// --type-poles/--type-t1/--type-t2 enables typing (defaults: the
+        /// vertical axis (0,1,0), t1 -0.35, t2 0.30).
+        var typePoles: SIMD3<Float>?
+        /// Stem threshold: s < t1 -> stem (type 1).
+        var typeT1: Float = -0.35
+        /// Cap threshold: s > t2 -> cap (type 4); t1 <= s <= t2 -> the
+        /// lamel/dal band.
+        var typeT2: Float = 0.30
+        /// Phase-2 switch: divisions executed before the rule matrix flips
+        /// (0 = never — pure phase 1).
+        var phaseX = 0
+        /// Phase-2 growth rates (SimParams mirrors; see foodStep).
+        var lamelRate: Float = 1.0
+        var dalRate: Float = 0.5
+        var interiorDivider: Float = 10.0
     }
 
     private static func parseOptions() -> Options {
@@ -180,6 +203,17 @@ enum HeadlessRunner {
             o.rdeDv = preset.params.rdeDv
             o.rdeBase = preset.params.rdeBase
             o.rdeGain = preset.params.rdeGain
+            // V2.3: presets can carry the two-phase growth rates + the
+            // polar typing knobs (explicit flags below still win).
+            o.lamelRate = preset.params.lamelRate
+            o.dalRate = preset.params.dalRate
+            o.interiorDivider = preset.params.interiorDivider
+            o.phaseX = Int(preset.params.phaseSwitchX)
+            if let ax = preset.typeAxis {
+                o.typePoles = ax
+                o.typeT1 = preset.typeT1
+                o.typeT2 = preset.typeT2
+            }
             print("preset '\(preset.name)': \(preset.summary)")
         }
 
@@ -270,6 +304,23 @@ enum HeadlessRunner {
             case "--radius-scale":
                 o.radiusScale = Float(value("--radius-scale") ?? "") ?? o.radiusScale
                 o.radiusScaleGiven = true
+            // --- V2.3 (cell types + two-phase growth) ---
+            case "--type-poles":
+                if let v = value("--type-poles") {
+                    let parts = v.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
+                    if parts.count == 3 {
+                        o.typePoles = SIMD3<Float>(parts[0], parts[1], parts[2])
+                    } else {
+                        print("--type-poles expects \"x,y,z\"; got '\(v)'")
+                        exit(1)
+                    }
+                }
+            case "--type-t1": o.typeT1 = Float(value("--type-t1") ?? "") ?? o.typeT1
+            case "--type-t2": o.typeT2 = Float(value("--type-t2") ?? "") ?? o.typeT2
+            case "--phase-x": o.phaseX = Int(value("--phase-x") ?? "") ?? o.phaseX
+            case "--lamel-rate": o.lamelRate = Float(value("--lamel-rate") ?? "") ?? o.lamelRate
+            case "--dal-rate": o.dalRate = Float(value("--dal-rate") ?? "") ?? o.dalRate
+            case "--interior-divider": o.interiorDivider = Float(value("--interior-divider") ?? "") ?? o.interiorDivider
             default: break
             }
         }
@@ -360,6 +411,11 @@ enum HeadlessRunner {
             sim.params.radiusScale = min(max(o.radiusScale, 0.05), 1)
             sim.syncParams()
         }
+        // --- V2.3 cell types + two-phase growth ---
+        sim.params.lamelRate = max(o.lamelRate, 0)
+        sim.params.dalRate = max(o.dalRate, 0)
+        sim.params.interiorDivider = max(o.interiorDivider, 1)
+        sim.params.phaseSwitchX = UInt32(max(o.phaseX, 0))
 
         if o.rdeProbe {
             runRdeProbe(queue: queue, sim: sim, o: o)   // exits
@@ -421,6 +477,9 @@ enum HeadlessRunner {
         print("Cells: \(positions.count)  (icosphere subdiv \(o.subdiv), jitter \(o.jitter), division \(sim.params.divisionEnabled != 0))")
 
         sim.reset(positions: positions, links: links)
+        // V2.3: phase-0 polar typing when the run requests it — BEFORE any
+        // step runs (types are reset-time state; daughters inherit).
+        applyTypingIfRequested(sim: sim, o: o)
 
         func meanLinkLength() -> Float {
             guard let cb = queue.makeCommandBuffer() else { return -1 }
@@ -451,6 +510,7 @@ enum HeadlessRunner {
             if done % 500 == 0 || done == o.steps {
                 print("t=\(done)   cells=\(sim.cellCount)  meanLinkLength=\(meanLinkLength())")
                 printGrowthCheckpoint(sim: sim)
+                if isTyped(sim) { printTypedCheckpoint(sim: sim) }
             }
         }
         let elapsed = CFAbsoluteTimeGetCurrent() - t0
@@ -596,7 +656,7 @@ enum HeadlessRunner {
         }
     }
 
-    /// V2.2 tint-mode code from the CLI string; exits on an unknown mode.
+    /// V2.2/V2.3 tint-mode code from the CLI string; exits on an unknown mode.
     /// "auto" (the default) reproduces the pre-V2.2 behaviour exactly:
     /// chemical colours in rde mode, neutral albedo otherwise.
     static func tintModeCode(_ s: String) -> UInt32 {
@@ -606,8 +666,10 @@ enum HeadlessRunner {
         case "chemical": return 2
         case "food": return 3
         case "pulse": return 4
+        case "type": return 5          // V2.3 type colours
+        case "type-pulse": return 6    // V2.3 type colours + mitosis-pulse overlay
         default:
-            print("--tint '\(s)' unknown (auto | none | chemical | food | pulse)")
+            print("--tint '\(s)' unknown (auto | none | chemical | food | pulse | type | type-pulse)")
             exit(1)
         }
     }
@@ -813,6 +875,79 @@ enum HeadlessRunner {
         sim.syncParams()
     }
 
+    /// V2.3: apply the phase-0 polar typing when the run requests it
+    /// (--type-poles/--type-t1/--type-t2, or a preset that carries them).
+    /// Called right after every reset that starts a typed run (and after a
+    /// state load — re-bands the loaded geometry, the GUI re-type semantics).
+    private static func applyTypingIfRequested(sim: CellSim, o: Options) {
+        guard let axis = o.typePoles else { return }
+        sim.applyPolarTypes(axis: axis, t1: o.typeT1, t2: o.typeT2)
+        let t = sim.readTypes()
+        var counts = [Int](repeating: 0, count: 5)
+        for x in t where Int(x) < 5 { counts[Int(x)] += 1 }
+        print("typing: axis (\(axis.x),\(axis.y),\(axis.z)) t1 \(o.typeT1) t2 \(o.typeT2) -> none=\(counts[0]) stem=\(counts[1]) lamel=\(counts[2]) dal=\(counts[3]) cap=\(counts[4])")
+    }
+
+    /// V2.3 typed-growth checkpoint (printed once per checkpoint when the
+    /// run is typed): per-type counts (Σ must equal V — every cell typed
+    /// exactly once, daughters inherit), per-type MEAN PULSE (the phase-2
+    /// validation: only voeg cells divide in phase 2, so the pulse mass must
+    /// sit on lamel/dal), and the phase state.
+    private static func printTypedCheckpoint(sim: CellSim) {
+        let v = sim.cellCount
+        guard v > 0 else { return }
+        let types = sim.readTypes()
+        var counts = [Int](repeating: 0, count: 5)
+        var badType = 0
+        for t in types {
+            let k = Int(t)
+            if k < 5 { counts[k] += 1 } else { badType += 1 }
+        }
+        let pulse = sim.readPulse()
+        var pulseSum = [Float](repeating: 0, count: 5)
+        for i in 0..<v {
+            let t = Int(min(types[i], 4))
+            pulseSum[t] += pulse[i]
+        }
+        func avg(_ s: Float, _ n: Int) -> String {
+            n > 0 ? String(format: "%.3f", s / Float(n)) : "  -  "
+        }
+        let div = sim.divisionCounter
+        let x = Int(sim.params.phaseSwitchX)
+        let phase = (x != 0 && div >= x) ? 2 : 1
+        // Valence pressure diagnostic (V2.3): divisions insert daughters into
+        // plane neighbours' rings, so cells at the growth front (and the
+        // dormant band cells beside it) accumulate links. A cell at
+        // maxValence defers its neighbours' splits — a saturated band freezes
+        // edge growth (documented failure mode; watched in V2.3).
+        let countsBuf = UnsafeBufferPointer(start: sim.linkCountsPointer, count: v)
+        var valenceHist = [Int](repeating: 0, count: Int(CellSim.maxValence) + 1)
+        var maxVal = 0
+        for c in countsBuf {
+            let k = Int(c)
+            if k <= Int(CellSim.maxValence) { valenceHist[k] += 1 }
+            maxVal = max(maxVal, k)
+        }
+        let atCap = valenceHist[Int(CellSim.maxValence)]
+        // Which types carry the valence pressure? (The dormant band cells
+        // cannot relieve their own valence by dividing — the suspected
+        // saturation mechanism.)
+        var satByType = [Int](repeating: 0, count: 5)
+        for i in 0..<v where Int(countsBuf[i]) >= Int(CellSim.maxValence) {
+            let t = Int(min(types[i], 4))
+            satByType[t] += 1
+        }
+        print("      valence: max=\(maxVal) at cap(\(CellSim.maxValence))=\(atCap) (\(String(format: "%.1f%%", 100 * Float(atCap) / Float(v))))  v14+ = \(valenceHist[14] + valenceHist[15] + valenceHist[16])  sat by type: none=\(satByType[0]) stem=\(satByType[1]) lamel=\(satByType[2]) dal=\(satByType[3]) cap=\(satByType[4])")
+        print("      types: none=\(counts[0]) stem=\(counts[1]) lamel=\(counts[2]) dal=\(counts[3]) cap=\(counts[4]) Σ=\(v)\(badType == 0 ? "" : " BAD=\(badType)")  divisions=\(div) phase=\(phase)")
+        print("      pulse/type: none \(avg(pulseSum[0], counts[0]))  stem \(avg(pulseSum[1], counts[1]))  lamel \(avg(pulseSum[2], counts[2]))  dal \(avg(pulseSum[3], counts[3]))  cap \(avg(pulseSum[4], counts[4]))")
+    }
+
+    /// True when the live state carries ANY typed cell (types are checked
+    /// once per checkpoint — cheap host readback at validation scale).
+    private static func isTyped(_ sim: CellSim) -> Bool {
+        sim.readTypes().contains { $0 != 0 }
+    }
+
     private static func runHeadless(queue: MTLCommandQueue, sim: CellSim, o: Options) -> Never {
         // M6: --state-load works in the headless path too — render/screenshot
         // a stored state instead of growing (matches the --render workflow).
@@ -823,6 +958,10 @@ enum HeadlessRunner {
                 print("state loaded: \(loadPath) (CGST v\(snap.version), \(sim.cellCount) cells, mode \(modes[Int(min(snap.growthMode, 2))]))")
                 applyTintOverrideAfterLoad(sim: sim, o: o)
                 applyRadiusScaleAfterLoad(sim: sim, o: o)
+                // V2.3: --type-poles re-bands a LOADED state (the GUI re-type
+                // semantics); without the flag the state's stored types win.
+                applyTypingIfRequested(sim: sim, o: o)
+                if isTyped(sim) { printTypedCheckpoint(sim: sim) }   // persisted types + phase
             } catch {
                 print("state load FAILED: \(error)")
                 exit(1)
@@ -891,6 +1030,7 @@ enum HeadlessRunner {
                 print("state loaded: \(loadPath) (CGST v\(snap.version), \(sim.cellCount) cells, mode \(modes[Int(min(snap.growthMode, 2))]))")
                 applyTintOverrideAfterLoad(sim: sim, o: o)
                 applyRadiusScaleAfterLoad(sim: sim, o: o)
+                applyTypingIfRequested(sim: sim, o: o)   // V2.3: re-band on request
             } catch {
                 print("state load FAILED: \(error)")
                 exit(1)
@@ -1059,6 +1199,7 @@ enum HeadlessRunner {
         let (base, links) = Icosphere.generate(subdivisions: o.subdiv, spacing: sim.params.linkRestLength)
         let positions = o.jitter > 0 ? seededJitter(base, radius: o.jitter, seed: o.seed) : base
         sim.reset(positions: positions, links: links)
+        applyTypingIfRequested(sim: sim, o: o)   // V2.3: typed animations
 
         var settings = RayRenderSettings()
         switch o.style {
@@ -1261,10 +1402,17 @@ enum HeadlessRunner {
         print("repulsion: roi \(sim.params.roi), strength \(sim.params.repulsionStrength) (\(sim.params.repulsionStrength > 0 ? "grid rebuilt every step" : "off"))")
         let modeNames = ["uniform", "light", "rde"]
         print("growth mode: \(modeNames[Int(min(sim.params.growthMode, 2))]) (food \(sim.params.foodIncrement), threshold \(sim.params.splitThreshold))")
+        // V2.3: typing is applied per level (after each reset) when requested
+        // — the typed sweep measures the decide-kernel rule matrix + the
+        // foodStep rate classification against the untyped baseline.
+        if o.typePoles != nil {
+            print("typing: axis \(o.typePoles!) t1 \(o.typeT1) t2 \(o.typeT2), phaseX \(sim.params.phaseSwitchX), lamelRate \(sim.params.lamelRate), dalRate \(sim.params.dalRate)")
+        }
         print("cells            | ms/step cpu | ms/step gpu | steps/s")
         for level in levels {
             let (positions, links) = Icosphere.generate(subdivisions: level, spacing: sim.params.linkRestLength)
             sim.reset(positions: positions, links: links)
+            applyTypingIfRequested(sim: sim, o: o)   // V2.3: typed bench levels
             let initial = sim.cellCount
 
             // warmup
@@ -2220,6 +2368,84 @@ enum HeadlessRunner {
         sim.params.growthMode = 0
         sim.syncParams()
 
+        // --- Phase E: typed growth (V2.3) — the mushroom rule matrix ------
+        // A small paddenstoel-preset run: phase-0 polar typing (vertical
+        // axis, t1 -0.4 / t2 0.9 — the preset's tuned values), phase 1 (cap
+        // uniform + stem edge-only, voeg dormant) switching to phase 2
+        // (voeg-only) after phaseSwitchX executed divisions. Beyond the usual
+        // invariants (checkpoint() — which now includes the type-validity
+        // line), the phase E gates are:
+        //   - Σ per-type counts == V (every cell carries a valid type; the
+        //     invariants check covers the codes, this asserts the partition);
+        //   - the rule matrix is ACTIVE: daughters inherit the parent's
+        //     type, so a type's count can only change when that TYPE
+        //     divides — phase 1 must freeze lamel+dal, phase 2 must freeze
+        //     stem+cap (checked between consecutive same-phase checkpoints);
+        //   - the phase transition is observed EXACTLY ONCE (the device
+        //     divCounter is monotonic; it flips at the first step boundary
+        //     after reaching phaseSwitchX) and growth actually reaches X.
+        let phaseX = 2700
+        sim.params.lamelRate = 0.5
+        sim.params.dalRate = 0.25
+        sim.params.interiorDivider = 10.0
+        sim.params.phaseSwitchX = UInt32(phaseX)
+        sim.params.divisionEnabled = 1
+        sim.syncParams()
+        (base, links) = Icosphere.generate(subdivisions: max(o.subdiv, 3), spacing: sim.params.linkRestLength)
+        let eSteps = min(steps, 2000)
+        print("selftest phase E (typed growth): paddenstoel rule matrix, \(base.count) cells, t1 -0.4 t2 0.9, phaseX \(phaseX), \(eSteps) steps")
+        sim.reset(positions: base, links: links)
+        sim.applyPolarTypes(axis: SIMD3<Float>(0, 1, 0), t1: -0.4, t2: 0.9)
+        var lastP1: [Int]? = nil   // last phase-1 checkpoint's type counts
+        var lastP2: [Int]? = nil   // last phase-2 checkpoint's type counts
+        var phaseFlips = 0
+        var lastPhase = 1
+        func typeCheckpoint(_ step: Int) {
+            checkpoint(step)   // the usual invariants (incl. type validity)
+            let types = sim.readTypes()
+            var counts = [Int](repeating: 0, count: 5)
+            for t in types where Int(t) < 5 { counts[Int(t)] += 1 }
+            let sum = counts.reduce(0, +)
+            let sumOK = sum == sim.cellCount
+            let div = sim.divisionCounter
+            let phase = div >= phaseX ? 2 : 1
+            if phase != lastPhase { phaseFlips += 1; lastPhase = phase }
+            var matrixOK = true
+            if phase == 1 {
+                if let lc = lastP1, counts[2] != lc[2] || counts[3] != lc[3] {
+                    print("   FAIL: voeg counts changed in phase 1 (lamel \(lc[2])->\(counts[2]), dal \(lc[3])->\(counts[3]))")
+                    matrixOK = false
+                }
+                lastP1 = counts
+            } else {
+                if let lc = lastP2, counts[1] != lc[1] || counts[4] != lc[4] {
+                    print("   FAIL: stem/cap counts changed in phase 2 (stem \(lc[1])->\(counts[1]), cap \(lc[4])->\(counts[4]))")
+                    matrixOK = false
+                }
+                lastP2 = counts
+            }
+            print("   types: none=\(counts[0]) stem=\(counts[1]) lamel=\(counts[2]) dal=\(counts[3]) cap=\(counts[4]) Σ=\(sum) \(sumOK ? "PASS" : "FAIL")  divisions=\(div) phase=\(phase) flips=\(phaseFlips) \(matrixOK ? "matrix PASS" : "matrix FAIL")")
+            if !sumOK || !matrixOK { allPass = false }
+        }
+        typeCheckpoint(0)
+        var doneE = 0
+        while doneE < eSteps {
+            let batch = min(100, eSteps - doneE)
+            runSteps(queue: queue, sim: sim, count: batch)
+            doneE += batch
+            if doneE % 500 == 0 || doneE == eSteps {
+                typeCheckpoint(doneE)
+            }
+        }
+        let finalDiv = sim.divisionCounter
+        let transitionOK = phaseFlips == 1 && finalDiv >= phaseX
+        print("   phase transition: flips=\(phaseFlips) (gate == 1), final divisions=\(finalDiv) (gate >= \(phaseX)) \(transitionOK ? "PASS" : "FAIL")")
+        if !transitionOK { allPass = false }
+        // Restore the untyped defaults (the shared sim object runs phases
+        // sequentially; nothing after phase E reads the typed state).
+        sim.params.phaseSwitchX = 0
+        sim.syncParams()
+
         print(allPass ? "SELFTEST PASS" : "SELFTEST FAIL")
         exit(allPass ? 0 : 1)
     }
@@ -2324,6 +2550,10 @@ enum HeadlessRunner {
         // V2.2: the pulse buffer is maintained every step (decay pass); a NaN
         // there would leak into the tint (pulse mode blends by it).
         for x in UnsafeBufferPointer(start: sim.pulsePointer, count: v) where !x.isFinite { badChem += 1 }
+        // V2.3: every cell's type must be a valid type code (0-4); the
+        // per-type counts then partition V by construction (Σ counts = V).
+        var badType = 0
+        for t in UnsafeBufferPointer(start: sim.cellTypePointer, count: v) where t > 4 { badType += 1 }
 
         // Pass 2: bidirectionality — every directed link (i -> j) must have
         // its reverse (j -> i). O(links * max valence) with early exit.
@@ -2353,6 +2583,7 @@ enum HeadlessRunner {
         let eulerOK = sumValence == eulerTarget
         let valenceOK = minValence >= 3 && maxVal <= maxValence
         let finiteOK = nanCount == 0 && badFood == 0 && badChem == 0
+        let typesOK = badType == 0
         let meanLen = lenCount > 0 ? lenSum / lenCount : 0
         let rest = sim.params.linkRestLength
         let lenOK = settled
@@ -2368,6 +2599,7 @@ enum HeadlessRunner {
         add("closed triangulation (sum valence == 6(V-2))", eulerOK, "sum=\(sumValence) target=\(eulerTarget)")
         add("valence in [3, maxValence]", valenceOK, "min=\(minValence == Int.max ? 0 : minValence) max=\(maxVal)")
         add("no NaN/Inf (positions, food, chemicals, pulse)", finiteOK, "bad positions=\(nanCount) food=\(badFood) chem=\(badChem)")
+        add("cell types valid (0-4, Σ per-type = V)", typesOK, "bad type codes=\(badType)")
         add(settled ? "mean link length ~ rest (settle)" : "mean link length bounded (growing)",
             lenOK, "mean=\(String(format: "%.4f", meanLen)) rest=\(rest) \(settled ? "(tolerance 2%)" : "(limit \(meanLimit)x)")")
         add("max |P| bounded", boundOK, "max=\(String(format: "%.2f", maxAbs)) limit=10000")
@@ -2392,7 +2624,7 @@ enum HeadlessRunner {
         let hist = (3...min(9, maxValence)).map { "v\($0)=\(valenceHist[$0])" }.joined(separator: " ")
         lines.append("diag: len p10=\(String(format: "%.2f", pct(0.10))) p50=\(String(format: "%.2f", pct(0.50))) p90=\(String(format: "%.2f", pct(0.90))) p99=\(String(format: "%.2f", pct(0.99))) max=\(String(format: "%.2f", pct(1.0)))  valences: \(hist)")
 
-        let pass = bidirOK && eulerOK && valenceOK && finiteOK && lenOK && boundOK
+        let pass = bidirOK && eulerOK && valenceOK && finiteOK && typesOK && lenOK && boundOK
         return (pass, lines)
     }
 

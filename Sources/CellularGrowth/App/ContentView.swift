@@ -11,16 +11,18 @@ struct ContentView: View {
             MetalViewContainer(vm: vm)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            controlPanel
-                .frame(width: 290)
-                .padding(12)
-                .background(Color(nsColor: .windowBackgroundColor))
+            ScrollView {
+                controlPanel
+                    .frame(width: 290)
+                    .padding(12)
+            }
+            .background(Color(nsColor: .windowBackgroundColor))
         }
     }
 
     private var controlPanel: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Cellular Growth — M6")
+            Text("Cellular Growth — V2.3")
                 .font(.headline)
 
             HStack(spacing: 8) {
@@ -95,6 +97,23 @@ struct ContentView: View {
                 Toggle(isOn: $vm.divisionEnabled) { Text("Cell division") }
                 slider("Food increment", $vm.foodIncrement, 0...0.05)
                 slider("Split threshold", $vm.splitThreshold, 0.2...3)
+            }
+
+            // V2.3 type layout: phase-0 polar typing (axis + stem/cap
+            // thresholds; between them the lamel/dal band) and the two-phase
+            // growth switch. Dragging a knob re-types the LIVE cells; the
+            // button re-applies after a manual change.
+            GroupBox("Type layout (V2.3)") {
+                Toggle(isOn: $vm.typingEnabled) { Text("Polar typing (on reset + live)") }
+                slider("Axis X", $vm.typeAxisX, -1...1)
+                slider("Axis Y", $vm.typeAxisY, -1...1)
+                slider("Axis Z", $vm.typeAxisZ, -1...1)
+                slider("Stem threshold t1", $vm.typeT1, -1...1)
+                slider("Cap threshold t2", $vm.typeT2, -1...1)
+                Button("Re-type cells") { vm.retypeCells() }
+                slider("Phase switch X (divisions)", $vm.phaseX, 0...20000, step: 100)
+                slider("Lamel rate", $vm.lamelRate, 0...3)
+                slider("Dal rate", $vm.dalRate, 0...3)
             }
 
             GroupBox("Light (growth + shading)") {

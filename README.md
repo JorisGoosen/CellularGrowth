@@ -8,7 +8,7 @@ including the `bulgeDist` typo analysis) lives in
 [`docs/reference/lomas_cellular_forms_extraction.md`](docs/reference/lomas_cellular_forms_extraction.md),
 with page screenshots in `docs/reference/pages/`.
 
-## Status — V2.1b complete: foam rendering (real flat walls, power-diagram chambers)
+## Status — V2.3 complete: cell types + two-phase growth (the mushroom)
 
 **M1–M6 base** (details in git history / docs/benchlog.md): over-damped
 spring/planar/bulge forces (paper §4, Fig. 3); food + cell division with
@@ -33,6 +33,65 @@ entries of docs/benchlog.md. The V2.1 painted **edge layer** (`--edges`,
 `--edge-width`) was RETIRED in V2.1b: a darkening blend painted near walls
 reads as drawn outlines, not geometry — the foam walls below are the wall
 visualization now (the v21-solid-edges golden was retired with it).
+
+V2.3 additions — **cell types + two-phase growth** (the user's head idea; the
+paper has no cell types, every value is a documented design choice):
+- **Type contract**: a `cellType` uint per cell. **Type 0 = none — ALL
+  existing behaviour** (the rule matrix is a no-op on all-type-0 runs: the
+  14 goldens and selftest phases A–D are byte-identical). Types: 1 stem,
+  2 lamel, 3 dal, 4 cap. Types persist in CGST v3 as an appended block
+  (N×uint32 + the division counter, before the raw SimParams — the
+  pulse-block pattern; legacy files load type 0 everywhere).
+- **Phase-0 polar typing** (`--type-poles "x,y,z"`, default vertical
+  `(0,1,0)`; `--type-t1 F` / `--type-t2 F`, defaults −0.4 / 0.9): at reset
+  (and via the GUI re-type button) the normalized axis coordinate
+  `s = dot(normalize(P − centroid), axis)` types the ball: `s < t1` → stem,
+  `s > t2` → cap, between → the lamel/dal band, alternating along ONE cyclic
+  walk over the band cells ordered by azimuth around the axis (an odd band
+  size leaves exactly one same-type seam at the walk closure — harmless).
+- **Two-phase division rule matrix** (`--phase-x N`; 0 = never): phase 1
+  (divisions < N): the stem divides ONLY at the band edge (a voeg
+  neighbour), the cap uniformly, the band dormant. Phase 2 (divisions ≥ N):
+  ONLY the band divides — lamel at `--lamel-rate` (default 1.0) at edge
+  links (stem/cap neighbours), dal at `--dal-rate` (default 0.5),
+  lamel↔dal interior links at lamelRate/`--interior-divider` (10),
+  lamel↔lamel never. Daughters inherit the parent's type. The phase clock
+  is a device-side division counter (exactly one increment per executed
+  split; the switch happens at the first step boundary after the X-th
+  division — exactly once). Two non-obvious correctness points documented in
+  Shaders.swift: (a) the decide pass's independent-set blocker test must
+  count only MATRIX-ELIGIBLE cells — a permanently ineligible food hoarder
+  (stem cells away from the band; stem/cap in phase 2) would otherwise block
+  the growth front forever (measured: the front froze after 13 divisions);
+  (b) dormant band cells are valence sinks — they never divide, so they
+  never relieve the +1 links front divisions insert into their rings; the
+  stem front saturates after a few hundred divisions (watched, documented).
+- **Type colours** (`--tint type`, cellTint mode 5): stem white, lamel warm
+  white, dal cool white, cap red — deliberately near-white for the three
+  non-cap types so foam walls (which average adjacent tints) blend clean
+  inside the band and only the cap boundary shows a strong blend (tested
+  50/50 average vs a dominant-type variant; the average ships — the
+  red↔white boundary reads as a natural gradient, not mud). `--tint
+  type-pulse` (mode 6) adds the mitosis-pulse overlay: in phase 2 the
+  flashes light up the BAND and nowhere else — the direct visual proof of
+  the rule matrix (per-type pulse means: lamel/dal > 0, stem/cap 0.000).
+- **Preset `paddenstoel`** (mushroom): tuned two-phase showcase — small cap
+  patch (t2 0.9) so phase-1 exponential cap growth makes the dome while the
+  stem edge-grows the stalk, then phase 2 (X 2700) ruffles the gill collar
+  at moderate rates (lamel 0.5 / dal 0.25). Foam style + `--tint type` +
+  `--radius-scale 0.7` recommended. Honest morphology note: the form reads
+  as a mushroom-family silhouette (red cap canopy with overhanging margin,
+  two-tone lamellen collar at the junction, white stem base) — the stem
+  stays squat/flared rather than a tall cylinder, and with other
+  thresholds the same rules give a ruffled valance (documented in the V2.3
+  report).
+- **Validation**: `swift build` (debug+release), `--selftest` (5 phases —
+  the new phase E checks the typed run: invariants + Σ per-type counts = V
+  at every checkpoint, phase-1 freezes lamel+dal, phase-2 freezes stem+cap,
+  the phase transition observed exactly once) PASS, `--lockstep` PASS, all
+  14 goldens byte-PASS, typed state round-trip (types + division counter
+  persisted), decide/foodStep type-check bench ~nil at matched counts
+  (benchlog V2.3).
 
 V2.1b additions — **foam rendering** (`--style foam`, `--style foam-xray`):
 - Each cell renders as its **power-diagram chamber**:
@@ -200,7 +259,16 @@ rendering, `--radius-scale F` sets the render radius scale — foam recommends
 0.7; the 0.5 default makes walls degenerate to points). Foam look knobs via
 env: `CG_FOAM_OPACITY` (per-face composite opacity, default 0.5),
 `CG_FOAM_LAYERS` (max composited chamber faces per ray, default 6),
-`CG_FOAM_WALL` (foam-xray wall-spike gain, default 0.25). Diagnostic:
+`CG_FOAM_WALL` (foam-xray wall-spike gain, default 0.25). V2.3:
+`--type-poles "x,y,z"` (polar typing axis, default vertical `0,1,0` — the
+presence of any of the three typing flags enables typing),
+`--type-t1 F` / `--type-t2 F` (stem/cap thresholds on the normalized axis
+coordinate; between them the lamel/dal band; defaults −0.4 / 0.9),
+`--phase-x N` (phase-2 switch after N executed divisions, 0 = never),
+`--tint type|type-pulse` (type colours: stem white, lamel warm white, dal
+cool white, cap red; type-pulse adds the mitosis-pulse overlay),
+`--lamel-rate F` / `--dal-rate F` / `--interior-divider F` (phase-2 band
+growth rates, defaults 1.0 / 0.5 / 10). Diagnostic:
 `--div-stop N` (disable division after step N); env `CG_NO_COARSE_SKIP=1`
 disables the light-march occupancy skip (A/B kill switch); env
 `CG_SHADOW_SAMPLES=N` overrides the 4 default shadow rays per pixel (bench
@@ -217,10 +285,13 @@ swift run -c release CellularGrowth --render xray.png --style xray \
 ## Controls
 
 Drag to orbit, scroll/pinch to zoom. Panel: preset dropdown (ball / brain /
-plant / coral / degenerate-demo), Solid/X-ray/Foam render-style switch
-(+ X-ray gain, foam opacity + the foam radius-scale hint), Save State…/Load
-State…, growth mode + light/RDE parameter groups, repulsion, forces, run
-controls. Jitter and subdivision apply on Reset.
+plant / coral / degenerate-demo / paddenstoel), Solid/X-ray/Foam render-style
+switch (+ X-ray gain, foam opacity + the foam radius-scale hint), tint picker
+(Default/None/Chemical/Food heat/Mitosis pulse/Type/Type + pulse), Save
+State…/Load State…, growth mode + light/RDE parameter groups, the V2.3 Type
+layout group (polar typing toggle + axis/threshold sliders — dragging a knob
+re-types the LIVE cells, Re-type button, phase switch X, lamel/dal rates),
+repulsion, forces, run controls. Jitter and subdivision apply on Reset.
 
 ## Roadmap
 
@@ -235,3 +306,4 @@ controls. Jitter and subdivision apply on Reset.
 | V2.1 ✅ | render v2: edge-blend layer in all three paths (`--edges`), coloured X-ray (`--xray-color`), soft shadows + fractional per-cell light (`--shadows`, `--light-soft`) | `--selftest` 4 phases (recalibrated C gate), `--lockstep`, 6/6 legacy goldens byte-identical (no recapture), 3 new goldens capture+check, render-cost bench (edges ~free, shadows ~2–3x directional solid, coloured X-ray ~free), fractional-light A/B (benchlog) |
 | V2.2 ✅ | tint modes: food/nutrient heatmap (`--tint food`, `--heat-scale`), mitosis pulse visualization (`--tint pulse`, `--pulse-decay`) — division flashes trace the paper §7 growth wavefronts; CGST v3 persists the pulse buffer (byte-exact pulse replays); render-time illumination refresh made side-effect-free | `--selftest` 4 phases, `--lockstep`, 9/9 legacy goldens PASS, 3 new goldens capture+check (pulse + heatmap byte-exact snapshot replays), state round-trip byte-identical, tint-mode bench ~nil (benchlog), pulse ring-R² wavefront metric: light 0.33–0.36 vs uniform 0.18–0.22 |
 | V2.1b ✅ | foam rendering: cells as power-diagram chambers (flat power-bisector walls + curved caps), translucent front-to-back composite ("walls behind walls") in the ray tracer (`--style foam`) and the interactive impostors (sorted premultiplied blend); foam X-ray with wall-crossing membranes (`--style foam-xray`); painted edge layer RETIRED (`--edges`/`--edge-width` removed, v21-solid-edges golden retired) | `--selftest` 4 phases, `--lockstep`, 11/11 surviving goldens byte-PASS, 3 new foam goldens capture+check, cross-renderer consistency (impostor-foam vs ray-foam same state), 0.5-vs-0.7 radius-scale mechanism demo (walls degenerate at 0.5), foam cost bench (ray foam 3.6–5.3× solid, impostor ≈ solid + one-off sort) |
+| V2.3 ✅ | cell types + two-phase growth: `cellType` buffer (0 none = all existing behaviour, 1 stem, 2 lamel, 3 dal, 4 cap), phase-0 polar typing (`--type-poles/--type-t1/--type-t2`, one cyclic azimuthal walk for the lamel/dal band), type-dependent division rule matrix with a device-side phase switch (`--phase-x`): phase 1 stem edge-only + cap uniform + band dormant, phase 2 band-only (lamel/dal/interior rates); daughters inherit type; CGST v3 persists types + division counter; type colours (`--tint type|type-pulse`); preset `paddenstoel` (mushroom) | `--selftest` 5 phases (new phase E: typed run, Σ per-type = V, phase-1 freezes voeg / phase-2 freezes stem+cap, transition exactly once), `--lockstep`, 14/14 goldens byte-PASS, typed state round-trip (types + phase clock persisted), phase-2 pulse-in-the-band validation (per-type pulse means: lamel/dal > 0, stem/cap 0.000), decide/foodStep type-check bench ~nil at matched counts (benchlog V2.3), blocker-predicate fix documented (eligible-set independent set) |

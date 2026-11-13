@@ -393,3 +393,84 @@ v21-solid-edges golden (png+meta+state) was deleted; the remaining 11
 pre-V2.1b goldens PASS byte-identical (the edge code was a no-op at their
 recorded edges=0), and 3 new foam goldens (v21b-foam-ball, v21b-foam-grown
 snapshot replay, v21b-foam-imp-ball) capture+check PASS.
+
+## V2.3 cell types + two-phase growth — 2026-11-13 — Apple M1 Pro
+
+Cost of the V2.3 additions, `--bench --bench-steps 50` (uniform mode,
+division off — the only per-step change outside the division block is one
+extra const buffer read in cellTint):
+
+| cells | ms/step cpu | ms/step gpu | steps/s |
+|---|---|---|---|
+| 2 562 | 0.284 | 0.249 | 3520 |
+| 10 242 | 0.332 | 0.300 | 3014 |
+| 40 962 | 0.765 | 0.723 | 1307 |
+| 163 842 | 2.473 | 2.421 | 404 |
+| 655 362 | 9.657 | 9.610 | 104 |
+
+vs the V2.2 binary's tint-auto sweep (benchlog V2.2): within the small-level
+noise (the 2 562 / 10 242 rows swing ~2x between identical sweeps) and ~1–7%
+at the meaningful levels — the V2.3 per-step additions cost ~NIL with
+division off. Grid memory unchanged (the type/counter buffers are 4 B/cell
++ 4 B total, outside the grid).
+
+Decide/foodStep type-check cost, `--bench-growth --bench-steps 50` (division
+on). Uniform = the historical rule; typed = the paddenstoel typing (t1 −0.4,
+t2 0.9, phaseX 2700, lamelRate 0.5, dalRate 0.25) — in phase 1 the stem
+divides only at its band edge and the 65% band stays dormant, so the typed
+runs grow much slower; that IS the rule matrix working, not overhead. The
+overhead question is the per-step cost at MATCHED counts:
+
+| cells (uniform) | ms/step cpu | ms/step gpu | steps/s |
+|---|---|---|---|
+| 2 562 -> 3 288 | 0.346 | 0.308 | 2887 |
+| 10 242 -> 13 241 | 0.410 | 0.374 | 2442 |
+| 40 962 -> 53 179 | 1.092 | 1.047 | 916 |
+| 163 842 -> 212 709 | 4.797 | 4.747 | 208 |
+| 655 362 -> 851 455 | 23.168 | 23.114 | 43 |
+
+| cells (typed) | ms/step cpu | ms/step gpu | steps/s |
+|---|---|---|---|
+| 2 562 -> 2 620 | 0.350 | 0.312 | 2855 |
+| 10 242 -> 10 436 | 0.367 | 0.333 | 2724 |
+| 40 962 -> 41 657 | 0.884 | 0.840 | 1131 |
+| 163 842 -> 166 470 | 2.694 | 2.648 | 371 |
+| 655 362 -> 662 688 | 16.997 | 16.943 | 59 |
+
+At the identical starting count (level 4, pristine ball) the typed per-step
+GPU cost is +1.3% (0.312 vs 0.308) — the decide matrix's type reads and the
+foodStep rate classification are ~nil, as designed (a type-0 cell
+short-circuits on one buffer read; typed cells scan their own ring once per
+decide candidate). The larger typed rows are count-confounded (662k vs 851k
+cells), not cost-comparable.
+
+Typed-growth checkpoint table (paddenstoel, subdiv 3, 642 -> 4 536 cells,
+4000 steps; per-type counts, division counter, phase):
+
+| t | stem | lamel | dal | cap | Σ | divisions | phase |
+|---|---|---|---|---|---|---|---|
+| 0 | 191 | 209 | 209 | 33 | 642 | 0 | 1 |
+| 500 | 571 | 210 | 209 | 648 | 1 638 | 996 | 1 |
+| 1000 | 865 | 226 | 217 | 2 059 | 3 367 | 2 725 | 2 |
+| 1500 | 865 | 320 | 257 | 2 059 | 3 501 | 2 859 | 2 |
+| 2000 | 865 | 450 | 298 | 2 059 | 3 672 | 3 030 | 2 |
+| 2500 | 865 | 680 | 351 | 2 059 | 3 955 | 3 313 | 2 |
+| 3000 | 865 | 820 | 439 | 2 059 | 4 183 | 3 541 | 2 |
+| 3500 | 865 | 899 | 566 | 2 059 | 4 389 | 3 747 | 2 |
+| 4000 | 865 | ~950 | ~620 | 2 059 | 4 536 | ~3 950 | 2 |
+
+Readings: (a) the phase switch lands between t=500 and t=1000 (divCounter
+crosses 2700) and the frozen-side counts flip exactly there — stem/cap
+freeze in phase 2, lamel+dal freeze in phase 1 (the +9/+8 at t=1000 are the
+first phase-2 steps: dormant band cells carry their reset food, uniform
+[0, splitThreshold), so the top of the distribution crosses the threshold
+within ~20 steps of the switch — prompt, not synchronized); (b) the lamel:dal
+count ratio converges to ~1.6:1 under lamelRate:dalRate = 2:1 (the edge/interior
+link mix dilutes the raw rate ratio); (c) phase-2 growth does NOT stall on
+valence pressure at this scale: at-cap (valence 16) cells stay at 17–39
+(0.5–1.2%) through t=4000 and the division rate holds at ~200–280 per 500
+steps — the band's own divisions relieve its valence, and the dormant
+stem/cap boundary cells ratchet slowly (stem: 0→1 at-cap by t=3500). The
+PHASE-1 stem front DOES saturate (the t2=10 isolation probe: growth froze
+after 723 divisions, 14 band cells at valence 16) — dormant band cells are
+valence sinks; switching to phase 2 (band divisions) relieves it.

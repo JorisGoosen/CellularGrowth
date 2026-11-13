@@ -53,7 +53,7 @@ import Foundation
 import Metal
 import simd
 
-/// Must mirror MSL `struct SimParams` exactly (40 x 4 bytes = 160).
+/// Must mirror MSL `struct SimParams` exactly (44 x 4 bytes = 176).
 /// Fields are only ever APPENDED at the end, on both sides.
 struct SimParams {
     var linkRestLength: Float = 1.0
@@ -172,6 +172,29 @@ struct SimParams {
     /// below "the whole surface is flashing" on fast-growing runs (measured:
     /// 0.97 left 60-80% of cells active at the validation growth rate).
     var pulseDecay: Float = 0.95
+    // --- V2.3 (appended; struct grows 160 -> 176 bytes) ---
+    /// Type-dependent growth rates (V2.3 rule matrix; see foodStep and
+    /// divisionDecide in Shaders.swift). Types: 0 none (uniform — the
+    /// historical behaviour, the matrix is a no-op on untyped runs), 1 stem,
+    /// 2 lamel, 3 dal, 4 cap. Rates only apply in PHASE 2 (phaseSwitchX).
+    /// lamelRate: food-increment multiplier for lamel cells at EDGE links
+    /// (a link to a stem or cap cell) — the full band-growth rate.
+    var lamelRate: Float = 1.0
+    /// dalRate: food-increment multiplier for dal cells at edge links
+    /// (default 0.5 — dal grows at half the lamel rate).
+    var dalRate: Float = 0.5
+    /// Interior links (lamel<->dal with no edge neighbour) grow at
+    /// lamelRate / max(interiorDivider, 1) — default 10 (the scope's
+    /// lamelRate/10): the band interior thickens an order of magnitude
+    /// slower than its edge. lamel<->lamel and dal<->dal links never grow.
+    var interiorDivider: Float = 10.0
+    /// Two-phase growth switch: phase 2 begins when the global division
+    /// counter (executed divisions since reset, device-side — see
+    /// divisionCounterBuffer) reaches this value. 0 = never (pure phase 1).
+    /// Phase 1: stem divides only at the band edge, cap uniformly, voeg
+    /// (lamel/dal) dormant. Phase 2: ONLY voeg cells divide (stem/cap food
+    /// multiplier 0; type-0 cells stay uniform by contract).
+    var phaseSwitchX: UInt32 = 0
 }
 
 enum ShaderError: Error {
@@ -263,6 +286,22 @@ final class CellSim {
     /// load; persisted in CGST v3 files from V2.2 on (legacy files load with
     /// pulse = 0) so pulse-tinted renders replay byte-exact.
     let pulseBuffer: MTLBuffer
+    /// V2.3 cell TYPE per cell (UInt32): 0 = none (uniform — every historical
+    /// behaviour; the V2.3 rule matrix is a no-op on all-type-0 runs),
+    /// 1 = stem, 2 = lamel, 3 = dal, 4 = cap. Written host-side by
+    /// applyPolarTypes (phase-0 polar typing) and by divisionExecute
+    /// (daughters inherit the parent's type). Persisted in CGST v3 from
+    /// V2.3 on (an appended N x u32 block, before the raw SimParams; legacy
+    /// files load with type 0 everywhere).
+    let cellTypeBuffer: MTLBuffer
+    /// V2.3 global DIVISION counter (device-side, atomic): incremented once
+    /// per successful split in divisionExecute. The phase-2 switch reads it
+    /// (phase 2 when counter >= params.phaseSwitchX). Lives on the device so
+    /// the phase decision needs no host readback or mid-flight params update;
+    /// the host reads it only at checkpoints (GPU idle). Zeroed at reset and
+    /// restored from CGST v3 (V2.3 files) so a loaded state continues in its
+    /// own phase.
+    let divisionCounterBuffer: MTLBuffer
     private var usingNutA = true
     private var usingChemA = true
 
@@ -361,8 +400,8 @@ final class CellSim {
 
         // Layout drift guard: the MSL SimParams mirror is appended-only; a
         // mismatch here corrupts every kernel silently.
-        precondition(MemoryLayout<SimParams>.size == 160,
-                     "SimParams layout drift: \(MemoryLayout<SimParams>.size) != 160 (see Shaders.swift)")
+        precondition(MemoryLayout<SimParams>.size == 176,
+                     "SimParams layout drift: \(MemoryLayout<SimParams>.size) != 176 (see Shaders.swift)")
 
         let f3 = MemoryLayout<SIMD3<Float>>.stride
         positionsA = device.makeBuffer(length: maxCells * f3, options: .storageModeShared)!
@@ -463,12 +502,23 @@ final class CellSim {
         pulseBuffer = device.makeBuffer(length: maxCells * MemoryLayout<Float>.stride,
                                         options: .storageModeShared)!
         pulseBuffer.label = "mitosisPulse"
+        // V2.3 cell types (UInt32 per cell; zeroed = untyped — the historical
+        // behaviour until applyPolarTypes assigns types) + the global
+        // division counter (one UInt32).
+        cellTypeBuffer = device.makeBuffer(length: maxCells * MemoryLayout<UInt32>.stride,
+                                           options: .storageModeShared)!
+        cellTypeBuffer.label = "cellType"
+        divisionCounterBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride,
+                                                  options: .storageModeShared)!
+        divisionCounterBuffer.label = "divisionCounter"
         memset(binCountsBuffer.contents(), 0, binCountsBuffer.length)
         memset(collisionOffsetBuffer.contents(), 0, collisionOffsetBuffer.length)
         memset(nutrientA.contents(), 0, nutrientA.length)
         memset(nutrientB.contents(), 0, nutrientB.length)
         memset(boundBuffer.contents(), 0, boundBuffer.length)
         memset(pulseBuffer.contents(), 0, pulseBuffer.length)
+        memset(cellTypeBuffer.contents(), 0, cellTypeBuffer.length)
+        memset(divisionCounterBuffer.contents(), 0, divisionCounterBuffer.length)
         fillLitFraction(1.0, count: maxCells)   // neutral: no illumination verdict yet
         memset(occupancyBuffer.contents(), 0, occupancyBuffer.length)
     }
@@ -562,6 +612,10 @@ final class CellSim {
         memset(nutrientB.contents(), 0, nutrientB.length)
         memset(boundBuffer.contents(), 0, boundBuffer.length)
         memset(pulseBuffer.contents(), 0, pulseBuffer.length)   // V2.2: no division has run
+        // V2.3: untyped (all type 0 — the historical behaviour) until
+        // applyPolarTypes is called by the host; the phase clock restarts.
+        memset(cellTypeBuffer.contents(), 0, cellTypeBuffer.length)
+        memset(divisionCounterBuffer.contents(), 0, divisionCounterBuffer.length)
         fillLitFraction(1.0, count: cellCount)   // neutral until the first light march
 
         guard let cb = queue.makeCommandBuffer() else { fatalError("no command buffer") }
@@ -993,6 +1047,10 @@ final class CellSim {
         enc.setBuffer(nutrientBuffer, offset: 0, index: 4)   // M5: light-mode coupling
         enc.setBuffer(chemUBuffer, offset: 0, index: 5)      // M5: rde coupling
         enc.setBuffer(chemVBuffer, offset: 0, index: 6)
+        enc.setBuffer(cellTypeBuffer, offset: 0, index: 7)   // V2.3: type rate matrix
+        enc.setBuffer(divisionCounterBuffer, offset: 0, index: 8)   // V2.3: phase clock
+        enc.setBuffer(linksBuffer, offset: 0, index: 9)      // V2.3: edge/interior link classes
+        enc.setBuffer(linkCountsBuffer, offset: 0, index: 10)
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         enc.endEncoding()
@@ -1007,6 +1065,8 @@ final class CellSim {
         enc.setBuffer(splitFlagsBuffer, offset: 0, index: 3)
         enc.setBuffer(counterBuffer, offset: 0, index: 4)
         enc.setBuffer(paramsBuffer, offset: 0, index: 5)
+        enc.setBuffer(cellTypeBuffer, offset: 0, index: 6)   // V2.3: rule matrix
+        enc.setBuffer(divisionCounterBuffer, offset: 0, index: 7)   // V2.3: phase clock
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         enc.endEncoding()
@@ -1027,6 +1087,8 @@ final class CellSim {
         enc.setBuffer(chemUBuffer, offset: 0, index: 9)      // M5: daughter inheritance
         enc.setBuffer(chemVBuffer, offset: 0, index: 10)
         enc.setBuffer(pulseBuffer, offset: 0, index: 11)     // V2.2: division flash
+        enc.setBuffer(cellTypeBuffer, offset: 0, index: 12)  // V2.3: daughter type inheritance
+        enc.setBuffer(divisionCounterBuffer, offset: 0, index: 13)  // V2.3: phase clock increment
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         enc.endEncoding()
@@ -1126,6 +1188,7 @@ final class CellSim {
         enc.setBuffer(foodBuffer, offset: 0, index: 5)      // V2.2 food heatmap
         enc.setBuffer(nutrientBuffer, offset: 0, index: 6)  // V2.2 food heatmap (light mode)
         enc.setBuffer(pulseBuffer, offset: 0, index: 7)     // V2.2 mitosis pulse
+        enc.setBuffer(cellTypeBuffer, offset: 0, index: 8)  // V2.3 type colours (modes 5/6)
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         enc.endEncoding()
@@ -1242,6 +1305,78 @@ final class CellSim {
         encodeCellTint(cb, width: cellCount)
         cb.commit()
         cb.waitUntilCompleted()
+    }
+
+    // MARK: - V2.3 phase-0 polar typing
+
+    /// Assign cell TYPES from the position's normalized axis coordinate
+    /// (paper-silent design; the user's head idea, documented here):
+    ///
+    ///   s = dot(normalize(P - centroid), normalize(axis))   in [-1, 1]
+    ///   s < t1          -> type 1 (stem)
+    ///   s > t2          -> type 4 (cap)
+    ///   t1 <= s <= t2   -> the "voeg" (joint) band, alternating lamel (2) /
+    ///                      dal (3)
+    ///
+    /// The band alternation is ONE CYCLIC RING WALK: the band cells are
+    /// traversed as a single closed sequence ordered by azimuth around the
+    /// type axis (the belt's natural ring; ties in angle — a radial column —
+    /// are broken by s then index, so the order is a deterministic total
+    /// order), and lamel/dal alternate along the walk. An ODD band size
+    /// leaves exactly ONE defect seam where the walk closes on itself (two
+    /// adjacent lamel cells): harmless — the pair is a lamel<->lamel link,
+    /// which never divides in phase 2, so growth locally pauses at the seam.
+    /// (A perfect 2-colouring of a TRIANGULATED band does not exist anyway —
+    /// every triangle forces a same-type edge — the walk merely concentrates
+    /// the unavoidable defect into one seam.)
+    ///
+    /// Host-side, deterministic (pure function of positions + axis +
+    /// thresholds); GPU must be idle. Refreshes the tint buffer afterwards so
+    /// type colours render immediately. Called at reset (CLI/GUI typing
+    /// knobs) and from the GUI re-type command (re-bands the CURRENT form —
+    /// note that after growth the centroid/shape have moved, so a re-type
+    /// re-bands the grown geometry, not the original ball).
+    func applyPolarTypes(axis: SIMD3<Float>, t1: Float, t2: Float) {
+        guard cellCount > 0 else { return }
+        let pos = UnsafeBufferPointer(start: positionsPointer, count: cellCount)
+        var centroid = SIMD3<Float>.zero
+        for p in pos { centroid += p }
+        centroid /= Float(max(cellCount, 1))
+        let a = simd_normalize(axis)
+        // Orthonormal basis perpendicular to the axis for the azimuthal angle.
+        let helper = abs(a.y) < 0.9 ? SIMD3<Float>(0, 1, 0) : SIMD3<Float>(1, 0, 0)
+        let b1 = simd_normalize(simd_cross(a, helper))
+        let b2 = simd_cross(a, b1)
+        var types = [UInt32](repeating: 0, count: cellCount)
+        var band: [(theta: Float, s: Float, idx: Int)] = []
+        band.reserveCapacity(cellCount / 4)
+        for (i, p) in pos.enumerated() {
+            let q = p - centroid
+            let len = max(simd_length(q), 1e-12)
+            let s = simd_dot(q, a) / len
+            if s < t1 {
+                types[i] = 1
+            } else if s > t2 {
+                types[i] = 4
+            } else {
+                let perp = q - a * simd_dot(q, a)
+                band.append((atan2(simd_dot(perp, b1), simd_dot(perp, b2)), s, i))
+            }
+        }
+        // The one cyclic ring walk: azimuthal order around the axis.
+        band.sort {
+            $0.theta != $1.theta ? $0.theta < $1.theta
+            : ($0.s != $1.s ? $0.s < $1.s : $0.idx < $1.idx)
+        }
+        for (k, b) in band.enumerated() { types[b.idx] = (k % 2 == 0) ? 2 : 3 }
+        types.withUnsafeBytes { src in
+            cellTypeBuffer.contents().copyMemory(
+                from: src.baseAddress!,
+                byteCount: types.count * MemoryLayout<UInt32>.stride)
+        }
+        // Type colours are render data derived from the types: refresh now
+        // (waited CB — this is a host-side config path, GPU idle).
+        refreshTint()
     }
 
     // MARK: - Stats
@@ -1363,6 +1498,10 @@ final class CellSim {
     var pulsePointer: UnsafeMutablePointer<Float> {
         pulseBuffer.contents().assumingMemoryBound(to: Float.self)
     }
+    /// V2.3 cell types readback (validation/probe; GPU must be idle).
+    var cellTypePointer: UnsafeMutablePointer<UInt32> {
+        cellTypeBuffer.contents().assumingMemoryBound(to: UInt32.self)
+    }
     var radiiPointer: UnsafeMutablePointer<Float> {
         radiiBuffer.contents().assumingMemoryBound(to: Float.self)
     }
@@ -1378,6 +1517,14 @@ final class CellSim {
     }
     func readPulse() -> [Float] {
         Array(UnsafeBufferPointer(start: pulsePointer, count: cellCount))
+    }
+    func readTypes() -> [UInt32] {
+        Array(UnsafeBufferPointer(start: cellTypePointer, count: cellCount))
+    }
+    /// V2.3: executed divisions since reset (the device phase clock; GPU
+    /// must be idle).
+    var divisionCounter: Int {
+        Int(divisionCounterBuffer.contents().assumingMemoryBound(to: UInt32.self)[0])
     }
 
     // MARK: - State snapshots (CGST; M6 unification)
@@ -1400,10 +1547,15 @@ final class CellSim {
     //            |   (division ORDER is GPU-schedule-dependent, the pulse
     //            |   VALUES are part of the snapshot); legacy files load
     //            |   with pulse = 0]
+    //            | [V2.3: cellType (N x u32) + divisionCounter (1 x u32) —
+    //            |   the typed-growth state, appended BEFORE the raw
+    //            |   SimParams (same pattern as the pulse block); legacy
+    //            |   files load with type 0 everywhere and a fresh phase
+    //            |   clock]
     //            | SimParams (raw, appended-only: 128 B comment from v3's first
     //            |   draft was wrong — M6 files carry 144 B, V2.1 files 148 B,
-    //            |   V2.2 files 160 B; the reader accepts every prefix length
-    //            |   and prefixes into the struct)
+    //            |   V2.2 files 160 B, V2.3 files 176 B; the reader accepts
+    //            |   every prefix length and prefixes into the struct)
     //            Loaded WITHOUT reset(): buffers installed directly, normals/
     //            radii/tint recomputed (deterministic functions of the state).
     //
@@ -1425,7 +1577,9 @@ final class CellSim {
                                              + 4 * MemoryLayout<UInt32>.stride
                                              + MemoryLayout<Float>.stride * 4
                                              + MemoryLayout<UInt64>.stride
-                                             + MemoryLayout<Float>.stride)   // V2.2 pulse
+                                             + MemoryLayout<Float>.stride   // V2.2 pulse
+                                             + MemoryLayout<UInt32>.stride  // V2.3 cellType
+                                             + MemoryLayout<UInt32>.stride) // V2.3 divisionCounter
                               + MemoryLayout<SimParams>.size)
         func append(_ v: UInt32) {
             var x = v.littleEndian
@@ -1477,6 +1631,10 @@ final class CellSim {
         // --- V2.2: pulse block (N x f32), BEFORE the raw SimParams. See the
         // format comment above (division pulses are live state).
         for f in UnsafeBufferPointer(start: pulsePointer, count: count) { append(f) }
+        // --- V2.3: cell types (N x u32) + the division counter (1 x u32),
+        // same appended-block pattern (see the format comment above).
+        for t in UnsafeBufferPointer(start: cellTypePointer, count: count) { append(t) }
+        append(UInt32(divisionCounter))
         // Raw SimParams (the simulation contract; appended-only layout).
         withUnsafeBytes(of: &params) { src in
             bytes.append(contentsOf: src.prefix(MemoryLayout<SimParams>.size))
@@ -1517,17 +1675,26 @@ final class CellSim {
         let v3Payload = count * (4 * 4 + MemoryLayout<Float>.stride * 4
                                  + MemoryLayout<UInt64>.stride)
         // Raw SimParams block lengths by writer era: 144 B (M6), 148 B (V2.1,
-        // lightSoft), 160 B (V2.2: tintMode + heatScale + pulseDecay). The
+        // lightSoft), 160 B (V2.2: tintMode + heatScale + pulseDecay), 176 B
+        // (V2.3: lamelRate + dalRate + interiorDivider + phaseSwitchX). The
         // appended-only layout makes every shorter block a compatible prefix
         // of the current struct — the read below copies only the bytes
         // present, leaving fields the file predates at their struct defaults.
-        // V2.2 writers ALSO append a pulse block (N x f32) before the params.
-        // count >= 12 for every real state (icosphere minimum), so 4N > 16:
-        // the pulse-bearing tail (>= 4N + 144) can never collide with a bare
-        // params length (<= 160).
-        let paramSizes: [Int] = [144, 148, MemoryLayout<SimParams>.size]
-        let v3Sizes = paramSizes.flatMap { [baseSize + v3Payload + $0,
-                                           baseSize + v3Payload + 4 * count + $0] }
+        // (The list must be EXPLICIT: MemoryLayout<SimParams>.size alone
+        // would drop the V2.2 160 B length every time the struct grows —
+        // found by the v21b/v22 golden replay failing the size check.)
+        // V2.2 writers ALSO append a pulse block (N x f32) before the params;
+        // V2.3 writers append cell types (N x u32) + the division counter
+        // (4 B) on top of that. count >= 12 for every real state (icosphere
+        // minimum), so 4N > 16: the variable tails (>= 4N + 144) can never
+        // collide with a bare params length (<= 176).
+        let paramSizes: [Int] = [144, 148, 160, MemoryLayout<SimParams>.size]
+        var v3Sizes: [Int] = []
+        for p in paramSizes {
+            v3Sizes.append(baseSize + v3Payload + p)                  // pre-V2.2 (no pulse block)
+            v3Sizes.append(baseSize + v3Payload + 4 * count + p)      // V2.2 (+ pulse block)
+            v3Sizes.append(baseSize + v3Payload + 8 * count + 4 + p)  // V2.3 (+ pulse + types + div counter)
+        }
         let expected = version == 2 ? [baseSize + 56]      // v2 block: 1 uint + 13 floats
                      : version == 3 ? v3Sizes
                      : [baseSize]
@@ -1619,10 +1786,23 @@ final class CellSim {
         off += count * MemoryLayout<UInt64>.stride
         // V2.2: optional pulse block (N x f32) between the RNG state and the
         // raw SimParams — present iff the remaining bytes exceed the largest
-        // bare params block (see the size check above).
+        // bare params block of the pre-V2.3 eras (160; see the size check
+        // above).
         var pulse = [Float](repeating: 0, count: count)
         if data.count - off > 160 {
             pulse = readFloats(count)
+        }
+        // V2.3: optional cell types (N x u32) + the division counter (u32),
+        // same detection pattern (remaining > the largest bare params block,
+        // 176 — the V2.3 tail is 4N + 4 >= 2604 for any real state, never
+        // ambiguous).
+        var types = [UInt32](repeating: 0, count: count)
+        var divCount: UInt32 = 0
+        if data.count - off > MemoryLayout<SimParams>.size {
+            for i in 0..<count { types[i] = u32(off + i * 4) }
+            off += count * 4
+            divCount = u32(off)
+            off += 4
         }
         // Raw SimParams.
         var restored = SimParams()
@@ -1639,7 +1819,8 @@ final class CellSim {
 
         installFullState(positions: positions, flatLinks: flatLinks, counts: counts,
                          food: food, nutrient: nutrient, chemU: chemU, chemV: chemV,
-                         tint: tint, rng: rng, pulse: pulse)
+                         tint: tint, rng: rng, pulse: pulse, types: types,
+                         divCount: divCount)
         return (version, params.growthMode)
     }
 
@@ -1651,15 +1832,17 @@ final class CellSim {
     }
 
     /// Install a COMPLETE state snapshot (v3) without reseeding anything:
-    /// positions/links/counts/food/nutrient/u/v/tint/rng + params, then
-    /// recompute the derived per-cell data (normals, radii, tint) in a waited
-    /// command buffer. Derived state that only render paths consume
-    /// (litFraction) is neutralized to 1.0 — directional renders call
-    /// encodeIlluminationRefresh, and the next light-mode step re-marches.
+    /// positions/links/counts/food/nutrient/u/v/tint/rng (+ V2.2 pulse,
+    /// V2.3 types + division counter) + params, then recompute the derived
+    /// per-cell data (normals, radii, tint) in a waited command buffer.
+    /// Derived state that only render paths consume (litFraction) is
+    /// neutralized to 1.0 — directional renders call encodeIlluminationRefresh,
+    /// and the next light-mode step re-marches.
     private func installFullState(positions: [SIMD3<Float>], flatLinks: [UInt32],
                                   counts: [UInt32], food: [Float], nutrient: [Float],
                                   chemU: [Float], chemV: [Float], tint: [SIMD3<Float>],
-                                  rng: [UInt64], pulse: [Float]) {
+                                  rng: [UInt64], pulse: [Float],
+                                  types: [UInt32], divCount: UInt32) {
         precondition(positions.count <= maxCells, "state exceeds maxCells")
         cellCount = positions.count
         params.cellCount = UInt32(cellCount)
@@ -1689,6 +1872,12 @@ final class CellSim {
         // V2.2 pulse (legacy files pass zeros — no pulses recorded).
         memset(pulseBuffer.contents(), 0, pulseBuffer.length)
         copy(pulse, to: pulseBuffer)
+        // V2.3 cell types (legacy files pass all zeros — untyped) + the
+        // division counter (the phase clock continues where the state left
+        // off; legacy files pass 0 — pure phase 1).
+        memset(cellTypeBuffer.contents(), 0, cellTypeBuffer.length)
+        copy(types, to: cellTypeBuffer)
+        divisionCounterBuffer.contents().assumingMemoryBound(to: UInt32.self)[0] = divCount
         counterBuffer.contents().assumingMemoryBound(to: UInt32.self)[0] = UInt32(cellCount)
         memset(boundBuffer.contents(), 0, boundBuffer.length)
         fillLitFraction(1.0, count: cellCount)   // neutral until encodeIlluminationRefresh

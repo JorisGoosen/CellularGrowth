@@ -39,10 +39,11 @@ enum Shaders {
     #include <metal_stdlib>
     using namespace metal;
 
-    // NOTE: layout must mirror Swift struct SimParams exactly (40 x 4 bytes =
-    // 160). New fields are APPENDED at the end on both sides (AGENTS.md
+    // NOTE: layout must mirror Swift struct SimParams exactly (44 x 4 bytes =
+    // 176). New fields are APPENDED at the end on both sides (AGENTS.md
     // SimParams rule). Size history: 144 B through M6, 148 B in V2.1
-    // (lightSoft), 160 B from V2.2 (tintMode + heatScale + pulseDecay) —
+    // (lightSoft), 160 B from V2.2 (tintMode + heatScale + pulseDecay),
+    // 176 B from V2.3 (lamelRate + dalRate + interiorDivider + phaseSwitchX) —
     // the CGST v3 reader accepts every prefix length.
     struct SimParams {
         float linkRestLength;
@@ -105,6 +106,21 @@ enum Shaders {
                                  // (see the cellTint comment)
         float pulseDecay;        // per-step multiplier on the division pulse
                                  // (0.95 default; division writes 1.0)
+        // --- V2.3 (appended; struct grows 160 -> 176 bytes) ---
+        float lamelRate;         // phase-2 food-increment multiplier for LAMEL
+                                 // cells at EDGE links (neighbour = stem/cap)
+        float dalRate;           // phase-2 food-increment multiplier for DAL
+                                 // cells at edge links
+        float interiorDivider;   // phase-2 interior rate: lamel<->dal links
+                                 // (no edge neighbour) grow at
+                                 // lamelRate / max(interiorDivider, 1)
+        uint  phaseSwitchX;      // two-phase growth: phase 2 (voeg-only
+                                 // division) begins when the global division
+                                 // counter reaches this many EXECUTED
+                                 // divisions; 0 = never (pure phase 1).
+                                 // Type-0 (untyped) runs ignore the phase
+                                 // entirely — the rule matrix is a no-op
+                                 // (see divisionDecide / foodStep).
     };
     // (alignment 16!). Links are stored strided per cell (cell * maxValence + k)
     // in CYCLIC RING ORDER (neighbors consecutive around the vertex), so the
@@ -917,10 +933,43 @@ enum Shaders {
     // rand01 call), so uniform-mode runs stay bit-identical to the pre-M5
     // semantics and the per-cell RNG streams stay in lockstep across modes.
     //
+    // V2.3 type-dependent increment multiplier (rate), multiplied in AFTER
+    // drive and BEFORE rand01 — for rate == 1.0f the product is BIT-IDENTICAL
+    // to the pre-V2.3 expression (x*1.0f == x exactly), which is the type-0
+    // contract: untyped runs (all cells type 0) reproduce the historical
+    // semantics byte-for-byte. The rate is the phase-2 half of the rule
+    // matrix (the decide-pass gate is the other half — see divisionDecide):
+    //   phase 1 (divCounter < phaseSwitchX, or phaseSwitchX == 0):
+    //     type 0: 1.0 (contract)    type 1 stem: 1.0 (gate lives in decide)
+    //     type 2/3 voeg: 0 — dormant (their food stays at the RESET value,
+    //                     uniform [0, splitThreshold): at the switch the top
+    //                     of that distribution is already near the threshold,
+    //                     so phase 2 starts promptly — no synchronized burst
+    //                     though: the ring-distance-2 independent set and the
+    //                     spread of reset foods spread the first wave out)
+    //     type 4 cap: 1.0
+    //   phase 2 (divCounter >= phaseSwitchX > 0): ONLY voeg cells divide, so
+    //     stem/cap get 0; a voeg cell's rate depends on its LINK CLASSES
+    //     (edge = a link to a stem/cap cell; interior = a link to the
+    //     COMPLEMENTARY voeg type):
+    //     lamel: edge -> lamelRate; lamel<->dal interior -> interiorRate;
+    //            lamel<->lamel only -> 0 (never)
+    //     dal:   edge -> dalRate;   lamel<->dal interior -> interiorRate;
+    //            dal<->dal only -> 0 (never)
+    //     interiorRate = lamelRate / max(interiorDivider, 1) (default /10).
+    // The RNG stream is still consumed EXACTLY once per cell at rate 0 (the
+    // product is simply 0) — stream parity across configs is preserved.
+    //
     // Buffer table:
     //   0 rngState (read+write)   1 food (write)   2 cellCounter   3 params
     //   4 nutrient (const, current buffer; light mode)
     //   5 chemU (const, current buffer; rde mode)   6 chemV (const; rde mode)
+    //   7 cellType (const; V2.3 rate matrix)
+    //   8 divCounter (const; V2.3 phase clock — read-only here; the increment
+    //     happens in divisionExecute LATER in the same command buffer, so
+    //     every foodStep thread of a step sees the same pre-step phase)
+    //   9 links (const; V2.3 edge/interior link classes)
+    //  10 linkCounts (const; V2.3)
     kernel void foodStep(device uint64_t* rngState    [[buffer(0)]],
                          device float*   food         [[buffer(1)]],
                          device const uint* cellCounter [[buffer(2)]],
@@ -928,6 +977,10 @@ enum Shaders {
                          device const float* nutrient   [[buffer(4)]],
                          device const float* chemU      [[buffer(5)]],
                          device const float* chemV      [[buffer(6)]],
+                         device const uint*  cellType   [[buffer(7)]],
+                         device const uint*  divCounter [[buffer(8)]],
+                         device const uint*  links      [[buffer(9)]],
+                         device const uint*  linkCounts [[buffer(10)]],
                          uint gid [[thread_position_in_grid]])
     {
         if (gid >= cellCounter[0]) return;
@@ -937,7 +990,34 @@ enum Shaders {
         } else if (params.growthMode == 2u) {
             drive = params.rdeBase + params.rdeGain * chemV[gid];
         }
-        food[gid] += params.foodIncrement * drive * rand01(&rngState[gid]);
+        // V2.3 type rate (1.0 for type 0 — the no-op contract; see above).
+        float rate = 1.0f;
+        uint type = cellType[gid];
+        if (type != 0u) {
+            const bool phase2 = (params.phaseSwitchX != 0u)
+                             && (divCounter[0] >= params.phaseSwitchX);
+            if (!phase2) {
+                if (type == 2u || type == 3u) rate = 0.0f;   // voeg dormant
+            } else if (type == 1u || type == 4u) {
+                rate = 0.0f;                                 // only voeg cells grow
+            } else {
+                // Voeg cell in phase 2: classify the ring links (frozen data).
+                uint n = linkCounts[gid];
+                uint base = gid * params.maxValence;
+                bool edge = false;       // neighbour = stem (1) or cap (4)
+                bool interior = false;   // neighbour = the complementary voeg type
+                for (uint k = 0; k < n; ++k) {
+                    uint tj = cellType[links[base + k]];
+                    if (tj == 1u || tj == 4u) edge = true;
+                    else if (type == 2u ? tj == 3u : tj == 2u) interior = true;
+                }
+                const float interiorRate = params.lamelRate
+                                         / max(params.interiorDivider, 1.0f);
+                rate = edge ? (type == 2u ? params.lamelRate : params.dalRate)
+                            : (interior ? interiorRate : 0.0f);
+            }
+        }
+        food[gid] += params.foodIncrement * drive * rate * rand01(&rngState[gid]);
     }
 
     // ---- M5: growth-mode chemicals (paper §4 methods 2 and 3) --------------
@@ -1204,9 +1284,9 @@ enum Shaders {
         chemVNext[gid] = clamp(v + dv, 0.0f, 2.0f);
     }
 
-    // M5/V2.2: per-cell RENDER colour. Tint modes (params.tintMode, V2.2 —
-    // appended enum; 0 reproduces the pre-V2.2 behaviour exactly, so every
-    // existing golden stays byte-identical):
+    // M5/V2.2/V2.3: per-cell RENDER colour. Tint modes (params.tintMode,
+    // V2.2 — appended enum; 0 reproduces the pre-V2.2 behaviour exactly, so
+    // every existing golden stays byte-identical):
     //   0 auto     — chemical colours iff growthMode == 2 (rde), else the
     //                neutral albedo
     //   1 none     — neutral albedo always
@@ -1215,6 +1295,20 @@ enum Shaders {
     //   3 food     — growth-substance heatmap (mapping below)
     //   4 pulse    — base tint (auto rule) blended with the magenta division
     //                pulse (see pulseDecayStep / divisionExecute)
+    //   5 type     — V2.3 TYPE colours: stem white, lamel warm white, dal
+    //                cool white, cap red; type 0 cells stay neutral. The
+    //                palette is deliberately NEAR-WHITE for the three
+    //                non-cap types (white / warm white / cool white) so the
+    //                foam walls — which average ADJACENT cells' tints —
+    //                blend to near-white inside the band (only the cap
+    //                boundary shows a strong red<->white blend), and the
+    //                red cap reads as the form's one saturated mass.
+    //   6 type-pulse — mode 5 + the mode-4 mitosis-pulse overlay: the V2.3
+    //                phase-2 validation view. In phase 2 ONLY voeg cells
+    //                divide, so the magenta flashes must light up the BAND
+    //                and nowhere else — a direct visual proof of the rule
+    //                matrix (checked quantitatively by the per-type pulse
+    //                means in the typed checkpoint stats).
     //
     // In rde mode the chemicals tint the cells: base GREEN, shifted toward
     // BLUE proportional to u and toward RED proportional to v (documented
@@ -1277,6 +1371,7 @@ enum Shaders {
     //   4 params
     //   5 food (const; V2.2 food heatmap)  6 nutrient (const; V2.2)
     //   7 pulse (const; V2.2 mitosis pulse)
+    //   8 cellType (const; V2.3 type colours, modes 5/6)
     kernel void cellTint(device const float* chemU    [[buffer(0)]],
                          device const float* chemV    [[buffer(1)]],
                          device float3*      tint     [[buffer(2)]],
@@ -1285,6 +1380,7 @@ enum Shaders {
                          device const float* food     [[buffer(5)]],
                          device const float* nutrient [[buffer(6)]],
                          device const float* pulse    [[buffer(7)]],
+                         device const uint*  cellType [[buffer(8)]],
                          uint gid [[thread_position_in_grid]])
     {
         if (gid >= cellCounter[0]) return;
@@ -1320,9 +1416,20 @@ enum Shaders {
             if (h < 1.0f / 3.0f)      col = mix(c0, c1, h * 3.0f);
             else if (h < 2.0f / 3.0f) col = mix(c1, c2, (h - 1.0f / 3.0f) * 3.0f);
             else                      col = mix(c2, c3, (h - 2.0f / 3.0f) * 3.0f);
+        } else if (mode == 5u || mode == 6u) {
+            // V2.3 type colours (palette rationale in the comment above).
+            // Type 0 keeps the neutral albedo — an untyped run renders
+            // exactly as before in every mode.
+            uint t = cellType[gid];
+            col = (t == 1u) ? float3(1.00, 1.00, 1.00)    // stem: white
+                : (t == 2u) ? float3(1.00, 0.88, 0.72)    // lamel: warm white
+                : (t == 3u) ? float3(0.72, 0.86, 1.00)    // dal: cool white
+                : (t == 4u) ? float3(0.80, 0.10, 0.10)    // cap: red
+                : float3(0.87, 0.85, 0.82);               // type 0: neutral
         }
-        // V2.2 pulse blend (over the base tint of every mode).
-        if (mode == 4u) {
+        // V2.2 pulse blend (over the base tint of every mode); V2.3 mode 6
+        // (type-pulse) shares it.
+        if (mode == 4u || mode == 6u) {
             float p = clamp(pulse[gid], 0.0f, 1.0f);
             col = mix(col, float3(0.95, 0.15, 0.85), p);
         }
@@ -1365,21 +1472,120 @@ enum Shaders {
     // The claim flag is consumed by divisionExecute, which MUST be dispatched
     // with the same width (claims beyond the width are then never consumed).
     //
+    // V2.3 TYPE-DEPENDENT RULE MATRIX (gate, before the historical checks):
+    //
+    //   Phase 1 (divCounter < phaseSwitchX, or phaseSwitchX == 0):
+    //     type 0 (none): NO gate — the historical uniform rule verbatim
+    //                    (the type-0 contract: untyped runs are untouched)
+    //     type 1 (stem): divides ONLY with a voeg neighbour (lamel/dal in its
+    //                    ring) — edge growth at the band
+    //     type 2/3 (voeg): never (dormant; their food multiplier is also 0 —
+    //                    see foodStep)
+    //     type 4 (cap): uniform (the old rule)
+    //   Phase 2 (divCounter >= phaseSwitchX > 0): ONLY voeg cells divide
+    //     (type 0 exempt by contract — an untyped run stays uniform in both
+    //     phases):
+    //     type 1/4 (stem/cap): never
+    //     type 2 (lamel): needs an EDGE link (stem/cap neighbour) or an
+    //                     interior lamel<->dal link; lamel<->lamel never
+    //     type 3 (dal):   same (edge or a lamel neighbour)
+    //
+    // BLOCKER PREDICATE (V2.3, critical): the independent-set test must count
+    // only MATRIX-ELIGIBLE cells as blockers, not every food-heavy cell. With
+    // the historical food-only predicate, a cell that hoards food above the
+    // threshold while being permanently INELIGIBLE under the matrix (a stem
+    // cell with no voeg neighbour; any stem/cap cell in phase 2 — their food
+    // multiplier is 0, so the hoard never clears) sits at ring-distance <= 2
+    // of the growth front forever and BLOCKS every higher-indexed eligible
+    // candidate — measured: the stem edge front froze after 13 divisions
+    // (t2 = 10 isolation probe, 2000 steps). The M2 "blocked cells simply
+    // retry" claim relies on blockers eventually dividing themselves clear;
+    // the matrix breaks that, so the blocker set must be the ELIGIBLE set.
+    // For type-0 runs typeEligible is constant true, which restores the
+    // historical predicate EXACTLY (the type-0 contract).
+    //
+    // Race-freedom of the matrix: every type check is a READ of FROZEN data —
+    // links, linkCounts and cellType are not written by any kernel between
+    // the step start and this pass (divisionExecute, the only writer of
+    // cellType, runs AFTER decide in the same command buffer), and decide
+    // itself writes ONLY splitFlags[gid]. The M2 ring-distance-2 argument
+    // therefore extends verbatim: the claim set is the set of matrix-eligible
+    // local minima (two eligible cells within ring-distance 2 — the lower
+    // index blocks the higher, whichever it is), so concurrent claimants
+    // still have pairwise distance >= 3 and disjoint write sets, and the
+    // added reads cannot observe a concurrent write (there is none). The
+    // phase read (divCounter[0]) is frozen within the step for the same
+    // reason: divisionExecute's atomic increment happens LATER in the same
+    // command buffer, so every decide thread of a step evaluates the same
+    // pre-step phase — the phase switches at the first step boundary AFTER
+    // the X-th executed division (exactly once; the counter is monotonic).
+    //
+    // V2.3: rule-matrix eligibility of ONE cell — the decide gate for the
+    // candidate itself and the blocker predicate for its ring-distance <= 2
+    // neighbours (same predicate both roles — see the blocker-predicate note
+    // above). Type 0 (none) is unconditionally eligible: the matrix is a
+    // no-op on untyped runs. All reads are of frozen data.
+    static inline bool typeEligible(uint c,
+                                    device const uint* links,
+                                    device const uint* linkCounts,
+                                    device const uint* cellType,
+                                    bool phase2, uint maxValence) {
+        uint t = cellType[c];
+        if (t == 0u) return true;
+        uint n = linkCounts[c];
+        uint base = c * maxValence;
+        if (!phase2) {
+            if (t == 2u || t == 3u) return false;   // voeg dormant in phase 1
+            if (t == 1u) {
+                // Stem: eligible only at the band edge (a voeg neighbour).
+                for (uint k = 0; k < n; ++k) {
+                    uint tj = cellType[links[base + k]];
+                    if (tj == 2u || tj == 3u) return true;
+                }
+                return false;
+            }
+            return true;                            // cap: uniform
+        }
+        if (t == 1u || t == 4u) return false;       // phase 2: voeg-only
+        bool edge = false;       // neighbour = stem (1) or cap (4)
+        bool interior = false;   // neighbour = the complementary voeg type
+        for (uint k = 0; k < n; ++k) {
+            uint tj = cellType[links[base + k]];
+            if (tj == 1u || tj == 4u) edge = true;
+            else if (t == 2u ? tj == 3u : tj == 2u) interior = true;
+        }
+        return edge || interior;
+    }
+
     // Buffer table:
     //   0 food (const)          1 links (const)     2 linkCounts (const)
     //   3 splitFlags (write)    4 cellCounter       5 params
+    //   6 cellType (const; V2.3 rule matrix)
+    //   7 divCounter (const; V2.3 phase clock)
     kernel void divisionDecide(device const float* food      [[buffer(0)]],
                                device const uint*   links          [[buffer(1)]],
                                device const uint*   linkCounts     [[buffer(2)]],
                                device uint*         splitFlags     [[buffer(3)]],
                                device const uint*   cellCounter    [[buffer(4)]],
                                constant SimParams&  params         [[buffer(5)]],
+                               device const uint*   cellType       [[buffer(6)]],
+                               device const uint*   divCounter     [[buffer(7)]],
                                uint gid [[thread_position_in_grid]])
     {
         uint count = cellCounter[0];
         if (gid >= count) { splitFlags[gid] = 0u; return; }
         if (params.divisionEnabled == 0u) { splitFlags[gid] = 0u; return; }
         if (food[gid] <= params.splitThreshold) { splitFlags[gid] = 0u; return; }
+
+        // V2.3 rule matrix gate (type 0 exempt — typeEligible is constant
+        // true there and this is a no-op read).
+        const bool phase2 = (params.phaseSwitchX != 0u)
+                         && (divCounter[0] >= params.phaseSwitchX);
+        if (!typeEligible(gid, links, linkCounts, cellType, phase2,
+                          params.maxValence)) {
+            splitFlags[gid] = 0u;
+            return;
+        }
 
         uint n = linkCounts[gid];
         if (n < 3u || n > params.maxValence) { splitFlags[gid] = 0u; return; }
@@ -1388,13 +1594,19 @@ enum Shaders {
         for (uint k = 0; k < n; ++k) {
             uint j = links[base + k];
             if (j == gid) { splitFlags[gid] = 0u; return; }   // corrupt ring: defer
-            if (food[j] > params.splitThreshold && j < gid) { splitFlags[gid] = 0u; return; }
+            if (food[j] > params.splitThreshold && j < gid
+                && typeEligible(j, links, linkCounts, cellType, phase2,
+                                params.maxValence)) {
+                splitFlags[gid] = 0u; return;
+            }
             uint jn = linkCounts[j];
             if (jn > params.maxValence) { splitFlags[gid] = 0u; return; }
             uint jbase = j * params.maxValence;
             for (uint k2 = 0; k2 < jn; ++k2) {
                 uint l = links[jbase + k2];
-                if (l != gid && food[l] > params.splitThreshold && l < gid) {
+                if (l != gid && food[l] > params.splitThreshold && l < gid
+                    && typeEligible(l, links, linkCounts, cellType, phase2,
+                                    params.maxValence)) {
                     splitFlags[gid] = 0u;
                     return;
                 }
@@ -1484,10 +1696,16 @@ enum Shaders {
     // Race-freedom: claimants (decide pass) are pairwise at ring-distance >= 3,
     // so their write sets (own ring, daughter slot, one slot per B-side
     // neighbour, one insertion per plane neighbour — plus the M5 chemical
-    // writes: own + daughter slot in nutrient/chemU/chemV) are disjoint. Reads
+    // writes: own + daughter slot in nutrient/chemU/chemV, the V2.2 pulse
+    // write, and the V2.3 daughter TYPE write) are disjoint. Reads
     // in this kernel touch only cells within ring-distance 1, which no
     // claimant writes. The daughter slot is >= the step-start count, disjoint
     // from the positions integrateForces wrote into this same buffer.
+    // V2.3 additions to the write set: cellType[d] (the daughter inherits the
+    // parent's type — a FRESH slot, disjoint like the chemical writes) and
+    // one atomic increment of divisionCounter[0] per successful split (the
+    // phase clock; consumed by decide/foodStep of the NEXT step — encoder
+    // order makes that read see the completed increment).
     //
     // Ring handling preserves the CYCLIC CCW order (no re-sort): the ring is
     // walked in cyclic order rotated to start at the first plane link; the
@@ -1514,6 +1732,8 @@ enum Shaders {
     //   9 chemU (read parent, write daughter; M5 rde inheritance)
     //  10 chemV (read parent, write daughter; M5 rde inheritance)
     //  11 pulse (write; V2.2: parent + daughter flash at 1.0)
+    //  12 cellType (read parent, write daughter; V2.3 type inheritance)
+    //  13 divisionCounter (atomic add; V2.3 phase clock)
     kernel void divisionExecute(device float3* positions    [[buffer(0)]],
                                 device uint*   links        [[buffer(1)]],
                                 device uint*   linkCounts   [[buffer(2)]],
@@ -1526,6 +1746,8 @@ enum Shaders {
                                 device float*  chemU        [[buffer(9)]],
                                 device float*  chemV        [[buffer(10)]],
                                 device float*  pulse        [[buffer(11)]],
+                                device uint*   cellType     [[buffer(12)]],
+                                device atomic_uint* divisionCounter [[buffer(13)]],
                                 uint gid [[thread_position_in_grid]])
     {
         if (gid >= atomic_load_explicit(&cellCounter[0], memory_order_relaxed)) return;
@@ -1682,6 +1904,12 @@ enum Shaders {
         nutrient[gid] = 0.5f * nutrient[gid];
         chemU[d] = chemU[gid];
         chemV[d] = chemV[gid];
+        // V2.3: the daughter inherits the parent's TYPE (same write pattern
+        // as the chemical inheritance above: a fresh daughter slot, claims
+        // ring-distance >= 3 apart — write sets stay disjoint). Type is the
+        // cell's identity in the rule matrix: daughters continue their
+        // parent's role (stem stays stem, lamel stays lamel, ...).
+        cellType[d] = cellType[gid];
         // V2.2 mitosis pulse: both cells flash at FULL pulse on the step of
         // the division (pulseDecayStep next step starts the decay). Write
         // sets stay disjoint — claims are ring-distance >= 3 apart and the
@@ -1718,6 +1946,11 @@ enum Shaders {
         insertIntoRing(links, linkCounts, plane2, (uint)p2At, d, params.maxValence);
 
         splitFlags[gid] = 1u;   // success: finalizeFood halves the parent's food
+        // V2.3 phase clock: one increment per EXECUTED division. decide and
+        // foodStep of the NEXT command buffer read this (encoder order);
+        // phase 2 begins at the first step boundary after the count reaches
+        // params.phaseSwitchX.
+        atomic_fetch_add_explicit(&divisionCounter[0], 1u, memory_order_relaxed);
     }
 
     // ---- cell division, pass 3: parent food reset ----

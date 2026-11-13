@@ -21,8 +21,17 @@ struct SimPreset {
     let jitter: Float
     /// Full SimParams bundle.
     let params: SimParams
+    /// V2.3: reset-time polar typing knobs (nil = no typing — all cells stay
+    /// type 0, the historical behaviour). Types are per-cell STATE assigned
+    /// at reset by CellSim.applyPolarTypes, NOT SimParams — the axis and the
+    /// stem/cap thresholds are the reset-time knobs (like subdivision/jitter).
+    var typeAxis: SIMD3<Float>? = nil
+    /// s < typeT1 -> stem (type 1).
+    var typeT1: Float = -0.35
+    /// s > typeT2 -> cap (type 4); the lamel/dal band sits between.
+    var typeT2: Float = 0.30
 
-    static let all: [SimPreset] = [ball, brain, plant, coral, degenerateDemo]
+    static let all: [SimPreset] = [ball, brain, plant, coral, degenerateDemo, paddenstoel]
 
     static func named(_ name: String) -> SimPreset? {
         all.first { $0.name == name }
@@ -106,4 +115,39 @@ struct SimPreset {
             foodIncrement: 0.01, splitThreshold: 1.0, divisionEnabled: 1,
             roi: 1.6, repulsionStrength: 0,
             growthMode: 0))
+
+    /// V2.3 "paddenstoel" (mushroom): the two-phase typed-growth showcase.
+    /// Vertical type axis; stem = s < -0.4 (the bottom), cap = s > 0.9 (a
+    /// small top patch that grows into the dome), the lamel/dal band between
+    /// them (the future gill collar). Phase 1: the cap grows uniformly
+    /// (exponential dome inflation from the small patch) and the stem only
+    /// at its band edge (stalk elongation); the band itself is dormant.
+    /// Phase 2 (after phaseSwitchX = 2700 executed divisions, ~t=1050 at
+    /// subdiv 3): ONLY the band grows — lamel at lamelRate 0.5 at its edge
+    /// links (neighbours in the stem or cap), dal at half that (0.25),
+    /// lamel<->dal interior links at lamelRate/10 (0.05) — the gill collar
+    /// ruffles out at the stem/cap junction while the cap and stem freeze.
+    /// Tuned by screenshot sweep (probe_A..probe_E, V2.3 report): the cap
+    /// patch must start SMALL (t2 high) or its exponential phase-1 growth
+    /// swamps the form (probe_t400); the phase-2 rates must sit below the
+    /// phase-1 cap rate or the collar swamps the stem (probe_A/probe_E).
+    /// Foam rendering + --tint type (or type-pulse) recommended
+    /// (--radius-scale 0.7). Every value documented here is a tuned choice
+    /// where the paper is silent (the paper has no cell types — this is the
+    /// user's head idea).
+    static let paddenstoel = SimPreset(
+        name: "paddenstoel",
+        summary: "Two-phase typed growth — stem + cap + lamel/dal gill band (mushroom; foam + tint type recommended)",
+        subdivision: 3,
+        jitter: 0.25,
+        params: SimParams(
+            springFactor: 1.0 / 3.0, planarFactor: 1.0 / 3.0, bulgeFactor: 1.0 / 3.0,
+            foodIncrement: 0.01, splitThreshold: 1.0, divisionEnabled: 1,
+            roi: 1.6, repulsionStrength: 0.1,
+            growthMode: 0,
+            lamelRate: 0.5, dalRate: 0.25, interiorDivider: 10.0,
+            phaseSwitchX: 2700),
+        typeAxis: SIMD3<Float>(0, 1, 0),
+        typeT1: -0.4,
+        typeT2: 0.9)
 }

@@ -88,7 +88,11 @@ walls + curved caps, translucent composite) and `--radius-scale F` (render
 radius scale; foam recommends 0.7 — at 0.5 neighbours merely touch and walls
 degenerate to points; foam look knobs via env CG_FOAM_OPACITY/CG_FOAM_LAYERS/
 CG_FOAM_WALL). The V2.1 `--edges`/`--edge-width` flags are RETIRED (painted
-edge layer removed in V2.1b).
+edge layer removed in V2.1b). V2.3: `--type-poles "x,y,z"` (polar cell-type
+typing axis; default vertical), `--type-t1 F`, `--type-t2 F` (stem/cap
+thresholds; between them the lamel/dal band), `--phase-x N` (division
+counter switching to phase 2; 0 = never), `--tint type|type-pulse` (type
+colours: stem white, lamel warm white, dal cool white, cap red).
 
 Scratch-artefact policy: screenshots, test renders and debug dumps go under
 `/private/tmp/opencode/cellulargrowth/` (pre-approved scratch) — NOT generic

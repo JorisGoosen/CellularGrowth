@@ -107,16 +107,21 @@ final class SimViewModel: ObservableObject, ViewInput {
     @Published var rdeGain: Double = 2.5 {
         didSet { sim.params.rdeGain = Float(rdeGain); sim.syncParams() }
     }
-    // --- V2.2 tint modes (cellTint kernel; feeds BOTH render paths and thus
-    // the coloured X-ray) ---
+    // --- V2.2/V2.3 tint modes (cellTint kernel; feeds BOTH render paths and
+    // thus the coloured X-ray) ---
     enum TintMode: Int, CaseIterable, Identifiable {
         case auto = 0       // chemical iff rde mode (the pre-V2.2 behaviour)
         case none = 1       // neutral albedo
         case chemical = 2   // rde u/v mapping in every growth mode
         case food = 3       // food/nutrient heatmap
         case pulse = 4      // magenta division-pulse flashes over the base tint
+        case type = 5       // V2.3 type colours (stem/lamel/dal/cap)
+        case typePulse = 6  // V2.3 type colours + the mitosis-pulse overlay
         var id: Int { rawValue }
-        var label: String { ["Default", "None", "Chemical", "Food heat", "Mitosis pulse"][rawValue] }
+        var label: String {
+            ["Default", "None", "Chemical", "Food heat", "Mitosis pulse",
+             "Type", "Type + pulse"][rawValue]
+        }
     }
     @Published var tintMode: TintMode = .auto {
         didSet { sim.params.tintMode = UInt32(tintMode.rawValue); sim.syncParams() }
@@ -134,6 +139,52 @@ final class SimViewModel: ObservableObject, ViewInput {
     }
     @Published var jitter: Double = 0.2          // applied on reset
     @Published var subdivision: Double = 3       // applied on reset
+
+    // --- V2.3 type layout (phase-0 polar typing + the two-phase switch) ---
+    /// Type axis components (normalized at apply). Dragging any typing knob
+    /// re-types the LIVE cells immediately (the GUI "re-type command");
+    /// reset() re-types the fresh ball when typing is on.
+    @Published var typingEnabled = false
+    @Published var typeAxisX: Double = 0 { didSet { applyTypingLive() } }
+    @Published var typeAxisY: Double = 1 { didSet { applyTypingLive() } }
+    @Published var typeAxisZ: Double = 0 { didSet { applyTypingLive() } }
+    /// s < typeT1 -> stem.
+    @Published var typeT1: Double = -0.35 { didSet { applyTypingLive() } }
+    /// s > typeT2 -> cap; the lamel/dal band sits between.
+    @Published var typeT2: Double = 0.30 { didSet { applyTypingLive() } }
+    /// Phase-2 switch (executed divisions; 0 = never).
+    @Published var phaseX: Double = 0 {
+        didSet { sim.params.phaseSwitchX = UInt32(max(Int(phaseX), 0)); sim.syncParams() }
+    }
+    /// Phase-2 band growth rates (see foodStep in Shaders.swift).
+    @Published var lamelRate: Double = 1.0 {
+        didSet { sim.params.lamelRate = Float(max(lamelRate, 0)); sim.syncParams() }
+    }
+    @Published var dalRate: Double = 0.5 {
+        didSet { sim.params.dalRate = Float(max(dalRate, 0)); sim.syncParams() }
+    }
+
+    /// V2.3: apply the current type layout to the live cells (the Re-type
+    /// button; also fired by the typing sliders). Re-bands the CURRENT
+    /// geometry — after growth the centroid/shape have moved, so this is a
+    /// re-typing of the grown form, not the original ball.
+    func retypeCells() {
+        let axis = SIMD3<Float>(Float(typeAxisX), Float(typeAxisY), Float(typeAxisZ))
+        guard simd_length(axis) > 1e-6 else {
+            statusMessage = "Type axis must be non-zero"
+            return
+        }
+        sim.applyPolarTypes(axis: axis, t1: Float(typeT1), t2: Float(typeT2))
+        statusMessage = String(format: "Types applied (t1 %.2f, t2 %.2f)", typeT1, typeT2)
+    }
+
+    /// Live re-type on slider drags — suppressed while a preset is being
+    /// applied (its slider writes would re-type the PREVIOUS geometry) and
+    /// while a state loads (types come from the file, not the sliders).
+    private func applyTypingLive() {
+        guard typingEnabled, !applyingPreset, !loadingState else { return }
+        retypeCells()
+    }
 
     // --- M6 render style (Solid = historical path; X-ray = additive impostor
     // density accumulation — the interactive approximation of the offline
@@ -218,6 +269,9 @@ final class SimViewModel: ObservableObject, ViewInput {
         sim.params.growthMode = UInt32(growthMode.rawValue)
         sim.syncParams()
         sim.reset(positions: positions, links: links)
+        // V2.3: re-type the fresh ball when typing is on (reset zeroed the
+        // types — typing is reset-time state).
+        if typingEnabled { retypeCells() }
         cellCount = positions.count
 
         let ballRadius = positions.map { simd_length($0) }.max() ?? 1
@@ -267,6 +321,20 @@ final class SimViewModel: ObservableObject, ViewInput {
         rdeDv = Double(p.rdeDv)
         rdeBase = Double(p.rdeBase)
         rdeGain = Double(p.rdeGain)
+        // V2.3: two-phase growth rates (SimParams) + the polar typing knobs
+        // (reset-time). Non-typed presets switch typing OFF (a previously
+        // selected typed preset must not re-type the next reset).
+        phaseX = Double(p.phaseSwitchX)
+        lamelRate = Double(p.lamelRate)
+        dalRate = Double(p.dalRate)
+        typingEnabled = (preset.typeAxis != nil)
+        if let ax = preset.typeAxis {
+            typeAxisX = Double(ax.x)
+            typeAxisY = Double(ax.y)
+            typeAxisZ = Double(ax.z)
+            typeT1 = Double(preset.typeT1)
+            typeT2 = Double(preset.typeT2)
+        }
         subdivision = Double(preset.subdivision)
         jitter = Double(preset.jitter)
         reset()
@@ -356,6 +424,10 @@ final class SimViewModel: ObservableObject, ViewInput {
         tintMode = TintMode(rawValue: Int(p.tintMode)) ?? .auto
         heatScale = Double(p.heatScale)
         pulseDecay = Double(p.pulseDecay)
+        // V2.3 two-phase growth params (the loaded state's own values).
+        phaseX = Double(p.phaseSwitchX)
+        lamelRate = Double(p.lamelRate)
+        dalRate = Double(p.dalRate)
         cellCount = sim.cellCount
         // Re-frame the camera on the loaded structure.
         let ballRadius = sim.readPositions().map { simd_length($0) }.max() ?? 1
