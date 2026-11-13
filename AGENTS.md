@@ -191,6 +191,31 @@ files written from M6 onward are v3.
 12. A light-march skip map must be live during the post-scatter march —
     "self-cleaning" counters consumed by the scatter are zero before the march
     reads them (found in M6).
+13. Two GPU-dispatch perf traps that masquerade as measurement noise (found
+    in V2.5: the 655k bench was bimodal ~10 vs ~16 ms/step):
+    (a) NEVER `atomic_load` a single counter address per thread at full
+    dispatch width — same-address atomics serialize in the L2 atomic unit
+    (~5–7 cycles/op; ~2M ops = ms). Encoders are ordered within a command
+    buffer, so a plain `device const uint*` load is race-free and free
+    (every kernel's counter read already does this).
+    (b) NEVER run a heavy-bodied kernel (big register footprint: local
+    arrays, ear-clip/splice logic) at the full every-step dispatch width —
+    its STATICALLY PRESENT body alone collapses co-residency, turns the
+    dispatch launch-latency bound, and can inflate the whole step ~1.7×
+    even when not one thread executes the body. Bisect arms are the
+    diagnostic (delete body / shrink arrays / scalars-only). Fix shape:
+    hot kernel = guards + atomic queue append; narrow fixed-width kernel
+    strides over the queue and carries the heavy body (`deathExecute` /
+    `deathSplice`). Queue order is irrelevant when claims are pairwise
+    ring-distance ≥ 3 (disjoint neighbourhoods). Measure with
+    `CG_BENCH_BATCHES=1` (per-batch min/median) and interleaved A/B pairs
+    only — the absolute floor drifts with system load.
+14. Headless paths MUST use the seeded jitter (`growAndReport(...,
+    useSeededJitter: true)`): the `--headless` caller once omitted it, so
+    "identical" runs diverged from step 0 while the file header claimed all
+    headless jitter is seeded (found in V2.5 during the death-path
+    determinism chase). `--screenshot` unseeded is documented historical
+    behaviour; `--render` seeds.
 
 ## Validation gates (per milestone)
 

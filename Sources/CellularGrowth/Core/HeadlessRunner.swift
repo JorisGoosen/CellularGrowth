@@ -204,7 +204,7 @@ enum HeadlessRunner {
         /// above the ~20-step food climb of fed cells at the default light
         /// gate values, well below the hundreds of steps a shaded cell needs;
         /// see starvationStep in Shaders.swift).
-        var deathSteps = 100
+        var deathSteps = 250
     }
 
     private static func parseOptions() -> Options {
@@ -1509,7 +1509,16 @@ enum HeadlessRunner {
                 exit(1)
             }
         } else {
-            growAndReport(queue: queue, sim: sim, o: o)
+            // V2.5 fix: the headless path is DOCUMENTED as seeded (file
+            // header: "All headless jitter is seeded (deterministic runs)")
+            // but called growAndReport without useSeededJitter, so it ran the
+            // GUI's unseeded randomInBall — two identical --headless
+            // invocations started from different positions and diverged
+            // (found while validating the V2.5 death path: two-run state
+            // compares differed at step 0). --screenshot keeps its
+            // documented historical unseeded behaviour; --render was already
+            // seeded.
+            growAndReport(queue: queue, sim: sim, o: o, useSeededJitter: true)
         }
 
         // M5: --state-save now works in the headless path too (it was only
@@ -2005,14 +2014,31 @@ enum HeadlessRunner {
 
             let t0 = CFAbsoluteTimeGetCurrent()
             var gpuTime = 0.0
+            // CG_BENCH_SPLIT diagnostics (V2.5): the measured gpu window
+            // (gpuStartTime..gpuEndTime) spans the WHOLE batch — if the CPU
+            // cannot encode faster than the GPU executes, the GPU DRAINS the
+            // queue mid-batch and the window silently includes encoder-starve
+            // idle time. Splitting encode / wait wall time per batch exposes
+            // that: gpu-window >> gpu-busy means the number is CPU-bound and
+            // NOT a GPU cost. Gated by env (CG_FOAM_* precedent: bench A/B
+            // without a CLI contract change); default output is unchanged.
+            var encodeTime = 0.0
+            var waitTime = 0.0
+            var batchGpu: [Double] = []
             var done = 0
             while done < steps {
                 let batch = min(10, steps - done)
+                let tEnc0 = CFAbsoluteTimeGetCurrent()
                 guard let cb = queue.makeCommandBuffer() else { break }
                 for _ in 0..<batch { sim.step(cb) }
                 cb.commit()
+                encodeTime += CFAbsoluteTimeGetCurrent() - tEnc0
+                let tWait0 = CFAbsoluteTimeGetCurrent()
                 cb.waitUntilCompleted()
-                gpuTime += cb.gpuEndTime - cb.gpuStartTime
+                waitTime += CFAbsoluteTimeGetCurrent() - tWait0
+                let g = cb.gpuEndTime - cb.gpuStartTime
+                gpuTime += g
+                batchGpu.append(g / Double(batch) * 1000)
                 done += batch
             }
             let dt = CFAbsoluteTimeGetCurrent() - t0
@@ -2020,6 +2046,18 @@ enum HeadlessRunner {
             let cells = o.benchGrowth ? "\(initial) -> \(sim.cellCount)" : "\(initial)"
             print("\(cells) | \(String(format: "%.3f", dt / Double(steps) * 1000)) | \(String(format: "%.3f", gpuTime / Double(steps) * 1000)) | \(String(format: "%.0f", Double(steps) / dt))")
             print("   \(sim.gridMemoryDescription())")
+            if ProcessInfo.processInfo.environment["CG_BENCH_BATCHES"] != nil {
+                // Per-batch gpu window (ms/step): exposure of GPU-scheduler
+                // interference from other GPU clients (WindowServer etc.).
+                // A level whose batches disagree by >2x is contention-tainted;
+                // the MIN batch is the best exclusive-GPU estimate.
+                let sorted = batchGpu.sorted()
+                let median = sorted[sorted.count / 2]
+                print("   batches: \(batchGpu.map { String(format: "%.3f", $0) }.joined(separator: " ")) | median \(String(format: "%.3f", median)) min \(String(format: "%.3f", sorted.first!))")
+            }
+            if ProcessInfo.processInfo.environment["CG_BENCH_SPLIT"] != nil {
+                print("   split: encode \(String(format: "%.3f", encodeTime / Double(steps) * 1000)) + wait \(String(format: "%.3f", waitTime / Double(steps) * 1000)) = wall \(String(format: "%.3f", (encodeTime + waitTime) / Double(steps) * 1000)) ms/step (gpu window \(String(format: "%.3f", gpuTime / Double(steps) * 1000)))")
+            }
         }
         exit(0)
     }
@@ -3225,7 +3263,7 @@ enum HeadlessRunner {
         if !vRiseFallOK || !deathsOK { allPass = false }
         // Restore the death-off defaults (the shared sim object).
         sim.params.deathEnabled = 0
-        sim.params.deathSteps = 100
+        sim.params.deathSteps = 250
         sim.syncParams()
 
         print(allPass ? "SELFTEST PASS" : "SELFTEST FAIL")

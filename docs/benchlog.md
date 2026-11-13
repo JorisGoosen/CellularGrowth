@@ -548,3 +548,153 @@ grid memory rows (T_max = 2^22 preallocated; live T per level):
    grid T=524288: binCounts 2097152B + binStarts 2097156B + particleIndices 655368B + collisionOffsets 2621472B = 7471148B
    grid T=2097152: binCounts 8388608B + binStarts 8388612B + particleIndices 2621448B + collisionOffsets 10485792B = 29884460B
 ```
+
+## V2.5 starvation death — 2026-11-13 — Apple M1 Pro
+
+Starvation death (the inverse of division, paper §8): a cell whose food
+ledger stays below `deathThreshold` for `deathSteps` consecutive steps dies;
+the ring is re-spliced Euler-exactly; dead slots stay allocated. The bench
+work below started as an open item from the interrupted first V2.5 session:
+the 655k forces-only bench was BIMODAL with death armed (~10 vs ~16 ms/step,
+interleaved, unexplained). Full investigation record:
+
+### 1. The bimodality — what it was and was not
+
+- NOT the death kernels' executed work: with `--death-steps 1000000` no
+  death can execute within the window, the decide pass early-returns per
+  cell, and the arm still measured 15–20 ms/step.
+- NOT food-init randomness (hypothesis (a) of the interrupted session): the
+  GPU food init is seeded via `rngSeed`; and with the death window huge, the
+  starving set cannot change any executed work anyway.
+- NOT CPU encode starvation: `CG_BENCH_SPLIT=1` measured encode at
+  0.013–0.016 ms/step at every level — the gpu window (gpuStartTime..
+  gpuEndTime) itself stretched.
+- NOT the footprint: `--max-cells 700000` (buffers ~175 MB instead of
+  ~500 MB) changed nothing measurable.
+- REAL, code-linked (bisect arms, one variable at a time): deleting the
+  splice body from `deathExecute` returned the arm to baseline (10.8);
+  keeping the body with every per-thread array shrunk to 4 entries was
+  STILL slow; a scalar-only body was fast. The statically present splice
+  body (ring staging + ear clipping + ring rewrites) alone cost ~+7 ms/step
+  at 655k cells — the heavy register footprint collapses co-residency, the
+  ~20k threadgroups of a full-width dispatch turn launch-latency bound, GPU
+  utilization sags and the whole step inflates ~1.7x. The in-run RATCHET
+  (batches 10.9 → 13.9 → 17.7, never recovering within a level) and the
+  rare fully-fast runs (1 of ~16) are the DVFS interplay on top; transient
+  system-wide windows (even the baseline hit 34–37 ms/step for a few
+  minutes — the machine ran with 4.2 GB swap in use, Firefox/Slack/editor
+  resident) add the wide spread the first session saw.
+- FIX: hot/splice split. `deathExecute` is now guards + claim QUEUEING
+  (atomic append); the ear-clip machinery lives in `deathSplice` at a fixed
+  narrow width (16 384 threads, whole threadgroups) striding over the
+  queue. Queue order is nondeterministic but provably irrelevant: claims
+  are pairwise ring-distance >= 3 (decide's independent set), so splices
+  touch disjoint neighbourhoods. Verified EMPIRICALLY: two identical seeded
+  runs produce BYTE-IDENTICAL CGST v3 states (201 = 201 deaths).
+
+### 2. Determinism chase (side findings, two real bugs)
+
+- `--headless` ran the GUI's UNSEEDED jitter (`SimViewModel.randomInBall`)
+  although the file header documents "All headless jitter is seeded" —
+  two identical headless invocations started from different positions
+  (states differed at step 0). FIXED in V2.5 (headless now uses
+  `seededJitter`; `--screenshot` keeps its documented historical unseeded
+  behaviour; `--render` was already seeded). This also explains the first
+  session's 218-vs-208 death-count mismatch between "identical" runs.
+- Grid-scatter arrival order (per-bin atomic placement) makes repulsion
+  sums float-order-nondeterministic: with the seed fix, death counts now
+  match run-to-run (209 = 209) but positions still differ at ulp level in
+  single components. Pre-existing, absorbed by the lockstep (1e-6 mean) and
+  golden (pixel-tolerance) gates; death sets are stable.
+- Division-ON runs remain macroscopically nondeterministic (9296 vs 9298
+  cells after 500 steps): daughter slots come from an atomic fetch_add
+  race, and both division's and death's min-index tie-breaking is
+  index-sensitive. Pre-existing M2 design, NOT a V2.5 regression; the
+  paper does not require bit-reproducibility of slot indices. Follow-up if
+  reproducible growth runs are ever needed: deterministic slot handout
+  (e.g. claim-index-ordered allocation).
+
+### 3. Death-block cost arm (forces-only, division OFF, death armed with
+`--death-steps 1000000` — starvation + decide + queue pass run every step,
+no deaths execute; the delta vs the unarmed baseline is the block cost at
+matched counts). Two interleaved A/B sweep pairs, same session/binary
+(run1/run2):
+
+| cells | baseline gpu ms/step (run1/run2) | death-armed gpu ms/step (run1/run2) |
+|---|---|---|
+| 2 562 | 0.287 / 0.265 | 0.297 / 0.251 |
+| 10 242 | 0.309 / 0.285 | 0.406 / 0.399 |
+| 40 962 | 0.941 / 0.943 | 1.076 / 1.084 |
+| 163 842 | 3.175 / 3.173 | 3.454 / 3.459 |
+| 655 362 | 12.697 / 12.776 | 13.231 / 13.253 |
+
+Delta at the stable levels: +0.11 (10 242), +0.14 (40 962), +0.29
+(163 842), +0.48 (655 362) ms/step = +3.7% at the top level. The model
+fits: a ~0.1 ms fixed launch floor (4 extra compute encoders + 1 blit per
+step) plus linear traffic (starving read/write + claims write + claims
+read + the second tint pass ~ 34 B/cell ≈ 22 MB/step at 655k ≈ 0.4 ms at
+effective DRAM bandwidth). Re-tint pass ≈ 0.2 ms of the top-level delta
+(bisect).
+
+### 4. Measurement protocol (applied above; use for future cost arms)
+
+- Run cost arms as INTERLEAVED A/B pairs (off/death alternating), never as
+  isolated sweeps — the absolute floor drifted 10.5 → 12.8 ms/step at 655k
+  across this session with system load; only deltas are meaningful.
+- `CG_BENCH_BATCHES=1` prints every batch's gpu window + median/min: a
+  level whose batches disagree by >2x is contention-tainted (ratchet or
+  external interference); prefer the min batch as the exclusive-GPU
+  estimate and re-run.
+- `CG_BENCH_SPLIT=1` prints encode/wait/gpu-window per level: encode
+  ~0.015 ms/step always; wait >> gpu-window would mean CPU starvation
+  (never observed); gpu-window >> fast-mode gpu-window means scheduler
+  interference, not kernel cost.
+
+Baseline forces-only sweep (division off), full prescribed columns
+(death-armed sweep = the table above):
+
+| cells | ms/step cpu | ms/step gpu | steps/s |
+|---|---|---|---|
+| 2 562 | 0.301 | 0.265 | 3321 |
+| 10 242 | 0.320 | 0.285 | 3122 |
+| 40 962 | 0.985 | 0.943 | 1015 |
+| 163 842 | 3.228 | 3.173 | 310 |
+| 655 362 | 12.826 | 12.776 | 78 |
+
+Death-armed (window 1e6 — the block cost arm):
+
+| cells | ms/step cpu | ms/step gpu | steps/s |
+|---|---|---|---|
+| 2 562 | 0.295 | 0.251 | 3390 |
+| 10 242 | 0.443 | 0.399 | 2256 |
+| 40 962 | 1.132 | 1.084 | 884 |
+| 163 842 | 3.512 | 3.459 | 285 |
+| 655 362 | 13.310 | 13.253 | 75 |
+
+grid memory rows (T_max = 2^22 preallocated; live T per level; identical
+for both arms — the death buffers add 8 B/cell + one 4 B counter, all
+preallocated at maxCells):
+
+```
+   grid T=8192: binCounts 32768B + binStarts 32772B + particleIndices 10248B + collisionOffsets 40992B = 116780B
+   grid T=32768: binCounts 131072B + binStarts 131076B + particleIndices 40968B + collisionOffsets 163872B = 466988B
+   grid T=131072: binCounts 524288B + binStarts 524292B + particleIndices 163848B + collisionOffsets 655392B = 1867820B
+   grid T=524288: binCounts 2097152B + binStarts 2097156B + particleIndices 655368B + collisionOffsets 2621472B = 7471148B
+   grid T=2097152: binCounts 8388608B + binStarts 8388612B + particleIndices 2621448B + collisionOffsets 10485792B = 29884460B
+```
+
+### 5. Follow-ups surfaced by this investigation
+
+- `divisionExecute` still carries the same-shape risks at full width: a
+  same-address `atomic_load` guard (plus a second one mislabelled "plain
+  load" in the capacity pre-check) and the heavy inline splice body. In the
+  M5/V2.4 growth benches the division block costs ~+12–14 ms/step at 655k
+  over forces-only; part of that may be the same occupancy/launch-latency
+  effect. NOT touched in V2.5 (M2 core; needs its own validation cycle) —
+  the hot/splice split pattern is proven now and transfers directly.
+- `boundMax` does a same-address `atomic_fetch_max` at full width (light
+  mode, every `lightInterval` steps) — same atomic class, ~1% amortized at
+  655k against the march's cost; a two-stage reduction would remove it.
+- Dead-slot compaction (reindex + swap-removal with ring rewrite) — the
+  documented fragmentation trade-off, still open.
+- GUI death sliders (death parameters are CLI/preset-side for now).

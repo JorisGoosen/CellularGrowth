@@ -8,7 +8,7 @@ including the `bulgeDist` typo analysis) lives in
 [`docs/reference/lomas_cellular_forms_extraction.md`](docs/reference/lomas_cellular_forms_extraction.md),
 with page screenshots in `docs/reference/pages/`.
 
-## Status — V2.4 complete: the differentiation phase (RDE typing + hysteresis)
+## Status — V2.5 complete: starvation death — cell pruning, the inverse of division
 
 **M1–M6 base** (details in git history / docs/benchlog.md): over-damped
 spring/planar/bulge forces (paper §4, Fig. 3); food + cell division with
@@ -135,6 +135,59 @@ is a documented design where the paper is silent):
   growth ≫ stem) PASS, `--diff-probe` PASS (pattern R², mixed types,
   flip-settle, type map PNG), `--lockstep` PASS, 14/14 goldens byte-PASS,
   differentiation-pass bench ~2–3% at 655k cells (benchlog V2.4).
+
+V2.5 additions — **starvation death** (cell pruning; paper §8 names it as
+the inverse of division — "cell death as well as cell growth, with
+appropriate topological changes to the surface when cells die"; the death
+RULE below is a documented design where the paper is silent):
+- **The rule** (`--death`, `--death-threshold F`, `--death-steps N`): a cell
+  whose accumulated FOOD ledger stays below `deathThreshold` for
+  `deathSteps` CONSECUTIVE steps dies. `0` = never. The signal is the food
+  LEDGER (not food + nutrient: the nutrient steady state dwarfs the food
+  scale and would read "fed" everywhere). The window is a GROWTH-RATE
+  detector: a fed cell re-crosses the threshold long before the window
+  closes, a shaded cell (drive ≈ `--light-base`) cannot — so the pruning
+  front sits at the shade iso-line where the climb time crosses the window.
+  `deathThreshold` defaults to `splitThreshold`: a cell starves while it
+  cannot reach its own division threshold fast enough.
+- **The splice is Euler-exact** (dV−1, dE−3, dF−2): removing a valence-k
+  vertex leaves a k-gon hole bounded by the dying cell's ring cycle; it is
+  closed WITHOUT new vertices by balanced EAR-CLIPPING (k−3 shortest-local
+  diagonals, picked under valence caps + chord checks — a fan from one pivot
+  was tried first and deadlocked: sustained pruning piled valence onto
+  pivot cells up to `maxValence`, where they hoard food and block every
+  higher-indexed candidate forever). Claims form the SAME ring-distance-2
+  independent set as division (min index wins) — splices touch disjoint
+  neighbourhoods, so claim order is irrelevant. Guards: every ring
+  neighbour must have valence ≥ 4; a valence-3 death is the native
+  zero-clip case; a chord-blocked hole defers the death (the cell keeps
+  starving and retries — all-or-defer, no partial state).
+- **Dead slots stay allocated** (`liveCount = cellCount − deathCount`; the
+  counter is an allocation high-water mark): a death sets `deadFlags`,
+  zeroes radius/links/starving, and every consumer skips dead slots
+  (grid, repulsion, march, typing, render — radius 0 = zero-area impostor).
+  Buffer fragmentation is the documented trade-off; compaction is a
+  follow-up.
+- **HOT/SPLICE SPLIT (V2.5 perf finding)**: the splice kernel's statically
+  present body alone cost ~+7 ms/step at 655k cells even when not one
+  thread executed it (bench bimodality investigation: body deleted →
+  baseline speed; every array shrunk → still slow) — the heavy register
+  footprint collapses co-residency and the full-width dispatch becomes
+  launch-latency bound (see benchlog V2.5). deathExecute is now guards +
+  claim QUEUEING only; the ear-clip machinery lives in `deathSplice` at a
+  fixed narrow width striding over the queue. Queue order is
+  nondeterministic but provably irrelevant (disjoint neighbourhoods) —
+  verified: two identical seeded runs produce BYTE-IDENTICAL states.
+- **State**: CGST v3 persists the death state (deadFlags + starving +
+  deathCounter) — a loaded death-era state resumes with its dead slots
+  (round-trip byte-identical).
+- **Validation**: `--selftest` 7 phases (new phase G: light-grown run with
+  death — V rises then FALLS, 168k deaths, all invariants hold on the LIVE
+  surface with V = live cells) PASS, `--lockstep` PASS, 14/14 goldens
+  PASS, CGST v3 death round-trip byte-identical, seeded two-run state
+  compares byte-identical (death path deterministic), prune-demo
+  before/after screenshots inspected (coral-crown pruning from below),
+  death-block bench +0.5 ms/step ≈ +3.7% at 655k cells (benchlog V2.5).
 
 V2.1b additions — **foam rendering** (`--style foam`, `--style foam-xray`):
 - Each cell renders as its **power-diagram chamber**:
@@ -311,11 +364,19 @@ coordinate; between them the lamel/dal band; defaults −0.4 / 0.9),
 `--tint type|type-pulse` (type colours: stem white, lamel warm white, dal
 cool white, cap red; type-pulse adds the mitosis-pulse overlay),
 `--lamel-rate F` / `--dal-rate F` / `--interior-divider F` (phase-2 band
-growth rates, defaults 1.0 / 0.5 / 10). Diagnostic:
+growth rates, defaults 1.0 / 0.5 / 10). V2.5: `--death` (starvation death
+on), `--death-threshold F` (default = splitThreshold), `--death-steps N`
+(consecutive starving steps before death, default 250; 0 = never),
+`--tint starve` (the red death front — blend weight = starving counter
+progress toward the window). Diagnostic:
 `--div-stop N` (disable division after step N); env `CG_NO_COARSE_SKIP=1`
 disables the light-march occupancy skip (A/B kill switch); env
 `CG_SHADOW_SAMPLES=N` overrides the 4 default shadow rays per pixel (bench
-knob — goldens record 4).
+knob — goldens record 4). Bench diagnostics (V2.5): env `CG_BENCH_SPLIT=1`
+prints per-level encode/wait/gpu-window split (exposes GPU-scheduler
+interference), `CG_BENCH_BATCHES=1` prints every batch's gpu window +
+median/min (a level whose batches disagree by >2x is contention-tainted;
+the min batch is the best exclusive-GPU estimate).
 
 ```bash
 # M4: ray-traced renders of the grown state (paper Fig. 8 / Fig. 9 styles)
@@ -328,13 +389,16 @@ swift run -c release CellularGrowth --render xray.png --style xray \
 ## Controls
 
 Drag to orbit, scroll/pinch to zoom. Panel: preset dropdown (ball / brain /
-plant / coral / degenerate-demo / paddenstoel), Solid/X-ray/Foam render-style
-switch (+ X-ray gain, foam opacity + the foam radius-scale hint), tint picker
-(Default/None/Chemical/Food heat/Mitosis pulse/Type/Type + pulse), Save
-State…/Load State…, growth mode + light/RDE parameter groups, the V2.3 Type
-layout group (polar typing toggle + axis/threshold sliders — dragging a knob
-re-types the LIVE cells, Re-type button, phase switch X, lamel/dal rates),
-repulsion, forces, run controls. Jitter and subdivision apply on Reset.
+plant / coral / degenerate-demo / paddenstoel / prune-demo), Solid/X-ray/Foam
+render-style switch (+ X-ray gain, foam opacity + the foam radius-scale
+hint), tint picker
+(Default/None/Chemical/Food heat/Mitosis pulse/Type/Type + pulse/Starving),
+Save State…/Load State…, growth mode + light/RDE parameter groups, the V2.3
+Type layout group (polar typing toggle + axis/threshold sliders — dragging a
+knob re-types the LIVE cells, Re-type button, phase switch X, lamel/dal
+rates), repulsion, forces, run controls. Jitter and subdivision apply on
+Reset. (Death parameters are CLI/preset-side: pick the `prune-demo` preset or
+pass `--death`; the GUI exposes the Starving tint but no death sliders yet.)
 
 ## Roadmap
 
@@ -351,3 +415,4 @@ repulsion, forces, run controls. Jitter and subdivision apply on Reset.
 | V2.1b ✅ | foam rendering: cells as power-diagram chambers (flat power-bisector walls + curved caps), translucent front-to-back composite ("walls behind walls") in the ray tracer (`--style foam`) and the interactive impostors (sorted premultiplied blend); foam X-ray with wall-crossing membranes (`--style foam-xray`); painted edge layer RETIRED (`--edges`/`--edge-width` removed, v21-solid-edges golden retired) | `--selftest` 4 phases, `--lockstep`, 11/11 surviving goldens byte-PASS, 3 new foam goldens capture+check, cross-renderer consistency (impostor-foam vs ray-foam same state), 0.5-vs-0.7 radius-scale mechanism demo (walls degenerate at 0.5), foam cost bench (ray foam 3.6–5.3× solid, impostor ≈ solid + one-off sort) |
 | V2.3 ✅ | cell types + two-phase growth: `cellType` buffer (0 none = all existing behaviour, 1 stem, 2 lamel, 3 dal, 4 cap), phase-0 polar typing (`--type-poles/--type-t1/--type-t2`, one cyclic azimuthal walk for the lamel/dal band), type-dependent division rule matrix with a device-side phase switch (`--phase-x`): phase 1 stem edge-only + cap uniform + band dormant, phase 2 band-only (lamel/dal/interior rates); daughters inherit type; CGST v3 persists types + division counter; type colours (`--tint type|type-pulse`); preset `paddenstoel` (mushroom) | `--selftest` 5 phases (new phase E: typed run, Σ per-type = V, phase-1 freezes voeg / phase-2 freezes stem+cap, transition exactly once), `--lockstep`, 14/14 goldens byte-PASS, typed state round-trip (types + phase clock persisted), phase-2 pulse-in-the-band validation (per-type pulse means: lamel/dal > 0, stem/cap 0.000), decide/foodStep type-check bench ~nil at matched counts (benchlog V2.3), blocker-predicate fix documented (eligible-set independent set) |
 | V2.4 ✅ | the differentiation phase: division frozen (`--differentiate-at N [--differentiate-until M]`, GUI "Differentiate now"), RDE keeps stepping, new `typeTransition` kernel (division-block slot, race-free) types undifferentiated cells from the chemical field (`--type-cap-v` 0.30 → cap, `--type-stem-v` 0.10 → stem, dead band stays 0); hysteresis = type memory (typed cells ignore the RDE: rdeStep freezes their u/v — no reaction participation, patterns cannot flicker, a cell's type changes at most once); rule-matrix MODE `--type-mode band\|region` (region: every type divides uniformly in its region — patterned growth via the frozen-v food coupling; band: the V2.3 matrix; type-0 contract both modes); differentiationPhase persists in CGST v3 raw params (mid-phase states resume in the phase); GUI button + threshold sliders | `--selftest` 6 phases (new phase F: static RDE settle → differentiation with division enabled-but-frozen (cells/divisions constant) → 0/V → mixed partition, flip stream settles ≈ 0 (gate ≤ 0.5% V/window), type memory (only 0→1/0→4 ever), regional growth resumes: cap per-capita ×94.9 vs stem ×6.14) PASS, `--diff-probe` PASS (pattern R² 0.68, stem 32.5%/cap 27.6%, flips 1439-burst → 0–4/window tail, type map PNG), `--lockstep` PASS, 14/14 goldens byte-PASS (typing off by default), mid-diff state round-trip resumes DIFFERENTIATING, differentiation-pass bench ~2–3% at 655k cells / regional-vs-uniform growth bench count-confounded as designed (benchlog V2.4) |
+| V2.5 ✅ | starvation death — the inverse of division (paper §8): a cell below `--death-threshold` for `--death-steps` consecutive steps dies (food-LEDGER signal; the window is a growth-rate detector — the pruning front sits at the shade iso-line); Euler-exact ring splice (dV−1, dE−3, dF−2) via balanced ear-clipping under valence caps + chord checks (the fan design deadlocked on valence-hoarding pivots — documented); claims = the division independent-set rule (order-irrelevant, verified byte-identical); dead slots stay allocated (`liveCount = cellCount − deathCount`), every consumer skips them; CGST v3 persists the death state; `--tint starve` death front; preset `prune-demo` (coral-crown self-pruning); HOT/SPLICE split (guards+queue vs narrow-width splice) after the bench bimodality investigation | `--selftest` 7 phases (new phase G: grown run with death — V rises then falls, 168k deaths, invariants on the LIVE surface) PASS, `--lockstep` PASS, 14/14 goldens PASS, CGST v3 death round-trip byte-identical, seeded two-run state compares byte-identical, prune-demo before/after screenshots inspected, death-block bench +0.5 ms/step ≈ +3.7% at 655k cells, headless jitter seeding bug fixed (benchlog V2.5) |

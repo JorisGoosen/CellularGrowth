@@ -241,7 +241,7 @@ struct SimParams {
     /// puts the pruning front at nutrient ~0.25 (deep shade); window 80 was
     /// measured to prune at nutrient ~1.1 — half the form (too aggressive;
     /// the death rate then crumples the mesh and division jams).
-    var deathSteps: UInt32 = 100
+    var deathSteps: UInt32 = 250
 }
 
 enum ShaderError: Error {
@@ -278,6 +278,13 @@ final class CellSim {
     /// Recomputed/cleared every step (a deferred death retries), unlike
     /// splitFlags which persist until the next decide.
     private let deathClaimsBuffer: MTLBuffer
+    /// V2.5 claim queue (UInt32 per cell slot): deathExecute appends queued
+    /// claimants, deathSplice drains them at a fixed narrow width. Per-step
+    /// scratch — the count is blit-cleared at the top of the death block,
+    /// and nothing here is persisted (CGST v3 stores the death STATE, not
+    /// the queue).
+    private let deathQueueBuffer: MTLBuffer
+    private let deathQueueCountBuffer: MTLBuffer
     let counterBuffer: MTLBuffer            // UInt32: authoritative live cell count
     let radiiBuffer: MTLBuffer              // Float per cell (read by the renderer)
     let paramsBuffer: MTLBuffer             // SimParams mirror (read by the M4 ray renderer for roi + hash bits)
@@ -427,6 +434,7 @@ final class CellSim {
     private var pStarvationStep: MTLComputePipelineState!
     private var pDeathDecide: MTLComputePipelineState!
     private var pDeathExecute: MTLComputePipelineState!
+    private var pDeathSplice: MTLComputePipelineState!
     // TEMPORARY DEBUG (CELLDBG; remove after M3 gates are green):
     private var pParamEcho: MTLComputePipelineState!
     private var pQueryFingerprint: MTLComputePipelineState!
@@ -475,6 +483,7 @@ final class CellSim {
             pStarvationStep = try pipeline("starvationStep")
             pDeathDecide = try pipeline("deathDecide")
             pDeathExecute = try pipeline("deathExecute")
+            pDeathSplice = try pipeline("deathSplice")
             // TEMPORARY DEBUG (CELLDBG; remove after M3 gates are green):
             pParamEcho = try pipeline("paramEcho")
             pQueryFingerprint = try pipeline("queryFingerprint")
@@ -513,6 +522,15 @@ final class CellSim {
         deathClaimsBuffer = device.makeBuffer(length: maxCells * MemoryLayout<UInt32>.stride,
                                               options: .storageModeShared)!
         deathClaimsBuffer.label = "deathClaims"
+        // V2.5: per-step claim queue (deathExecute appends, deathSplice
+        // drains). Scratch — never persisted; the count is blit-cleared at
+        // the top of each death block.
+        deathQueueBuffer = device.makeBuffer(length: maxCells * MemoryLayout<UInt32>.stride,
+                                             options: .storageModeShared)!
+        deathQueueBuffer.label = "deathQueue"
+        deathQueueCountBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride,
+                                                  options: .storageModeShared)!
+        deathQueueCountBuffer.label = "deathQueueCount"
         counterBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride,
                                           options: .storageModeShared)!
         counterBuffer.label = "cellCounter"
@@ -623,6 +641,8 @@ final class CellSim {
         memset(deadFlagsBuffer.contents(), 0, deadFlagsBuffer.length)
         memset(starvingBuffer.contents(), 0, starvingBuffer.length)
         memset(deathCounterBuffer.contents(), 0, deathCounterBuffer.length)
+        // V2.5: the claim queue is per-step scratch (count gates reads)
+        memset(deathQueueCountBuffer.contents(), 0, deathQueueCountBuffer.length)
         fillLitFraction(1.0, count: maxCells)   // neutral: no illumination verdict yet
         memset(occupancyBuffer.contents(), 0, occupancyBuffer.length)
     }
@@ -726,6 +746,8 @@ final class CellSim {
         memset(deadFlagsBuffer.contents(), 0, deadFlagsBuffer.length)
         memset(starvingBuffer.contents(), 0, starvingBuffer.length)
         memset(deathCounterBuffer.contents(), 0, deathCounterBuffer.length)
+        // V2.5: the claim queue is per-step scratch (count gates reads)
+        memset(deathQueueCountBuffer.contents(), 0, deathQueueCountBuffer.length)
         fillLitFraction(1.0, count: cellCount)   // neutral until the first light march
 
         guard let cb = queue.makeCommandBuffer() else { fatalError("no command buffer") }
@@ -807,9 +829,10 @@ final class CellSim {
     /// repulsionStrength > 0] -> [M5 chemical passes: boundMax + illuminate +
     /// clearBound + nutrientDiffuse (light mode) | rdeStep (rde mode)] ->
     /// [V2.2 pulseDecayStep] -> integrate -> food -> division (decide,
-    /// execute, finalize) -> [V2.5 death: starvationStep, deathDecide,
-    /// deathExecute (+ re-tint), when deathEnabled] -> [typeTransition +
-    /// cellTint (V2.4 differentiation phase)] -> radii.
+    /// execute, finalize) -> [V2.5 death: queue clear, starvationStep,
+    /// deathDecide, deathExecute (queue), deathSplice (+ re-tint), when
+    /// deathEnabled] -> [typeTransition + cellTint (V2.4 differentiation
+    /// phase)] -> radii.
     /// The pulse decay runs BEFORE the division block: a division this step
     /// flashes at pulse = 1.0 and the decay starts next step. cellTint runs
     /// after division so this step's daughters are tinted (M6). The death
@@ -915,9 +938,11 @@ final class CellSim {
         // is frozen there, so a cell frozen below the threshold starves
         // steadily — documented in the death-kernel block comment).
         if params.deathEnabled != 0 {
+            encodeDeathQueueClear(cb)   // per-step claim queue scratch
             encodeStarvationStep(cb, width: width)
             encodeDeathDecide(cb, width: width)
             encodeDeathExecute(cb, width: width)
+            encodeDeathSplice(cb)
             // Re-tint so the starve mode (tintMode 7) reflects this step's
             // counter updates; every other mode re-derives identical values
             // (the death block writes no tint input except starving).
@@ -1407,11 +1432,13 @@ final class CellSim {
 
     // MARK: V2.5 starvation death
 
-    /// The death block's three encoders (see the death-kernel block comment
-    /// in Shaders.swift): counter -> decide -> execute, all at the shared
-    /// dispatch width (decide and execute MUST share it — the claim-consumption
-    /// contract, same as division). Encoded only when deathEnabled != 0, so
-    /// death-off runs are untouched (goldens byte-identical).
+    /// The death block's encoders (see the death-kernel block comment
+    /// in Shaders.swift): a blit queue-clear, then counter -> decide ->
+    /// execute (queue append) -> splice, with decide/execute at the shared
+    /// dispatch width (the claim-contract pair, same as division) and the
+    /// splice at its own fixed narrow width. Encoded only when
+    /// deathEnabled != 0, so death-off runs are untouched (goldens
+    /// byte-identical).
     private func encodeStarvationStep(_ cb: MTLCommandBuffer, width: Int) {
         guard let enc = cb.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pStarvationStep)
@@ -1444,6 +1471,38 @@ final class CellSim {
     private func encodeDeathExecute(_ cb: MTLCommandBuffer, width: Int) {
         guard let enc = cb.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pDeathExecute)
+        enc.setBuffer(deathClaimsBuffer, offset: 0, index: 0)
+        enc.setBuffer(deathQueueBuffer, offset: 0, index: 1)
+        enc.setBuffer(deathQueueCountBuffer, offset: 0, index: 2)
+        enc.setBuffer(linkCountsBuffer, offset: 0, index: 3)
+        enc.setBuffer(counterBuffer, offset: 0, index: 4)
+        enc.setBuffer(paramsBuffer, offset: 0, index: 5)
+        enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    /// Per-step claim-queue clear (blit — no kernel): deathExecute appends
+    /// with an atomic fetch_add against this counter, so it must start the
+    /// step at zero.
+    private func encodeDeathQueueClear(_ cb: MTLCommandBuffer) {
+        guard let blit = cb.makeBlitCommandEncoder() else { return }
+        blit.fill(buffer: deathQueueCountBuffer,
+                  range: 0..<MemoryLayout<UInt32>.stride, value: 0)
+        blit.endEncoding()
+    }
+
+    /// The queued splice at a FIXED narrow width (the heavy ear-clip body
+    /// must stay off the full-width every-step dispatch — see the split
+    /// rationale in the shader's Mechanics comment). Threads stride over the
+    /// queue; the width is pre-rounded to whole threadgroups so the kernel's
+    /// stride (threadgroups_per_grid x threads_per_threadgroup) equals the
+    /// dispatch width exactly and coverage of 0..<queueCount is guaranteed
+    /// (queueCount <= liveCount <= maxCells).
+    private func encodeDeathSplice(_ cb: MTLCommandBuffer) {
+        let width = ((min(maxCells, 16_384) + 63) / 64) * 64
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pDeathSplice)
         enc.setBuffer(positionsBuffer, offset: 0, index: 0)    // ear-diagonal scoring
         enc.setBuffer(linksBuffer, offset: 0, index: 1)
         enc.setBuffer(linkCountsBuffer, offset: 0, index: 2)
@@ -1452,8 +1511,10 @@ final class CellSim {
         enc.setBuffer(starvingBuffer, offset: 0, index: 5)
         enc.setBuffer(radiiBuffer, offset: 0, index: 6)        // zeroed: the renderer's free skip
         enc.setBuffer(deathCounterBuffer, offset: 0, index: 7)
-        enc.setBuffer(counterBuffer, offset: 0, index: 8)
-        enc.setBuffer(paramsBuffer, offset: 0, index: 9)
+        enc.setBuffer(deathQueueBuffer, offset: 0, index: 8)
+        enc.setBuffer(deathQueueCountBuffer, offset: 0, index: 9)
+        enc.setBuffer(counterBuffer, offset: 0, index: 10)
+        enc.setBuffer(paramsBuffer, offset: 0, index: 11)
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         enc.endEncoding()
@@ -2185,6 +2246,9 @@ final class CellSim {
         copy(starving, to: starvingBuffer)
         deathCounterBuffer.contents().assumingMemoryBound(to: UInt32.self)[0] = deathCtr
         deathCount = Int(deathCtr)
+        // V2.5: the claim queue is per-step scratch — a loaded state starts
+        // with an empty queue.
+        deathQueueCountBuffer.contents().assumingMemoryBound(to: UInt32.self)[0] = 0
         counterBuffer.contents().assumingMemoryBound(to: UInt32.self)[0] = UInt32(cellCount)
         memset(boundBuffer.contents(), 0, boundBuffer.length)
         fillLitFraction(1.0, count: cellCount)   // neutral until encodeIlluminationRefresh

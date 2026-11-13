@@ -2089,8 +2089,12 @@ enum Shaders {
             daughterPos = P + (0.5f * params.linkRestLength) * (bis / bisLen);
         }
 
-        // Fast capacity pre-check (plain load, no RMW storm at the cap); the
-        // atomic below stays authoritative for the rare concurrent overrun.
+        // Capacity pre-check. NOT a plain load on purpose (the comment once
+        // claimed otherwise): this kernel also does atomic fetch_add/sub on
+        // cellCounter below, so a plain load would formally race with
+        // sibling threads' RMWs. The atomic load is the correct form; the
+        // pre-check just avoids the RMW storm at the cap (the atomic below
+        // stays authoritative for the rare concurrent overrun).
         if (atomic_load_explicit(&cellCounter[0], memory_order_relaxed) >= params.maxCells) {
             splitFlags[gid] = 0u;   // revoke the claim: nothing happened
             return;
@@ -2194,7 +2198,8 @@ enum Shaders {
     // ---- death as well as cell growth, with appropriate topological changes
     // ---- to the surface when cells die") -------------------------------
     //
-    // Three kernels, mirroring the division machinery (counter/decide/execute):
+    // Three pass FAMILIES, mirroring the division machinery
+    // (counter/decide/execute) plus a queued splice pass:
     //
     //   starvationStep — per-cell consecutive-starving counter. The signal is
     //     the accumulated FOOD LEDGER, compared against deathThreshold,
@@ -2234,7 +2239,11 @@ enum Shaders {
     //     persist until the next decide), deathClaims are RECOMPUTED and
     //     cleared every step: a deferred death (guards below) simply retries.
     //
-    //   deathExecute — the splice. Removing a valence-k vertex from a closed
+    //   deathExecute — the hot pass: guards + claim QUEUEING (the splice
+    //     moved to deathSplice — see the split rationale at the Mechanics
+    //     section). A queued claim is consumed exactly once this step.
+    //
+    //   deathSplice — the splice. Removing a valence-k vertex from a closed
     //     triangulated surface leaves a k-gon hole bounded by the dying
     //     cell's ring cycle (consecutive ring pairs are already edges — each
     //     was a face with the dying cell). Closing the hole WITHOUT new
@@ -2316,9 +2325,10 @@ enum Shaders {
     //     swap-removal with ring rewrite) is a follow-up, NOT in scope.
     //
     //     PIPELINE SLOT: the death block runs AFTER the division block (the
-    //     splice must read the topology division just rebuilt — decide and
-    //     execute are later encoders, so post-division rings are what they
-    //     see) and BEFORE typeTransition. It runs whenever deathEnabled,
+    //     splice must read the topology division just rebuilt — the queue
+    //     append and the splice are later encoders, so post-division rings
+    //     are what they see) and BEFORE typeTransition. It runs whenever
+    //     deathEnabled,
     //     INCLUDING during the differentiation phase: the phase freezes the
     //     DIVISION block, not death — food is frozen there, so a cell frozen
     //     below the threshold starves steadily (documented semantics; the
@@ -2410,54 +2420,100 @@ enum Shaders {
         deathClaims[gid] = 1u;
     }
 
-    // Mechanics (see the block comment above for the full splice derivation).
-    // All-or-defer: the clip sequence is pre-computed against simulated
-    // state; the first impossibility revokes the claim and leaves NO partial
-    // state behind (the division discipline).
+    // Mechanics — SPLIT INTO TWO KERNELS (found in the V2.5 bench
+    // bimodality investigation). The splice used to live inline in
+    // deathExecute at the FULL step dispatch width, and its statically
+    // present body alone (ring staging, ear clipping, ring rewrites) cost
+    // ~+7 ms/step at 655k cells even when not one thread executed it
+    // (bisect arms: body deleted -> baseline speed; every array shrunk to
+    // 4 entries -> still slow; scalar-only body -> fast). The heavy body
+    // collapses the kernel's register footprint: co-residency drops, the
+    // ~20k threadgroups of a full-width dispatch turn launch-latency
+    // bound, GPU utilization sags and the whole step inflates ~1.7x (the
+    // bench "slow mode" and its in-run ratchet — see the V2.5 benchlog
+    // entry). The fix keeps the hot path guards-only and moves the
+    // ear-clip machinery into deathSplice at a FIXED narrow width that
+    // strides over a claim queue. Queue ORDER is nondeterministic but
+    // IRRELEVANT: claims are pairwise ring-distance >= 3 (decide's
+    // independent set), so splices touch disjoint neighbourhoods and every
+    // processing order yields the same final state (the race argument
+    // verbatim). The queue is per-step scratch: deathQueueCount is blit-
+    // cleared at the top of the death block, and nothing persists it.
     //
-    // Buffer table:
-    //   0 positions (const; ear-diagonal length scoring)
-    //   1 links (read + write)        2 linkCounts (read + write)
-    //   3 deathClaims (read + write)  4 deadFlags (write)
-    //   5 starving (write: reset on death)
-    //   6 radii (write 0: the renderer's free dead-slot skip)
-    //   7 deathCounter (atomic add)   8 cellCounter (atomic load)   9 params
-    kernel void deathExecute(device const float3* positions [[buffer(0)]],
-                             device uint*  links      [[buffer(1)]],
-                             device uint*  linkCounts [[buffer(2)]],
-                             device uint*  deathClaims [[buffer(3)]],
-                             device uint*  deadFlags  [[buffer(4)]],
-                             device uint*  starving   [[buffer(5)]],
-                             device float* radii      [[buffer(6)]],
-                             device atomic_uint* deathCounter [[buffer(7)]],
-                             device atomic_uint* cellCounter [[buffer(8)]],
-                             constant SimParams& params [[buffer(9)]],
+    // All-or-defer is unchanged: the clip sequence is pre-computed against
+    // simulated state; the first impossibility revokes the claim and
+    // leaves NO partial state behind (the division discipline). A deferred
+    // death (no clip-able ear) leaves the cell starving — it retries next
+    // step (decide recomputes claims from scratch every step).
+    //
+    // Buffer table (deathExecute — hot pass, same width as deathDecide):
+    //   0 deathClaims (read; write 0 on the valence defer)
+    //   1 deathQueue (write: queued claimants)
+    //   2 deathQueueCount (atomic add)
+    //   3 linkCounts (const; the valence defer)
+    //   4 cellCounter (const — PLAIN load, see the split rationale)
+    //   5 params
+    kernel void deathExecute(device uint*  deathClaims [[buffer(0)]],
+                             device uint*  deathQueue [[buffer(1)]],
+                             device atomic_uint* deathQueueCount [[buffer(2)]],
+                             device const uint* linkCounts [[buffer(3)]],
+                             device const uint* cellCounter [[buffer(4)]],
+                             constant SimParams& params [[buffer(5)]],
                              uint gid [[thread_position_in_grid]])
     {
-        if (gid >= atomic_load_explicit(&cellCounter[0], memory_order_relaxed)) return;
+        // Plain counter load on purpose: encoders are ordered within the
+        // command buffer, so earlier encoders' counter writes are visible
+        // without atomics. A same-address atomic LOAD here would run once
+        // per thread (~2x the cell count) and serialize in the L2 atomic
+        // unit — measurable, pointless.
+        if (gid >= cellCounter[0]) return;
         if (deathClaims[gid] == 0u) return;
-
         uint n = linkCounts[gid];
-        if (n < 3u || n > kMaxValence) { deathClaims[gid] = 0u; return; }
-        uint base = gid * params.maxValence;
+        if (n < 3u || n > params.maxValence) { deathClaims[gid] = 0u; return; }
+        // Queue the claim. Claims <= liveCount <= maxCells, so the index is
+        // in range (the guard is belt and braces).
+        uint idx = atomic_fetch_add_explicit(&deathQueueCount[0], 1u, memory_order_relaxed);
+        if (idx >= params.maxCells) return;
+        deathQueue[idx] = gid;
+    }
+
+    // One victim's splice — the ear-clip mechanics verbatim (function form
+    // so the validation paths can return early inside deathSplice's strided
+    // queue loop). See the block comment above for the full derivation and
+    // the split rationale.
+    void spliceVictim(device const float3* positions,
+                      device uint*  links,
+                      device uint*  linkCounts,
+                      device uint*  deathClaims,
+                      device uint*  deadFlags,
+                      device uint*  starving,
+                      device float* radii,
+                      device atomic_uint* deathCounter,
+                      device const uint* cellCounter,
+                      constant SimParams& params,
+                      uint victim)
+    {
+        uint n = linkCounts[victim];
+        if (n < 3u || n > kMaxValence) { deathClaims[victim] = 0u; return; }
+        uint base = victim * params.maxValence;
 
         // Stage the dying cell's ring (the hole's boundary cycle, in cyclic
         // order) and validate it: no self/duplicate entries, every member
         // alive with valence >= 4 (the min-valence guard: vertices that end
         // up never-endpoints finish at val - 1; endpoints only gain).
         uint ring[kMaxValence];
-        uint count = atomic_load_explicit(&cellCounter[0], memory_order_relaxed);
+        uint count = cellCounter[0];
         for (uint k = 0; k < n; ++k) {
             uint j = links[base + k];
-            if (j == gid || j >= count || deadFlags[j] != 0u
+            if (j == victim || j >= count || deadFlags[j] != 0u
                 || linkCounts[j] < 4u || linkCounts[j] > kMaxValence) {
-                deathClaims[gid] = 0u; return;
+                deathClaims[victim] = 0u; return;
             }
             ring[k] = j;
         }
         for (uint a = 0; a < n; ++a) {
             for (uint b = a + 1; b < n; ++b) {
-                if (ring[a] == ring[b]) { deathClaims[gid] = 0u; return; }
+                if (ring[a] == ring[b]) { deathClaims[victim] = 0u; return; }
             }
         }
 
@@ -2465,8 +2521,8 @@ enum Shaders {
         // removal pass; read-only).
         uint slot[kMaxValence];
         for (uint k = 0; k < n; ++k) {
-            int s = findSlot(links, linkCounts, ring[k], gid, params.maxValence);
-            if (s < 0) { deathClaims[gid] = 0u; return; }   // asymmetric link
+            int s = findSlot(links, linkCounts, ring[k], victim, params.maxValence);
+            if (s < 0) { deathClaims[victim] = 0u; return; }   // asymmetric link
             slot[k] = (uint)s;
         }
 
@@ -2507,7 +2563,7 @@ enum Shaders {
                 float len = distance(float3(positions[ca]), float3(positions[cc]));
                 if (best < 0 || len < bestLen) { best = (int)i; bestLen = len; }
             }
-            if (best < 0) { deathClaims[gid] = 0u; return; }   // no clip-able ear: defer
+            if (best < 0) { deathClaims[victim] = 0u; return; }   // no clip-able ear: defer
             uint i = (uint)best;
             uint pa = boundary[(i + m - 1u) % m];
             uint pb = boundary[i];
@@ -2524,11 +2580,11 @@ enum Shaders {
         // ---- Write phase (all checks passed; claims are ring-distance >= 3
         // ---- apart, so the touched rings are exclusively ours) ----
         atomic_fetch_add_explicit(&deathCounter[0], 1u, memory_order_relaxed);
-        deadFlags[gid] = 1u;
-        starving[gid] = 0u;
-        radii[gid] = 0.0f;
-        linkCounts[gid] = 0u;   // gates every read of the dead slot's stale ring
-        deathClaims[gid] = 0u;
+        deadFlags[victim] = 1u;
+        starving[victim] = 0u;
+        radii[victim] = 0.0f;
+        linkCounts[victim] = 0u;   // gates every read of the dead slot's stale ring
+        deathClaims[victim] = 0u;
 
         // (1) The removal pass: every neighbour loses its link to the dying
         // cell (the hole opens; the boundary cycle's consecutive pairs close
@@ -2554,6 +2610,46 @@ enum Shaders {
             int sc = findSlot(links, linkCounts, c, b, params.maxValence);
             insertIntoRing(links, linkCounts, a, (uint)sa + 1u, c, params.maxValence);
             insertIntoRing(links, linkCounts, c, (uint)sc, a, params.maxValence);
+        }
+    }
+
+    // The queued splice (see the split rationale above). Narrow FIXED
+    // dispatch (whole threadgroups); each thread strides over the queue, so
+    // throughput scales with the claim count while the heavy body's
+    // register footprint stays off the every-step full-width hot path.
+    // stride == dispatch width (pre-rounded to whole threadgroups), so the
+    // strided coverage of 0..<count is exact.
+    //
+    // Buffer table:
+    //   0 positions (const; ear-diagonal length scoring)
+    //   1 links (read + write)        2 linkCounts (read + write)
+    //   3 deathClaims (write: cleared for every processed victim)
+    //   4 deadFlags (write)           5 starving (write: reset on death)
+    //   6 radii (write 0: the renderer's free dead-slot skip)
+    //   7 deathCounter (atomic add)   8 deathQueue (const)
+    //   9 deathQueueCount (const)    10 cellCounter (const)   11 params
+    kernel void deathSplice(device const float3* positions [[buffer(0)]],
+                            device uint*  links      [[buffer(1)]],
+                            device uint*  linkCounts [[buffer(2)]],
+                            device uint*  deathClaims [[buffer(3)]],
+                            device uint*  deadFlags  [[buffer(4)]],
+                            device uint*  starving   [[buffer(5)]],
+                            device float* radii      [[buffer(6)]],
+                            device atomic_uint* deathCounter [[buffer(7)]],
+                            device const uint* deathQueue [[buffer(8)]],
+                            device const uint* deathQueueCount [[buffer(9)]],
+                            device const uint* cellCounter [[buffer(10)]],
+                            constant SimParams& params [[buffer(11)]],
+                            uint gid [[thread_position_in_grid]],
+                            uint tpg [[threads_per_threadgroup]],
+                            uint tpgg [[threadgroups_per_grid]])
+    {
+        uint count = deathQueueCount[0];
+        uint stride = tpgg * tpg;
+        for (uint t = gid; t < count; t += stride) {
+            spliceVictim(positions, links, linkCounts, deathClaims, deadFlags,
+                         starving, radii, deathCounter, cellCounter, params,
+                         deathQueue[t]);
         }
     }
 
