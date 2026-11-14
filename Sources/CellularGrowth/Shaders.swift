@@ -39,14 +39,15 @@ enum Shaders {
     #include <metal_stdlib>
     using namespace metal;
 
-    // NOTE: layout must mirror Swift struct SimParams exactly (51 x 4 bytes =
-    // 204). New fields are APPENDED at the end on both sides (AGENTS.md
+    // NOTE: layout must mirror Swift struct SimParams exactly (54 x 4 bytes =
+    // 216). New fields are APPENDED at the end on both sides (AGENTS.md
     // SimParams rule). Size history: 144 B through M6, 148 B in V2.1
     // (lightSoft), 160 B from V2.2 (tintMode + heatScale + pulseDecay),
     // 176 B from V2.3 (lamelRate + dalRate + interiorDivider + phaseSwitchX),
     // 192 B from V2.4 (typeMode + differentiationPhase + typeCapV +
     // typeStemV), 204 B from V2.5 (deathEnabled + deathThreshold +
-    // deathSteps) — the CGST v3 reader accepts every prefix length.
+    // deathSteps), 216 B from V2.8 (growthUniform + growthLight + growthRde)
+    // — the CGST v3 reader accepts every prefix length.
     struct SimParams {
         float linkRestLength;
         float springFactor;
@@ -160,6 +161,25 @@ enum Shaders {
                                  // steps and reset their counter, shaded
                                  // cells need hundreds — the window separates
                                  // the two (the pruning knob).
+        // --- V2.8 (appended; struct grows 204 -> 216 bytes) ---
+        // The three ADDITIVE growth drives (the M5 growthMode enum is a
+        // preset-setter for these — host setGrowthMode; the per-cell food
+        // increment is the SUM of the active terms, see foodStep):
+        float growthUniform;     // U: flat income strength (the legacy mode-0
+                                 // drive is the constant 1.0)
+        float growthLight;       // L: light coupling strength
+                                 // (lightBase + nutrient); > 0 also
+                                 // schedules the illumination march +
+                                 // nutrient diffusion
+        float growthRde;         // R: RDE coupling strength
+                                 // (rdeBase + rdeGain*v) — LIGHT-GATED
+                                 // (x litFraction) in every configuration
+                                 // except the pure legacy rde enum
+                                 // (growthMode == 2, U == L == 0), which
+                                 // keeps the pre-V2.8 ungated coupling
+                                 // bit-exact; R > 0 also schedules the
+                                 // illumination march so litFraction is
+                                 // live even when L == 0
     };
     // (alignment 16!). Links are stored strided per cell (cell * maxValence + k)
     // in CYCLIC RING ORDER (neighbors consecutive around the vertex), so the
@@ -1027,19 +1047,53 @@ enum Shaders {
     // eligible" (see typeEligible). The two-phase machinery is band-specific
     // and is not applied in region mode. Type 0 cells keep rate 1.0 in both
     // modes (the type-0 contract).
+    // V2.8 ADDITIVE GROWTH DRIVES — the M5 growthMode branches above become
+    // three strengths (SimParams growthUniform/growthLight/growthRde; the
+    // enum is a preset-setter, host setGrowthMode). The per-cell drive is the
+    // SUM of the active terms:
+    //   drive = U                            (uniform: flat income; the legacy
+    //                                         mode-0 drive is the constant 1.0)
+    //         + L * (lightBase + nutrient)   (light coupling, method 3)
+    //         + R * (rdeBase + rdeGain * v) * lit   (RDE coupling, method 2,
+    //                                         LIGHT-GATED: lit = litFraction —
+    //                                         RDE chemistry feeds food only
+    //                                         where light falls)
+    // Every term is guarded on its strength > 0 so that
+    //  (a) a zero drive never READS a chemical buffer this run may never have
+    //      written (0 * uninitialized garbage could be NaN and poison the sum;
+    //      the buffers are only maintained while their drive/schedule is on),
+    //  (b) the single surviving term reduces BIT-EXACTLY to the pre-V2.8
+    //      legacy formula: multiplying by exactly 1.0 and adding +0.0 are
+    //      exact in IEEE-754 round-to-nearest. The accumulator starts at
+    //      +0.0; a -0.0 term cannot arise for sane params (every coupling
+    //      floor is >= 0, nutrient is clamped >= 0, v >= 0, and the CLI/GUI
+    //      clamp drive strengths to >= 0) — so +0.0 + x == x bitwise for every
+    //      reachable x. The goldens (uniform) and the selftest phases C/D/F/G
+    //      assert this byte-exactness.
+    // The RDE term's light gate is the per-cell litFraction EXCEPT in the
+    // PURE legacy rde configuration (growthMode == 2 with U == L == 0 — the
+    // enum preset / an untouched loaded state): there the pre-V2.8 UNGATED
+    // coupling must be reproduced bit-exactly (the march is not even
+    // scheduled for that configuration; see CellSim.step). Any other R > 0
+    // configuration is a V2.8 combination run and gates on light — including
+    // R as the only drive (--growth-uniform 0 --growth-rde F), which is the
+    // "RDE grows only where light falls" mode.
+    //
     // The RNG stream is still consumed EXACTLY once per cell at rate 0 (the
     // product is simply 0) — stream parity across configs is preserved.
     //
     // Buffer table:
     //   0 rngState (read+write)   1 food (write)   2 cellCounter   3 params
-    //   4 nutrient (const, current buffer; light mode)
-    //   5 chemU (const, current buffer; rde mode)   6 chemV (const; rde mode)
+    //   4 nutrient (const, current buffer; light drive)
+    //   5 chemU (const, current buffer; rde drive)   6 chemV (const; rde drive)
     //   7 cellType (const; V2.3 rate matrix)
     //   8 divCounter (const; V2.3 phase clock — read-only here; the increment
     //     happens in divisionExecute LATER in the same command buffer, so
     //     every foodStep thread of a step sees the same pre-step phase)
     //   9 links (const; V2.3 edge/interior link classes)
     //  10 linkCounts (const; V2.3)
+    //  11 litFraction (const; V2.8 RDE light gate — written by illuminate,
+    //     scheduled whenever the gated RDE drive is active)
     kernel void foodStep(device uint64_t* rngState    [[buffer(0)]],
                          device float*   food         [[buffer(1)]],
                          device const uint* cellCounter [[buffer(2)]],
@@ -1051,14 +1105,24 @@ enum Shaders {
                          device const uint*  divCounter [[buffer(8)]],
                          device const uint*  links      [[buffer(9)]],
                          device const uint*  linkCounts [[buffer(10)]],
+                         device const float* litFraction [[buffer(11)]],
                          uint gid [[thread_position_in_grid]])
     {
         if (gid >= cellCounter[0]) return;
-        float drive = 1.0f;
-        if (params.growthMode == 1u) {
-            drive = params.lightBase + nutrient[gid];
-        } else if (params.growthMode == 2u) {
-            drive = params.rdeBase + params.rdeGain * chemV[gid];
+        float drive = 0.0f;
+        if (params.growthUniform > 0.0f) {
+            drive += params.growthUniform;
+        }
+        if (params.growthLight > 0.0f) {
+            drive += params.growthLight * (params.lightBase + nutrient[gid]);
+        }
+        if (params.growthRde > 0.0f) {
+            const float rdeDrive = params.rdeBase + params.rdeGain * chemV[gid];
+            const bool pureLegacyRde = (params.growthMode == 2u)
+                                    && (params.growthUniform == 0.0f)
+                                    && (params.growthLight == 0.0f);
+            drive += params.growthRde * rdeDrive
+                   * (pureLegacyRde ? 1.0f : litFraction[gid]);
         }
         // V2.3 type rate (1.0 for type 0 — the no-op contract; see above).
         float rate = 1.0f;

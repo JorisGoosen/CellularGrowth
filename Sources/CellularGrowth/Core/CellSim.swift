@@ -53,7 +53,7 @@ import Foundation
 import Metal
 import simd
 
-/// Must mirror MSL `struct SimParams` exactly (51 x 4 bytes = 204).
+/// Must mirror MSL `struct SimParams` exactly (54 x 4 bytes = 216).
 /// Fields are only ever APPENDED at the end, on both sides.
 struct SimParams {
     var linkRestLength: Float = 1.0
@@ -242,6 +242,33 @@ struct SimParams {
     /// measured to prune at nutrient ~1.1 — half the form (too aggressive;
     /// the death rate then crumples the mesh and division jams).
     var deathSteps: UInt32 = 250
+    // --- V2.8 (appended; struct grows 204 -> 216 bytes) ---
+    /// The three ADDITIVE growth drives (paper §4 food methods, combinable —
+    /// the M5 `growthMode` enum becomes a preset-setter for these; see
+    /// setGrowthMode). The per-cell food increment is the SUM of the active
+    /// terms (foodStep in Shaders.swift):
+    ///   drive = U                       (uniform: flat income, the legacy
+    ///                                    mode-0 drive is the constant 1.0)
+    ///         + L * (lightBase + nutrient)          (light coupling)
+    ///         + R * (rdeBase + rdeGain * v) * lit   (RDE coupling, LIGHT-
+    ///                                    GATED: lit = the per-cell litFraction
+    ///                                    — RDE chemistry only feeds food
+    ///                                    where light falls)
+    /// All three default to 0 (no drive) — every legacy-config code path
+    /// applies the enum preset explicitly (setGrowthMode). Struct defaults
+    /// are also what a pre-V2.8 CGST raw-params block restores before the
+    /// loader maps them from the file's growth mode.
+    /// Uniform drive strength (1.0 = the legacy uniform mode exactly).
+    var growthUniform: Float = 0
+    /// Light drive strength (1.0 = the legacy light mode exactly). Also
+    /// schedules the illumination march + nutrient diffusion when > 0.
+    var growthLight: Float = 0
+    /// RDE drive strength (1.0 with growthMode == 2 and no other drive = the
+    /// legacy RDE mode exactly — UNGATED, bit-exact pre-V2.8 coupling; in any
+    /// other combination the term is gated by litFraction and the illumination
+    /// march is scheduled so litFraction is live even when the light drive
+    /// itself is 0).
+    var growthRde: Float = 0
 }
 
 enum ShaderError: Error {
@@ -494,8 +521,8 @@ final class CellSim {
 
         // Layout drift guard: the MSL SimParams mirror is appended-only; a
         // mismatch here corrupts every kernel silently.
-        precondition(MemoryLayout<SimParams>.size == 204,
-                     "SimParams layout drift: \(MemoryLayout<SimParams>.size) != 204 (see Shaders.swift)")
+        precondition(MemoryLayout<SimParams>.size == 216,
+                     "SimParams layout drift: \(MemoryLayout<SimParams>.size) != 216 (see Shaders.swift)")
 
         let f3 = MemoryLayout<SIMD3<Float>>.stride
         positionsA = device.makeBuffer(length: maxCells * f3, options: .storageModeShared)!
@@ -822,12 +849,40 @@ final class CellSim {
         }
     }
 
+    // MARK: V2.8 growth drives
+
+    /// The legacy growth-mode enum as a PRESET-SETTER for the three additive
+    /// drives (uniform -> U=1, light -> L=1, rde -> R=1; see the SimParams
+    /// V2.8 comment). Every legacy-config code path goes through here — the
+    /// CLI --growth flag, the selftest phases, the lockstep, the goldens, the
+    /// M6 presets and the GUI mode picker — so they all keep their exact
+    /// pre-V2.8 single-drive semantics. Explicit V2.8 drive values (CLI
+    /// --growth-* flags, GUI drive sliders, a full 216-byte CGST params
+    /// block) are applied AFTER this call and win.
+    func setGrowthMode(_ mode: UInt32) {
+        params.growthMode = mode
+        applyGrowthDrivePreset()
+    }
+
+    /// Map the current growth-mode enum onto the drive preset. Kept separate
+    /// so the CGST loader can apply it to pre-V2.8 files (whose raw params
+    /// block predates the drive fields) without touching growthMode.
+    private func applyGrowthDrivePreset() {
+        switch params.growthMode {
+        case 1:  params.growthUniform = 0; params.growthLight = 1; params.growthRde = 0
+        case 2:  params.growthUniform = 0; params.growthLight = 0; params.growthRde = 1
+        default: params.growthUniform = 1; params.growthLight = 0; params.growthRde = 0
+        }
+    }
+
     // MARK: - Simulation
 
     /// Encode one simulation step into `cb`:
     /// normals -> [M3 grid rebuild + repulsionAccumulate, when
-    /// repulsionStrength > 0] -> [M5 chemical passes: boundMax + illuminate +
-    /// clearBound + nutrientDiffuse (light mode) | rdeStep (rde mode)] ->
+    /// repulsionStrength > 0 or the chemical drives need the grid] ->
+    /// [M5/V2.8 chemical passes: boundMax + illuminate + clearBound (march,
+    /// when the light or light-gated RDE drive is active) + nutrientDiffuse
+    /// (light drive) | rdeStep (RDE drive or legacy rde enum)] ->
     /// [V2.2 pulseDecayStep] -> integrate -> food -> division (decide,
     /// execute, finalize) -> [V2.5 death: queue clear, starvationStep,
     /// deathDecide, deathExecute (queue), deathSplice (+ re-tint), when
@@ -858,6 +913,24 @@ final class CellSim {
     /// - The nutrient/rde buffers swap after their pass, so foodStep and
     ///   divisionExecute (later in this CB) see the post-pass chemicals.
     ///
+    /// V2.8 drive-aware chemical scheduling (the M5 mode branches above
+    /// become drive predicates — the enum is a drive preset-setter, see
+    /// setGrowthMode):
+    /// - illumination march (boundMax + illuminate + clearBound, every
+    ///   lightInterval steps): runs when the LIGHT drive is active (legacy
+    ///   mode 1 included) OR the light-GATED RDE drive is active — the gate
+    ///   consumes litFraction even when the light drive itself is 0. The PURE
+    ///   legacy rde configuration (growthMode == 2 with U == L == 0, i.e. the
+    ///   enum preset or an untouched loaded state) keeps the pre-V2.8
+    ///   schedule: NO march (its foodStep reads no litFraction — bit-exact).
+    /// - nutrientDiffuse: only when the light drive is active (the only
+    ///   consumer of the nutrient field; a gated-RDE run leaves the marched
+    ///   nutrient unconsumed — production without decay just parks at the
+    ///   kNutrientMax clamp, which nothing reads).
+    /// - rdeStep: when the RDE drive is active OR the legacy rde enum is set
+    ///   (the v field must keep evolving for the food coupling in both).
+    /// - the grid additionally serves the march (needGrid below).
+    ///
     /// V2.4 differentiation phase (differentiationPhase == 1): the WHOLE
     /// division block is skipped — divisionExecute's cell-counter/phase-clock
     /// writes never happen (both frozen) and foodStep never runs (food freezes
@@ -874,7 +947,16 @@ final class CellSim {
         guard cellCount > 0 else { return }
         let width = dispatchWidth
         encodeNormals(cb, width: width)
-        let needGrid = params.repulsionStrength > 0 || params.growthMode == 1
+        // V2.8 drive predicates (mirrored by the foodStep shader logic — keep
+        // the two definitions in sync; the shader keys the RDE gate on the
+        // same pure-legacy condition).
+        let pureLegacyRde = params.growthMode == 2
+            && params.growthUniform == 0 && params.growthLight == 0
+        let lightDriveActive = params.growthLight > 0 || params.growthMode == 1
+        let gatedRdeActive = params.growthRde > 0 && !pureLegacyRde
+        let rdeActive = params.growthRde > 0 || params.growthMode == 2
+        let needMarch = lightDriveActive || gatedRdeActive
+        let needGrid = params.repulsionStrength > 0 || needMarch
         if needGrid {
             encodeClearOccupancy(cb)   // M6: the skip map is per-rebuild state
             encodeGridCount(cb, width: width)
@@ -886,20 +968,23 @@ final class CellSim {
         if params.repulsionStrength > 0 {
             encodeRepulsionAccumulate(cb, width: width)
         }
-        if params.growthMode == 1 {
+        if needMarch {
             // The illumination march is the expensive pass (empty-interior
             // traversal — benchlog M5); the shadow pattern evolves on
             // ~100-step scales, so it runs every lightInterval steps with
             // lightInterval× pulsed production (steady state unchanged).
-            // Decay + diffusion run every step below.
+            // Decay + diffusion run every step below (light drive only).
             if stepIndex % UInt64(max(params.lightInterval, 1)) == 0 {
                 encodeBoundMax(cb, width: width)
                 encodeIlluminate(cb, width: width)
                 encodeClearBound(cb)
             }
-            encodeNutrientDiffuse(cb, width: width)
-            usingNutA.toggle()
-        } else if params.growthMode == 2 {
+            if lightDriveActive {
+                encodeNutrientDiffuse(cb, width: width)
+                usingNutA.toggle()
+            }
+        }
+        if rdeActive {
             encodeRdeStep(cb, width: width)
             usingChemA.toggle()
         }
@@ -1234,6 +1319,7 @@ final class CellSim {
         enc.setBuffer(divisionCounterBuffer, offset: 0, index: 8)   // V2.3: phase clock
         enc.setBuffer(linksBuffer, offset: 0, index: 9)      // V2.3: edge/interior link classes
         enc.setBuffer(linkCountsBuffer, offset: 0, index: 10)
+        enc.setBuffer(litFractionBuffer, offset: 0, index: 11)   // V2.8: RDE light gate
         enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         enc.endEncoding()
@@ -1916,8 +2002,9 @@ final class CellSim {
     //            | SimParams (raw, appended-only: 128 B comment from v3's first
     //            |   draft was wrong — M6 files carry 144 B, V2.1 files 148 B,
     //            |   V2.2 files 160 B, V2.3 files 176 B, V2.4 files 192 B,
-    //            |   V2.5 files 204 B; the reader accepts every prefix length
-    //            |   and prefixes into the struct)
+    //            |   V2.5 files 204 B, V2.8 files 216 B; the reader accepts
+    //            |   every prefix length and prefixes into the struct, mapping
+    //            |   pre-V2.8 blocks' drives from the file's growth mode)
     //            Loaded WITHOUT reset(): buffers installed directly, normals/
     //            radii/tint recomputed (deterministic functions of the state).
     //
@@ -2047,7 +2134,8 @@ final class CellSim {
         // lightSoft), 160 B (V2.2: tintMode + heatScale + pulseDecay), 176 B
         // (V2.3: lamelRate + dalRate + interiorDivider + phaseSwitchX), 192 B
         // (V2.4: typeMode + differentiationPhase + typeCapV + typeStemV),
-        // 204 B (V2.5: deathEnabled + deathThreshold + deathSteps).
+        // 204 B (V2.5: deathEnabled + deathThreshold + deathSteps), 216 B
+        // (V2.8: growthUniform + growthLight + growthRde).
         // The appended-only layout makes every shorter block a compatible
         // prefix of the current struct — the read below copies only the bytes
         // present, leaving fields the file predates at their struct defaults.
@@ -2060,8 +2148,8 @@ final class CellSim {
         // (deadFlags N x u32 + starving N x u32 + the death counter 4 B).
         // count >= 12 for every real state (icosphere minimum), so 4N > 16:
         // the variable tails (>= 4N + 144) can never collide with a bare
-        // params length (<= 204).
-        let paramSizes: [Int] = [144, 148, 160, 176, MemoryLayout<SimParams>.size]
+        // params length (<= 216).
+        let paramSizes: [Int] = [144, 148, 160, 176, 204, MemoryLayout<SimParams>.size]
         var v3Sizes: [Int] = []
         for p in paramSizes {
             v3Sizes.append(baseSize + v3Payload + p)                  // pre-V2.2 (no pulse block)
@@ -2094,6 +2182,10 @@ final class CellSim {
             params.rdeDv = f32(off); off += 4
             params.rdeBase = f32(off); off += 4
             params.rdeGain = f32(off); off += 4
+            // V2.8: v2 files predate the drive fields — map the drives from
+            // the restored growth mode so the state keeps growing in its own
+            // mode (all-zero struct defaults would stall it).
+            applyGrowthDrivePreset()
         }
 
         // Geometry blocks (identical layout in every version).
@@ -2206,6 +2298,14 @@ final class CellSim {
         restored.maxCells = UInt32(min(Int(restored.maxCells), maxCells))
         restored.cellCount = UInt32(count)
         params = restored
+        // V2.8: a params block SHORTER than the current struct predates the
+        // drive fields — map the drives from the file's growth mode so the
+        // loaded state keeps growing in its own mode (the struct defaults are
+        // all-zero = no drive, which would stall a continued legacy run). A
+        // full 216-byte block carries the drives themselves and wins.
+        if data.count - off < MemoryLayout<SimParams>.size {
+            applyGrowthDrivePreset()
+        }
 
         installFullState(positions: positions, flatLinks: flatLinks, counts: counts,
                          food: food, nutrient: nutrient, chemU: chemU, chemV: chemV,

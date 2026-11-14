@@ -56,7 +56,7 @@ final class SimViewModel: ObservableObject, ViewInput {
     @Published var repulsionStrength: Double = 0.1 {
         didSet { sim.params.repulsionStrength = Float(repulsionStrength); sim.syncParams() }
     }
-    // --- M5 growth modes ---
+    // --- M5 growth modes / V2.8 composable drives ---
     enum GrowthMode: Int, CaseIterable, Identifiable {
         case uniform = 0
         case light = 1
@@ -68,12 +68,37 @@ final class SimViewModel: ObservableObject, ViewInput {
     /// chemicals (v = 0 everywhere is a fixed point — no pattern would form).
     /// During a state load the reseed is suppressed (v3 files carry their
     /// chemicals; v1/v2 files are reseeded by the loader itself).
+    /// V2.8: the mode picker is the PRESET-SETTER for the three additive
+    /// drive sliders below (uniform -> U=1, light -> L=1, rde -> R=1) —
+    /// setGrowthMode applies the preset and the slider bindings are synced
+    /// to show it. Dragging a drive slider afterwards turns the effective
+    /// configuration into a free combination (the mode label stays, the
+    /// drives rule — the panel caption spells this out).
     @Published var growthMode: GrowthMode = .uniform {
         didSet {
-            sim.params.growthMode = UInt32(growthMode.rawValue)
+            sim.setGrowthMode(UInt32(growthMode.rawValue))
             sim.syncParams()
+            // Show the preset on the drive sliders (their didSets re-push the
+            // same values — idempotent).
+            growthUniform = Double(sim.params.growthUniform)
+            growthLight = Double(sim.params.growthLight)
+            growthRde = Double(sim.params.growthRde)
             if growthMode == .rde && !loadingState { sim.reseedChemicals() }
         }
+    }
+    // --- V2.8 additive growth drives (each 0 = off; 1.0 = the legacy
+    // single-drive level). Shown next to their parameter groups in the panel
+    // (the uniform drive with the food knobs, the light drive at the top of
+    // the light group, the RDE drive at the top of the RDE group) — a drive
+    // at 0 visually demotes (disables) its group's parameters.
+    @Published var growthUniform: Double = 1 {
+        didSet { sim.params.growthUniform = Float(max(growthUniform, 0)); sim.syncParams() }
+    }
+    @Published var growthLight: Double = 0 {
+        didSet { sim.params.growthLight = Float(max(growthLight, 0)); sim.syncParams() }
+    }
+    @Published var growthRde: Double = 0 {
+        didSet { sim.params.growthRde = Float(max(growthRde, 0)); sim.syncParams() }
     }
     @Published var lightDiffusionRate: Double = 0.02 {
         didSet { sim.params.lightDiffusionRate = Float(lightDiffusionRate); sim.syncParams() }
@@ -387,6 +412,12 @@ final class SimViewModel: ObservableObject, ViewInput {
         renderer.orbiting = orbitEnabled
         renderer.orbitRate = Float(orbitRate)
 
+        // V2.8: apply the mode's drive preset once at startup — the @Published
+        // drive-slider defaults above (U=1) must match what the sim runs
+        // (the SimParams struct defaults are all-zero = no drive), and didSet
+        // does not fire at init (same pattern as the choreography sync).
+        sim.setGrowthMode(UInt32(growthMode.rawValue))
+
         reset()
     }
 
@@ -546,6 +577,12 @@ final class SimViewModel: ObservableObject, ViewInput {
         defer { loadingState = false }
         let p = sim.params
         growthMode = GrowthMode(rawValue: Int(p.growthMode)) ?? .uniform
+        // V2.8: the loaded drives (the growthMode didSet above applied the
+        // preset first; a full v3 params block carries its own drives, a
+        // pre-V2.8 block was mapped by the loader — both end up here).
+        growthUniform = Double(p.growthUniform)
+        growthLight = Double(p.growthLight)
+        growthRde = Double(p.growthRde)
         springFactor = Double(p.springFactor)
         planarFactor = Double(p.planarFactor)
         bulgeFactor = Double(p.bulgeFactor)

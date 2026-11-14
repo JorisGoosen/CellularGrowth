@@ -10,6 +10,11 @@ struct ContentView: View {
     // groups keep their GroupBox styling.
     @State private var exportOpen = true
     @State private var deathOpen = true
+    // V2.8: same collapsible pattern for the drive groups (growth drives,
+    // light, RDE). All start expanded — the pre-V2.8 panel showed everything.
+    @State private var growthOpen = true
+    @State private var lightOpen = true
+    @State private var rdeOpen = true
 
     var body: some View {
         HStack(spacing: 0) {
@@ -27,7 +32,7 @@ struct ContentView: View {
 
     private var controlPanel: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Cellular Growth — V2.7")
+            Text("Cellular Growth — V2.8")
                 .font(.headline)
 
             HStack(spacing: 8) {
@@ -153,18 +158,30 @@ struct ContentView: View {
                 }
             }
 
-            GroupBox("Growth") {
-                Picker("Mode", selection: $vm.growthMode) {
-                    ForEach(SimViewModel.GrowthMode.allCases) { m in
-                        Text(m.label).tag(m)
+            // V2.8 growth drives: the mode picker is the preset-setter for
+            // the three additive drives (U/L/R); each drive's slider sits
+            // WITH its parameter group (uniform with the food knobs, light at
+            // the top of the light group, RDE at the top of the RDE group) so
+            // activation and tuning live together. A drive at 0 disables its
+            // group's parameters (they cannot influence growth) — the light
+            // DIRECTION stays enabled: it also drives the render shading.
+            collapsible("Growth & drives (V2.8)", isExpanded: $growthOpen) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Picker("Mode", selection: $vm.growthMode) {
+                        ForEach(SimViewModel.GrowthMode.allCases) { m in
+                            Text(m.label).tag(m)
+                        }
                     }
+                    .pickerStyle(.segmented)
+                    Text("Mode sets the three drives (U/L/R); the drive sliders combine freely.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    slider("Uniform drive U", $vm.growthUniform, 0...2)
+                    Toggle(isOn: $vm.divisionEnabled) { Text("Cell division") }
+                    slider("Food increment", $vm.foodIncrement, 0...0.05)
+                    slider("Split threshold", $vm.splitThreshold, 0.2...3)
                 }
-                .pickerStyle(.segmented)
-                Toggle(isOn: $vm.divisionEnabled) { Text("Cell division") }
-                slider("Food increment", $vm.foodIncrement, 0...0.05)
-                slider("Split threshold", $vm.splitThreshold, 0.2...3)
             }
-
             // V2.7 death knobs (the V2.5 open issue: death parameters were
             // CLI/preset-side only). Placed directly under Growth — death is
             // division's inverse and its threshold rides the same food
@@ -220,23 +237,55 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
 
-            GroupBox("Light (growth + shading)") {
-                slider("Diffusion", $vm.lightDiffusionRate, 0...1)
-                slider("Nutrient/step", $vm.lightNutrient, 0...0.2)
-                slider("Decay", $vm.lightDecay, 0...0.2)
-                slider("Coupling base", $vm.lightBase, 0...1)
-                slider("March interval (steps)", $vm.lightInterval, 1...64, step: 1)
-                slider("Light azimuth°", $vm.lightAzimuth, 0...360, step: 5)
-                slider("Light elevation°", $vm.lightElevation, 0...180, step: 5)
+            // V2.8: the light DRIVE strength at the top of its parameter
+            // group. With the drive at 0 the light/nutrient coupling
+            // parameters are disabled (dormant — they cannot influence
+            // growth); the light direction stays live (render shading).
+            collapsible("Light (growth + shading)", isExpanded: $lightOpen) {
+                VStack(alignment: .leading, spacing: 10) {
+                    slider("Light drive L", $vm.growthLight, 0...2)
+                    Group {
+                        slider("Diffusion", $vm.lightDiffusionRate, 0...1)
+                        slider("Nutrient/step", $vm.lightNutrient, 0...0.2)
+                        slider("Decay", $vm.lightDecay, 0...0.2)
+                        slider("Coupling base", $vm.lightBase, 0...1)
+                        slider("March interval (steps)", $vm.lightInterval, 1...64, step: 1)
+                    }
+                    .disabled(vm.growthLight <= 0)
+                    if vm.growthLight <= 0 {
+                        Text("Light drive is 0 — nutrient coupling dormant.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    slider("Light azimuth°", $vm.lightAzimuth, 0...360, step: 5)
+                    slider("Light elevation°", $vm.lightElevation, 0...180, step: 5)
+                    Text("Direction also shades the render (always active).")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
-            GroupBox("RDE (mode: RDE)") {
-                slider("Feed F", $vm.rdeF, 0...0.08)
-                slider("Kill k", $vm.rdeK, 0...0.09)
-                slider("Du", $vm.rdeDu, 0...1)
-                slider("Dv", $vm.rdeDv, 0...1)
-                slider("Coupling base", $vm.rdeBase, 0...1)
-                slider("Coupling gain", $vm.rdeGain, 0...8)
+            // V2.8: the RDE DRIVE strength at the top of its parameter group;
+            // with the drive at 0 the chemistry parameters are disabled (the
+            // field is not stepped, so they cannot influence anything).
+            collapsible("RDE (pattern chemistry)", isExpanded: $rdeOpen) {
+                VStack(alignment: .leading, spacing: 10) {
+                    slider("RDE drive R", $vm.growthRde, 0...2)
+                    Group {
+                        slider("Feed F", $vm.rdeF, 0...0.08)
+                        slider("Kill k", $vm.rdeK, 0...0.09)
+                        slider("Du", $vm.rdeDu, 0...1)
+                        slider("Dv", $vm.rdeDv, 0...1)
+                        slider("Coupling base", $vm.rdeBase, 0...1)
+                        slider("Coupling gain", $vm.rdeGain, 0...8)
+                    }
+                    .disabled(vm.growthRde <= 0)
+                    if vm.growthRde <= 0 {
+                        Text("RDE drive is 0 — chemistry dormant (the RDE food term is light-gated: it feeds only where light falls).")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
 
             GroupBox("Repulsion") {
@@ -299,7 +348,9 @@ struct ContentView: View {
 
     /// V2.7: collapsible panel section (the user's request) — a
     /// DisclosureGroup with a headline label, replacing the GroupBox for the
-    /// sections this milestone touches (export, death).
+    /// sections this milestone touches (export, death). V2.8 uses the same
+    /// helper for the drive groups (growth drives, light, RDE) — one shared
+    /// pattern for every collapsible section.
     private func collapsible<Content: View>(_ title: String,
                                             isExpanded: Binding<Bool>,
                                             @ViewBuilder content: @escaping () -> Content) -> some View {

@@ -71,6 +71,9 @@ enum HeadlessRunner {
             // --- V2.6 (pitfall 10: every new flag routes to the headless path) ---
             || args.contains("--follow-centroid") || args.contains("--follow-smooth")
             || args.contains("--orbit-rate")
+            // --- V2.8 (pitfall 10: every new flag routes to the headless path) ---
+            || args.contains("--growth-uniform") || args.contains("--growth-light")
+            || args.contains("--growth-rde") || args.contains("--drive-probe")
             // V2.5: --state-load was only ever routed headless via its
             // --render/--screenshot companions (a bare --state-load silently
             // launched the GUI event loop and hung — pitfall 10 verbatim).
@@ -136,6 +139,15 @@ enum HeadlessRunner {
         var stereo = false         // ray tracer: side-by-side stereo pair
         var interocular: Float = 0.03  // eye separation as a fraction of the scene scale
         var screenshotStyle = "solid"  // raster screenshot style: solid | xray (impostor)
+        // --- V2.8 ---
+        /// Explicit drive-strength overrides (nil = the --growth enum preset
+        /// stands; an explicit flag wins over the enum-set component).
+        var growthUniform: Float?
+        var growthLight: Float?
+        var growthRde: Float?
+        /// Per-hemisphere per-capita growth probe (the V2.8 gating proof +
+        /// the all-zero sanity check).
+        var driveProbe = false
         // --- V2.1 ---
         var shadows: Float = 1.0       // per-pixel shadow strength (directional solid)
         var xrayColor = false          // coloured X-ray (per-channel tinted density)
@@ -404,6 +416,11 @@ enum HeadlessRunner {
             case "--follow-centroid": o.followCentroid = true
             case "--follow-smooth": o.followSmoothing = Float(value("--follow-smooth") ?? "") ?? o.followSmoothing
             case "--orbit-rate": o.orbitRate = Float(value("--orbit-rate") ?? "") ?? o.orbitRate
+            // --- V2.8 (composable growth drives) ---
+            case "--growth-uniform": o.growthUniform = Float(value("--growth-uniform") ?? "") ?? o.growthUniform
+            case "--growth-light": o.growthLight = Float(value("--growth-light") ?? "") ?? o.growthLight
+            case "--growth-rde": o.growthRde = Float(value("--growth-rde") ?? "") ?? o.growthRde
+            case "--drive-probe": o.driveProbe = true
             default: break
             }
         }
@@ -429,6 +446,10 @@ enum HeadlessRunner {
             if !given("--steps") { o.steps = 2000 }
             if !given("--subdiv") { o.subdiv = 4 }
             if !given("--differentiate-at") { o.differentiateAt = max(500, o.steps / 4) }
+        }
+        if o.driveProbe {
+            if !given("--steps") { o.steps = 1500 }
+            if !given("--subdiv") { o.subdiv = 3 }
         }
         return o
     }
@@ -456,7 +477,13 @@ enum HeadlessRunner {
         sim.params.roi = o.roi
         sim.params.repulsionStrength = o.repulsion
         // --- M5 ---
-        sim.params.growthMode = growthModeCode(o.growth)
+        // V2.8: the enum is a preset-setter for the three additive drives
+        // (setGrowthMode); the explicit --growth-* flags below override the
+        // enum-set component (a combination is free).
+        sim.setGrowthMode(growthModeCode(o.growth))
+        if let v = o.growthUniform { sim.params.growthUniform = max(v, 0) }
+        if let v = o.growthLight { sim.params.growthLight = max(v, 0) }
+        if let v = o.growthRde { sim.params.growthRde = max(v, 0) }
         let lLen = simd_length(o.lightDir)
         guard lLen > 1e-6 else {
             print("--light-dir must be non-zero")
@@ -536,6 +563,9 @@ enum HeadlessRunner {
         }
         if o.rdeProbe {
             runRdeProbe(queue: queue, sim: sim, o: o)   // exits
+        }
+        if o.driveProbe {
+            runDriveProbe(queue: queue, sim: sim, o: o)   // exits (V2.8)
         }
         if o.selftest {
             runSelftest(queue: queue, sim: sim, o: o)
@@ -854,7 +884,7 @@ enum HeadlessRunner {
     ///   lag-1 link correlation — corr(x_i, x_j) over directed links
     /// Prints a checkpoint table, writes u/v scatter dumps, PASS/FAIL + exit.
     private static func runRdeProbe(queue: MTLCommandQueue, sim: CellSim, o: Options) -> Never {
-        sim.params.growthMode = 2
+        sim.setGrowthMode(2)
         sim.params.divisionEnabled = 0
         sim.syncParams()
         let (base, links) = Icosphere.generate(subdivisions: o.subdiv, spacing: sim.params.linkRestLength)
@@ -915,6 +945,77 @@ enum HeadlessRunner {
         exit(ok ? 0 : 1)
     }
 
+    /// V2.8: per-hemisphere per-capita growth probe — the drive-combination
+    /// validation tool. Grows the CURRENT drive config from a fresh ball and
+    /// checkpoints the cell counts on the LIT vs SHADED hemisphere (dot(P,
+    /// lightDir) >= 0 vs < 0 — the shared light points along +lightDir, so a
+    /// cell on the light side of the origin plane is the lit side to first
+    /// order). Prints the per-capita table; ENFORCES gates only for the two
+    /// drive signatures that carry a physical expectation:
+    ///   - light-gated RDE only (R > 0, L == U == 0, growthMode != 2): the
+    ///     lit hemisphere must outgrow the shaded one — the RDE drive term is
+    ///     ~0 where litFraction ~ 0 (the V2.8 gating proof);
+    ///   - all drives zero (division on): the count must stay FLAT — no food,
+    ///     no division (stagnation sanity).
+    /// Any other signature prints an informational table and exits 0. Cells
+    /// crossing the equator between checkpoints add a little classification
+    /// noise — far below the gate margins.
+    private static func runDriveProbe(queue: MTLCommandQueue, sim: CellSim, o: Options) -> Never {
+        sim.params.divisionEnabled = 1
+        sim.syncParams()
+        let (base, links) = Icosphere.generate(subdivisions: max(o.subdiv, 3), spacing: sim.params.linkRestLength)
+        let L = simd_normalize(SIMD3<Float>(sim.params.lightDirX,
+                                            sim.params.lightDirY,
+                                            sim.params.lightDirZ))
+        func hemispheres(_ positions: [SIMD3<Float>]) -> (lit: Int, shade: Int) {
+            var lit = 0, shade = 0
+            for p in positions {
+                if simd_dot(p, L) >= 0 { lit += 1 } else { shade += 1 }
+            }
+            return (lit, shade)
+        }
+        sim.reset(positions: base, links: links)
+        let initial = hemispheres(sim.readPositions())
+        print("drive-probe: \(base.count) cells, drives U=\(sim.params.growthUniform) L=\(sim.params.growthLight) R=\(sim.params.growthRde) (growthMode \(sim.params.growthMode)), light (\(L.x), \(L.y), \(L.z)), \(o.steps) steps")
+        print("t=0 lit=\(initial.lit) shade=\(initial.shade)")
+        var done = 0
+        var last = initial
+        while done < o.steps {
+            let batch = min(100, o.steps - done)
+            runSteps(queue: queue, sim: sim, count: batch)
+            done += batch
+            if done % 500 == 0 || done == o.steps {
+                last = hemispheres(sim.readPositions())
+                let litPC = Double(last.lit) / Double(max(initial.lit, 1))
+                let shadePC = Double(last.shade) / Double(max(initial.shade, 1))
+                print("t=\(done) lit=\(last.lit) (x\(String(format: "%.2f", litPC))) shade=\(last.shade) (x\(String(format: "%.2f", shadePC))) cells=\(sim.cellCount)")
+            }
+        }
+        let litPC = Double(last.lit) / Double(max(initial.lit, 1))
+        let shadePC = Double(last.shade) / Double(max(initial.shade, 1))
+        let gatedRdeOnly = sim.params.growthRde > 0 && sim.params.growthLight == 0
+            && sim.params.growthUniform == 0 && sim.params.growthMode != 2
+        let allZero = sim.params.growthUniform == 0 && sim.params.growthLight == 0
+            && sim.params.growthRde == 0
+        var ok = true
+        if gatedRdeOnly {
+            // Gating proof: the lit hemisphere must grow substantially while
+            // the shaded one stays near flat (the terminator band's partial
+            // soft-light visibility may add a few percent of shade-side
+            // divisions — the 2x margin absorbs it).
+            let gateOK = litPC > 1.5 && litPC > 2.0 * shadePC
+            print("gating verdict (R-only, light-gated): lit x\(String(format: "%.2f", litPC)) vs shade x\(String(format: "%.2f", shadePC)) — \(gateOK ? "PASS (lit ≫ shade)" : "FAIL") (gates: lit > 1.5 && lit > 2 × shade)")
+            ok = gateOK
+        } else if allZero {
+            let flat = sim.cellCount == base.count
+            print("stagnation verdict (all drives 0): cells \(base.count) -> \(sim.cellCount) — \(flat ? "PASS (no growth without food)" : "FAIL")")
+            ok = flat
+        } else {
+            print("informational probe (no gates for this drive signature)")
+        }
+        exit(ok ? 0 : 1)
+    }
+
     private struct ChemStats {
         var mean: Float
         var variance: Float
@@ -966,7 +1067,7 @@ enum HeadlessRunner {
     /// Writes the type-map PNG (type colours) at the phase start and the end.
     /// PASS/FAIL + exit code.
     private static func runDiffProbe(queue: MTLCommandQueue, sim: CellSim, o: Options) -> Never {
-        sim.params.growthMode = 2
+        sim.setGrowthMode(2)
         sim.params.divisionEnabled = 0
         sim.params.typeMode = 1          // region (RDE typing)
         sim.params.typeCapV = o.typeCapV
@@ -2328,7 +2429,9 @@ enum HeadlessRunner {
         // the nutrient/u/v buffers (never positions/links), so the trajectory
         // comparison would stay valid even in light/rde mode — but the force
         // + repulsion semantics under test must be the M1-M4 path, unchanged.
-        sim.params.growthMode = 0
+        // V2.8: setGrowthMode also sets the drive preset (U=1 here — moot:
+        // division is off, foodStep never runs in lockstep).
+        sim.setGrowthMode(0)
         // V2.5: force death off — the CPU reference models neither division
         // nor death (both change topology; the comparison is index-labelled).
         sim.params.deathEnabled = 0
@@ -2756,8 +2859,10 @@ enum HeadlessRunner {
         // mode off, light/rde coupling defaults, and the light direction at
         // the pre-M5 impostor default (0.55, 0.75, 0.4) — the M3 raster
         // goldens were captured with that shading light, and the unified
-        // light now reads it from SimParams.
-        sim.params.growthMode = 0
+        // light now reads it from SimParams. V2.8: setGrowthMode also resets
+        // the three drives to the uniform preset so ambient --growth-* flags
+        // cannot leak either.
+        sim.setGrowthMode(0)
         sim.params.lightDirX = 0.55
         sim.params.lightDirY = 0.75
         sim.params.lightDirZ = 0.4
@@ -2834,7 +2939,7 @@ enum HeadlessRunner {
             // V2.1 capture-time growth config (provenance keys from the meta;
             // a snapshot replay ignores these — the state file carries it).
             if let v = r.v21 {
-                sim.params.growthMode = ["uniform", "light", "rde"].firstIndex(of: v.growth).map(UInt32.init) ?? 0
+                sim.setGrowthMode(["uniform", "light", "rde"].firstIndex(of: v.growth).map(UInt32.init) ?? 0)
                 sim.params.foodIncrement = v.food
                 sim.params.splitThreshold = v.threshold
                 sim.params.rdeF = v.rdeF
@@ -3154,7 +3259,7 @@ enum HeadlessRunner {
         // Division + light nutrient at the default gate values; the invariants
         // must hold under the new food coupling, and the lit/dark nutrient
         // gradient must actually exist (else the mode is a no-op).
-        sim.params.growthMode = 1
+        sim.setGrowthMode(1)
         sim.syncParams()
         (base, links) = Icosphere.generate(subdivisions: subdiv, spacing: sim.params.linkRestLength)
         print("selftest phase C (light growth): growthMode light, diffusion \(sim.params.lightDiffusionRate), nutrient \(sim.params.lightNutrient), decay \(sim.params.lightDecay), base \(sim.params.lightBase), \(min(steps, 1500)) steps")
@@ -3183,7 +3288,10 @@ enum HeadlessRunner {
         if !(lightMetrics.ratio > 1.5) { allPass = false }
 
         // --- Phase D: growth under the RDE mode (M5) ---
-        sim.params.growthMode = 2
+        // V2.8: setGrowthMode(2) sets the pure legacy rde drive preset
+        // (U=0, L=0, R=1) — the shader's pure-legacy condition keeps this
+        // phase's coupling UNGATED and bit-exact pre-V2.8.
+        sim.setGrowthMode(2)
         sim.syncParams()
         (base, links) = Icosphere.generate(subdivisions: subdiv, spacing: sim.params.linkRestLength)
         print("selftest phase D (rde growth): growthMode rde, F=\(sim.params.rdeF) k=\(sim.params.rdeK) Du=\(sim.params.rdeDu) Dv=\(sim.params.rdeDv), \(min(steps, 1500)) steps")
@@ -3197,7 +3305,7 @@ enum HeadlessRunner {
                 checkpoint(doneD)
             }
         }
-        sim.params.growthMode = 0
+        sim.setGrowthMode(0)
         sim.syncParams()
 
         // --- Phase E: typed growth (V2.3) — the mushroom rule matrix ------
@@ -3298,7 +3406,7 @@ enum HeadlessRunner {
         //   4. type memory holds: only 0 -> 1 / 0 -> 4 transitions ever;
         //   5. regional growth: cellCount grows AND cap per-capita growth >
         //      stem per-capita growth.
-        sim.params.growthMode = 2
+        sim.setGrowthMode(2)
         sim.params.typeMode = 1
         sim.params.typeCapV = 0.30
         sim.params.typeStemV = 0.10
@@ -3398,7 +3506,7 @@ enum HeadlessRunner {
         print("   regional growth: cells \(frozenCount) -> \(sim.cellCount) \(grewF ? "PASS" : "FAIL")  per-capita stem x\(String(format: "%.2f", stemFactorF)) cap x\(String(format: "%.2f", capFactorF)) \(regionalOK ? "PASS (cap > stem)" : "FAIL")")
         if !regionalOK { allPass = false }
         // Restore the defaults (the shared sim object; nothing after phase F).
-        sim.params.growthMode = 0
+        sim.setGrowthMode(0)
         sim.params.typeMode = 0
         let v24d = SimParams()
         sim.params.typeCapV = v24d.typeCapV
@@ -3419,7 +3527,7 @@ enum HeadlessRunner {
         //   1. V strictly rises then strictly falls across the checkpoints
         //      (the pruning overtakes the growth);
         //   2. deaths actually happened (deathCounter > 0).
-        sim.params.growthMode = 1
+        sim.setGrowthMode(1)
         sim.params.deathEnabled = 1
         sim.params.deathThreshold = sim.params.splitThreshold
         sim.params.deathSteps = 250
