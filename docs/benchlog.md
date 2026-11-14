@@ -788,3 +788,85 @@ Validation (agent + independent orchestrator re-run): build debug+release,
 clone/continuation byte-exactness probes, GUI launch check. Open point:
 the GUI export button itself was not click-tested (no screen-recording
 permission in the agent context).
+
+## V2.8 composable growth drives — 2026-11-14 — Apple M1 Pro
+
+The M5 `--growth` enum becomes a preset-setter for three ADDITIVE drive
+strengths (SimParams 204 -> 216 B: growthUniform/growthLight/growthRde,
+appended-only Swift+MSL). Per-cell drive = U + L*(lightBase + nutrient)
++ R*(rdeBase + rdeGain*v)*litFraction — the RDE term LIGHT-GATED in every
+configuration except the pure legacy rde enum (growthMode == 2, U = L = 0),
+which keeps the pre-V2.8 ungated coupling bit-exact. The illumination march
+is scheduled when L > 0 OR the gated RDE is active (the gate consumes
+litFraction even at L = 0); nutrient diffusion follows the light drive only;
+rdeStep follows the RDE drive or the legacy rde enum. NO new per-step
+buffers (litFraction existed since the V2.1 fractional light — foodStep just
+binds it now); SimParams +12 B; grid memory rows identical to V2.5-V2.7.
+
+Branch note: this milestone's original base was V2.6 (f47a048); the branch
+was REBASED onto main mid-milestone (V2.7 interactive video export + death
+sliders 6060afc, maxCells 2M -> 40M fbfb800) — the V2.7 GUI work IS in this
+branch's history from the rebase on.
+
+### 1. Legacy bit-exactness (the milestone's hard gate)
+
+Instrument: division ON but food starved (`--food 1e-7 --threshold 10`,
+3000 steps — foodStep runs every step, ZERO divisions execute) +
+`--repulsion 0` (no grid/scatter bin-order chaos) + `--light-soft 0` for the
+light arm (binary coverage makes the march's blocker product
+order-insensitive). State files (CGST v3: positions, links, food, nutrient,
+chemU/V, tint, RNG, raw params) compared byte-wise against the pre-V2.8
+binary (base fbfb800):
+
+- uniform (U preset): first 90 108 bytes IDENTICAL
+- light (L preset): first 90 108 bytes IDENTICAL
+- rde (R preset, pure legacy): first 90 108 bytes IDENTICAL
+
+(the V2.8 files add exactly 12 bytes — the three drive fields, values
+1/0/0, 0/1/0, 0/0/1). Growing runs are NOT byte-comparable — pre-existing
+run-to-run chaos (daughter-slot atomic order + per-bin scatter order;
+benchlog V2.5 §2), reproduced on the SAME binary.
+
+### 2. Interleaved per-drive A/B (division off, static ball, repulsion
+roi 1.6 / strength 0.1, 50 steps/level, CG_BENCH_BATCHES=1, two interleaved
+rounds per config — only deltas meaningful; gpu ms/step, round1/round2):
+
+| cells | A uniform | B light (march+diffuse) | C gated RDE (march+rdeStep) | D all-three |
+|---|---|---|---|---|
+| 2 562 | 0.251 / 0.285 | 0.324 / 0.383 | 0.313 / 0.325 | 0.388 / 0.357 |
+| 10 242 | 0.261 / 0.259 | 0.460 / 0.463 | 0.451 / 0.468 | 0.451 / 0.467 |
+| 40 962 | 0.838 / 0.800 | 1.786 / 1.865 | 1.815 / 1.829 | 1.930 / 1.875 |
+| 163 842 | 2.667 / 2.701 | 9.755 / 9.809 | 9.716 / 9.687 | 10.223 / 10.118 |
+| 655 362 | 10.607 / 10.758 | 46.322 / 46.333 | 46.965 / 46.521 | 48.507 / 48.595 |
+
+Deltas vs uniform (min per pair): light +0.20 (10k), +0.99 (41k), +7.1
+(164k), +35.7 (655k) ms/step; gated RDE within +0.6 of light at every level
+(rdeStep vs nutrientDiffuse: the RDE gathers two chemical fields instead of
+one); all-three = light + rdeStep (+1.7-2.2 at the top levels). The march
+dominates and is UNCHANGED from M5 (same kernels, same lightInterval=8
+pulsed schedule — M5 measured 88.9 ms/step at 655k growing with interval 8;
+the static-ball arm here is cheaper because division-off keeps the form
+compact). At validation scale (2.5k cells) every drive combination costs
++0.06-0.14 ms/step — the drives are effectively free where the sim is
+actually validated.
+
+### 3. Standard sweep (prescribed config, division off, uniform preset)
+
+| cells | ms/step cpu | ms/step gpu | steps/s |
+|---|---|---|---|
+| 2 562 | 0.402 | 0.368 | 2490 |
+| 10 242 | 0.337 | 0.301 | 2966 |
+| 40 962 | 0.880 | 0.837 | 1136 |
+| 163 842 | 2.776 | 2.726 | 360 |
+| 655 362 | 10.921 | 10.874 | 92 |
+
+grid memory rows (T_max = 2^22 preallocated; live T per level; identical to
+V2.5-V2.7 — no new buffers):
+
+```
+   grid T=8192: binCounts 32768B + binStarts 32772B + particleIndices 10248B + collisionOffsets 40992B = 116780B
+   grid T=32768: binCounts 131072B + binStarts 131076B + particleIndices 40968B + collisionOffsets 163872B = 466988B
+   grid T=131072: binCounts 524288B + binStarts 524292B + particleIndices 163848B + collisionOffsets 655392B = 1867820B
+   grid T=524288: binCounts 2097152B + binStarts 2097156B + particleIndices 655368B + collisionOffsets 2621472B = 7471148B
+   grid T=2097152: binCounts 8388608B + binStarts 8388612B + particleIndices 2621448B + collisionOffsets 10485792B = 29884460B
+```

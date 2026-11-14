@@ -1614,7 +1614,10 @@ enum HeadlessRunner {
             do {
                 let snap = try sim.loadState(from: loadPath)
                 let modes = ["uniform", "light", "rde"]
-                print("state loaded: \(loadPath) (CGST v\(snap.version), \(sim.cellCount) cells, mode \(modes[Int(min(snap.growthMode, 2))]))")
+                // V2.8: also show the active drives — a pre-V2.8 params block
+                // was mapped from the file's growth mode (a full 216-byte
+                // block carries its own drives).
+                print("state loaded: \(loadPath) (CGST v\(snap.version), \(sim.cellCount) cells, mode \(modes[Int(min(snap.growthMode, 2))]), drives U=\(sim.params.growthUniform) L=\(sim.params.growthLight) R=\(sim.params.growthRde))")
                 // V2.5: a death-era state restores its dead slots + starving
                 // counters + death counter; live = counter - deaths.
                 if sim.deathCount > 0 {
@@ -1700,7 +1703,8 @@ enum HeadlessRunner {
             do {
                 let snap = try sim.loadState(from: loadPath)
                 let modes = ["uniform", "light", "rde"]
-                print("state loaded: \(loadPath) (CGST v\(snap.version), \(sim.cellCount) cells, mode \(modes[Int(min(snap.growthMode, 2))]))")
+                // V2.8: show the active drives (see runHeadless).
+                print("state loaded: \(loadPath) (CGST v\(snap.version), \(sim.cellCount) cells, mode \(modes[Int(min(snap.growthMode, 2))]), drives U=\(sim.params.growthUniform) L=\(sim.params.growthLight) R=\(sim.params.growthRde))")
                 // V2.5: a death-era state restores its dead slots + starving
                 // counters + death counter; live = counter - deaths.
                 if sim.deathCount > 0 {
@@ -2256,6 +2260,9 @@ enum HeadlessRunner {
         print("repulsion: roi \(sim.params.roi), strength \(sim.params.repulsionStrength) (\(sim.params.repulsionStrength > 0 ? "grid rebuilt every step" : "off"))")
         let modeNames = ["uniform", "light", "rde"]
         print("growth mode: \(modeNames[Int(min(sim.params.growthMode, 2))]) (food \(sim.params.foodIncrement), threshold \(sim.params.splitThreshold))")
+        // V2.8: the active drives (the enum is only the preset-setter; the
+        // drives decide the chemical-block schedule this sweep measures).
+        print("drives: U=\(sim.params.growthUniform) L=\(sim.params.growthLight) R=\(sim.params.growthRde) (march \(sim.params.growthLight > 0 || (sim.params.growthRde > 0 && !(sim.params.growthMode == 2 && sim.params.growthUniform == 0 && sim.params.growthLight == 0)) ? "scheduled" : "off"), rdeStep \(sim.params.growthRde > 0 || sim.params.growthMode == 2 ? "scheduled" : "off"))")
         // V2.5: the death block's cost arm is a --bench run with --death and a
         // huge --death-steps (the counter + decide passes run every step, no
         // deaths execute — the delta vs the death-off baseline is the block

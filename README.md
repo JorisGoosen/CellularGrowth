@@ -8,7 +8,7 @@ including the `bulgeDist` typo analysis) lives in
 [`docs/reference/lomas_cellular_forms_extraction.md`](docs/reference/lomas_cellular_forms_extraction.md),
 with page screenshots in `docs/reference/pages/`.
 
-## Status — V2.7 complete: interactive video export + death sliders
+## Status — V2.8 complete: composable growth drives
 
 **M1–M6 base** (details in git history / docs/benchlog.md): over-damped
 spring/planar/bulge forces (paper §4, Fig. 3); food + cell division with
@@ -254,6 +254,61 @@ all 14 goldens byte-PASS unchanged):
   timings (benchlog V2.7). The export button itself was NOT click-tested
   (no screen-recording permission in the agent context — the same open
   point as V2.6).
+
+V2.8 additions — **composable growth drives** (the M5 `--growth` enum becomes
+a preset-setter for THREE ADDITIVE drive strengths; the user no longer
+chooses BETWEEN the paper's food methods but combines them):
+- **The three drives** (SimParams appended 204 → 216 B, Swift+MSL; each 0 =
+  off, 1.0 = the legacy single-drive level): `growthUniform` U (flat income —
+  the legacy mode-0 drive is the constant 1.0), `growthLight` L (the
+  light→nutrient coupling `(lightBase + nutrient)`), `growthRde` R (the RDE
+  coupling `(rdeBase + rdeGain·v)` — **LIGHT-GATED**: the term is multiplied
+  by the per-cell `litFraction`, so RDE chemistry feeds food only where light
+  falls; with L = 0 and R > 0 the pattern grows ONLY in the light). All
+  three feed the SAME food ledger additively; division logic unchanged.
+  Per-cell drive = `U + L·(lightBase + nutrient) + R·(rdeBase + rdeGain·v)·lit`.
+- **Legacy paths stay bit-exact** (verified, not just asserted): each term is
+  guarded on its strength > 0, so a single active term reduces exactly
+  (IEEE ×1.0 / +0.0); the RDE term keeps the pre-V2.8 UNGATED coupling in
+  the pure legacy configuration (`--growth rde`, growthMode == 2 with
+  U = L = 0 — the selftest phases D/F ride this path). Proof: three
+  starved-division runs (foodStep live, zero divisions → no GPU-scheduling
+  chaos) on uniform / light (`--light-soft 0` → order-insensitive binary
+  march) / rde produce state files BYTE-IDENTICAL to the pre-V2.8 binary
+  except the 12 appended drive bytes. The illumination MARCH is scheduled
+  whenever L > 0 OR the gated RDE is active (the gate needs `litFraction`
+  even when the light drive itself is 0); nutrient diffusion only follows
+  the light drive.
+- **CLI**: `--growth-uniform F`, `--growth-light F`, `--growth-rde F` — an
+  explicit flag overrides the enum-preset component; combinations free. The
+  light-gated RDE-only configuration is `--growth-uniform 0 --growth-rde F`
+  (`--growth rde` itself keeps the legacy ungated coupling). New
+  `--drive-probe`: grows the current drive config and prints per-hemisphere
+  (lit/shade) per-capita growth — ENFORCES the gating gate (lit ≫ shade) for
+  the R-only signature and the stagnation gate (zero divisions) for
+  all-zero drives; informational otherwise.
+- **GUI**: each drive's slider sits WITH its parameters — Uniform drive U in
+  the Growth & drives group (with the mode picker, which sets the three
+  sliders as presets), Light drive L at the top of the Light group, RDE
+  drive R at the top of the RDE group. A drive at 0 DISABLES its group's
+  parameters (dormant — the light DIRECTION stays live: it also shades the
+  render). The growth/light/RDE sections are collapsible `DisclosureGroup`s
+  (the V2.7 pattern).
+- **CGST**: v3 raw-params block grows to 216 B; the loader accepts every
+  prefix length (204-B literal added to the size list) and maps a
+  pre-V2.8 block's drives from the file's growth mode — a loaded legacy
+  state keeps growing in its own mode (a full 216-B block carries its own
+  drives). The `state loaded:` diagnostic now prints the active drives.
+- **Validation**: `swift build` (debug+release), `--selftest` 7 phases PASS,
+  `--lockstep` PASS, 14/14 goldens PASS, legacy bit-exactness state compares
+  (3 drive paths, above), `--drive-probe` gating proof (R-only: lit ×29.5 vs
+  shade ×1.47 per-capita) + all-zero stagnation PASS, all-three run
+  (U 0.3 / L 1 / R 0.5: 642 → 185 861 cells in 1000 steps, no NaN, centroid
+  drifts ALONG the light) with screenshots inspected, two identical seeded
+  combination runs → byte-identical state files (zero-division instrument —
+  growing runs remain macroscopically deterministic but byte-chaotic via the
+  pre-existing daughter-slot/bin-order effects, see benchlog V2.5 §2),
+  interleaved per-drive A/B bench + full sweep (benchlog V2.8).
 
 V2.6 additions — **camera choreography + video export** (host-side viewer
 state only — no sim buffer, shader or SimParams change; all 14 goldens
@@ -520,7 +575,13 @@ frame previews in the panel with a frames + elapsed progress line; Stop
 finishes the PARTIAL video; "Show in Finder" reveals the movie; grow-only
 window resize to the export aspect at start; same deterministic offscreen
 path as `--anim`, panel style/tint + current camera choreography), Save
-State…/Load State…, growth mode + light/RDE parameter groups, the V2.7
+State…/Load State…, the V2.8 collapsible Growth & drives group (mode picker
+Uniform/Light/RDE — the drive PRESET-setter — plus the Uniform drive U
+slider, division toggle, food increment + split threshold; the drive sliders
+combine freely — U next to the food knobs, Light drive L at the top of the
+collapsible Light group, RDE drive R at the top of the collapsible RDE
+group; a drive at 0 disables its group's parameters — dormant, with the
+light DIRECTION left live because it also shades the render), the V2.7
 collapsible Death group directly under Growth (starvation-death toggle +
 threshold + window sliders — live SimParams; preset/state loads sync them,
 explicit user input wins afterwards), the V2.3
@@ -547,3 +608,4 @@ Reset.
 | V2.5 ✅ | starvation death — the inverse of division (paper §8): a cell below `--death-threshold` for `--death-steps` consecutive steps dies (food-LEDGER signal; the window is a growth-rate detector — the pruning front sits at the shade iso-line); Euler-exact ring splice (dV−1, dE−3, dF−2) via balanced ear-clipping under valence caps + chord checks (the fan design deadlocked on valence-hoarding pivots — documented); claims = the division independent-set rule (order-irrelevant, verified byte-identical); dead slots stay allocated (`liveCount = cellCount − deathCount`), every consumer skips them; CGST v3 persists the death state; `--tint starve` death front; preset `prune-demo` (coral-crown self-pruning); HOT/SPLICE split (guards+queue vs narrow-width splice) after the bench bimodality investigation | `--selftest` 7 phases (new phase G: grown run with death — V rises then falls, 168k deaths, invariants on the LIVE surface) PASS, `--lockstep` PASS, 14/14 goldens PASS, CGST v3 death round-trip byte-identical, seeded two-run state compares byte-identical, prune-demo before/after screenshots inspected, death-block bench +0.5 ms/step ≈ +3.7% at 655k cells, headless jitter seeding bug fixed (benchlog V2.5) |
 | V2.6 ✅ | camera choreography + video export: follow-centroid (orbit-camera target tracks the LIVE cells' smoothed geometric centroid — uniform cell mass, dead slots skipped; host-side two-pass read, no GPU pass, no buffers touched; GUI default ON with toggle + smoothing slider, headless `--follow-centroid`/`--follow-smooth` opt-in), circle mode (`--orbit-rate F` rad per rendered frame around the moving target; GUI toggle + speed slider), drag-orbit rotates around the moving target by construction; video export as MP4 (M6 `.mov` REPLACED by `.mp4`, H.264/30 fps unchanged; M6 anim routine factored into `HeadlessRunner.exportAnimation` shared by CLI `--anim` and the GUI "Export video…" button — live state, panel style/tint, current choreography, display link paused during export) | `swift build` (debug+release), `--selftest` 7 phases PASS, `--lockstep` PASS, 14/14 goldens byte-PASS (headless camera legacy by default; choreography only on the video paths), follow+orbit anim exports visually inspected (form centered while growing 642→9 161 cells + azimuth rotates; light-grown drift centered with follow ON vs off-frame legacy), sim-step bench unchanged (12.77 vs 12.83 ms/step at 655k — no step-routine edit), export costs: ~0.37 s/frame GPU at 1600×1200 (~186k cells), ~38 ms/frame encode, choreography 0.11 ms/frame (benchlog V2.6) |
 | V2.7 ✅ | interactive video export + death sliders (GUI-only: no shader/SimParams/buffer/step-routine edit): NON-BLOCKING export on a byte-exact cloned sim (`CellSim.cloneState` copies ALL live state incl. both double-buffer sides, chemicals, RNG, pulse, types + division counter, death state, swap flags and the stepIndex march clock — CGST v3 round-trip rejected: it drops stepIndex; own `CellSim` + own command queue, GUI keeps stepping/rendering, GPU contention accepted), live frame preview + frames/elapsed progress + "Show in Finder" in the panel, Stop = partial-but-complete video (flag polled between frames, encode-after-loop truncates the frame list), export-sim capacity ESTIMATED from expected growth (overshoot stalls division device-side and is reported, never crashes), .mp4 extension forced (AVAssetWriter writes exactly the given URL — the V2.6 ".m4v" report has no write path in this code), death sliders (V2.5 follow-up: toggle + threshold + window, preset/state-synced, explicit input wins), frames slider to 10000 + steps/frame 600→2000, collapsible export/death sections, grow-only window resize to the export aspect | `swift build` (debug+release), `--selftest` 7 phases PASS, `--lockstep` PASS, 14/14 goldens byte-PASS, CLI `--anim` regression (4 frames → valid H.264 .mp4, ffprobe: h264/30 fps), clone probes: at-N state byte-identical, +400-step continuation integer-state byte-identical vs control AND fresh-run baseline (float Δ = the sim's own scheduling chaos, equal magnitude in both pairs), dividing-run form tracking ≤1.4% + invariants PASS, abort probe (4/10 frames → partial movie), capacity-watchdog probe (stall at maxCells + warning), GUI launch check; export button NOT click-tested (agent context — open point, benchlog V2.7) |
+| V2.8 ✅ | composable growth drives: the M5 `--growth` enum becomes a PRESET-setter for three additive drive strengths (SimParams 204 → 216 B, appended Swift+MSL) — uniform U (flat income), light L (the light→nutrient coupling), RDE R (the RDE coupling, LIGHT-GATED × per-cell litFraction: RDE chemistry feeds food only where light falls — with L=0, R>0 the pattern grows ONLY in the light); one food ledger, division logic unchanged; per-term guards keep every legacy configuration bit-exact (the pure `--growth rde` enum keeps the pre-V2.8 UNGATED coupling; the selftest phases C/D/F/G ride the legacy paths); illumination march scheduled when L>0 OR the gated RDE is active; CLI `--growth-uniform/--growth-light/--growth-rde` (explicit flag overrides the enum component) + `--drive-probe` (per-hemisphere per-capita growth probe, gating + stagnation gates); CGST v3 loader takes the 216-B block and maps pre-V2.8 blocks' drives from the file's growth mode; GUI: drive sliders live WITH their parameters (U in Growth & drives, L atop Light, R atop RDE), drive-off disables its group's params (light direction stays live — it shades the render), growth/light/RDE sections collapsible (V2.7 DisclosureGroup pattern) | `swift build` (debug+release), `--selftest` 7 phases PASS, `--lockstep` PASS, 14/14 goldens PASS, legacy bit-exactness: uniform/light/rde starved-division state files BYTE-IDENTICAL to the pre-V2.8 binary except the 12 appended drive bytes, `--drive-probe` gating proof (R-only: lit ×29.48 vs shade ×1.47) + all-zero stagnation PASS, all-three run (U 0.3/L 1/R 0.5: 642→185 861 cells, no NaN, centroid drift along the light) + screenshots inspected (pattern + light gradient + growth co-visible; gated-RDE visual: growth concentrated on the lit hemisphere), determinism: identical seeded combination runs → byte-identical state files (zero-division instrument), interleaved per-drive A/B + full sweep (benchlog V2.8) |
