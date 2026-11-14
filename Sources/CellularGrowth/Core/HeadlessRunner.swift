@@ -88,7 +88,7 @@ enum HeadlessRunner {
         var threshold: Float = 1.0
         var division = true
         var seed: UInt32 = 12345
-        var maxCells = 2_000_000
+        var maxCells = 40_000_000
         var screenshotPath: String?
         var bench = false
         var benchGrowth = false

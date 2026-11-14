@@ -222,7 +222,7 @@ all 14 goldens byte-PASS unchanged):
 - **Export-sim capacity**: the clone's `maxCells` is ESTIMATED from the
   expected growth (per-capita division rate ≈ drive / (2 × splitThreshold),
   compounded over frames × steps/frame, ×2 margin, clamped to the live
-  sim's maxCells) — a second full 2M buffer set (~400 MB) is only paid when
+  sim's maxCells) — a second full 40M buffer set (~8.4 GB) is only paid when
   the growth estimate demands it. Overshoot stalls division (the
   device-side hard cap) and is reported in the status — never a crash.
 - **The .mp4 extension is forced** (`assembleMovie` normalizes the output

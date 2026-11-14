@@ -68,7 +68,7 @@ struct SimParams {
     var splitThreshold: Float = 1.0
     var divisionEnabled: UInt32 = 1
     var rngSeed: UInt32 = 12345      // consumed host-side at reset
-    var maxCells: UInt32 = 2_000_000 // hard capacity enforced on the device
+    var maxCells: UInt32 = 40_000_000 // hard capacity enforced on the device
     // --- M3 (appended) ---
     /// Radius of influence for repulsion. Bin size = roi (h >= roi rule).
     /// Chosen 1.6 x linkRestLength: below the icosphere's second-neighbour
@@ -440,7 +440,7 @@ final class CellSim {
     private var pQueryFingerprint: MTLComputePipelineState!
     private var pZeroFloat3: MTLComputePipelineState!
 
-    init(device: MTLDevice, queue: MTLCommandQueue, maxCells: Int = 2_000_000) {
+    init(device: MTLDevice, queue: MTLCommandQueue, maxCells: Int = 40_000_000) {
         self.device = device
         self.queue = queue
         self.maxCells = maxCells

@@ -22,7 +22,8 @@ Morphogenesis"* (AISB50) as a macOS Swift/Metal app for Apple Silicon
    milestone report is delivered.
 2. All simulation data lives in preallocated Metal buffers
    (`storageModeShared`). No per-step allocations. Growth must stay within
-   `maxCells` (2M default; 16 GB machine ⇒ keep final runs ≤ ~30M cells).
+   `maxCells` (40M default ≈ 8.4 GB of buffers at full capacity — ~208
+   B/cell + ~17 MB grid; treat ~14 GB free as the ceiling, ≈ 65–70M cells).
 3. Positions are double-buffered: within one step all kernels read the current
    buffer and write the next one; buffers swap after the step.
 4. Shaders are MSL string constants in `Sources/CellularGrowth/Shaders.swift`.
