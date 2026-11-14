@@ -23,7 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "Cellular Growth — M6 (app polish)"
+        window.title = "Cellular Growth — V2.9"
         window.contentView = content
         window.center()
         window.makeKeyAndOrderFront(nil)

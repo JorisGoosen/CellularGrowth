@@ -323,21 +323,17 @@ final class SimViewModel: ObservableObject, ViewInput {
     // era before V2.7; the practical limit now is patience, not safety).
     @Published var exportFrames: Double = 60
     @Published var exportStepsPerFrame: Double = 100
-    // --- V2.7 non-blocking export state (the export runs on a CLONED sim
-    // with its own command queue — the GUI keeps stepping/rendering; GPU
-    // contention may lower the GUI fps, accepted and documented) ---
+    // --- V2.9 export state: the export runs ON THE LIVE SIM (one sim in
+    // memory — the V2.7 clone machinery is gone). The display link is paused
+    // for the export's duration (the export owns the sim + its queue; the
+    // GUI does not step or render), the app's event loop stays responsive
+    // and the most recent completed frame previews in the MAIN viewer. ---
     @Published var exportRunning = false
-    /// Most recent completed export frame, downscaled for the panel preview.
+    /// Most recent completed export frame (full resolution) — shown
+    /// aspect-fit in the main viewer while the export runs.
     @Published var exportPreviewImage: NSImage?
     /// "frame 12/300 — elapsed 0:45" (frame-cadence updates + a 0.5 s timer).
     @Published var exportProgressText: String?
-    /// V2.7: true between the Export click and the clone's completion — the
-    /// one-off window in which the GUI sim is frozen (playing = false) and
-    /// its buffers are being memcpy'd to the clone. Play/Reset/Export are
-    /// disabled during it: a step or reset enqueued mid-clone would race
-    /// GPU writes against the clone's reads. The window is sub-second
-    /// (~0.5 s drain + the one-off clone).
-    @Published var exportSetupActive = false
     /// Finished movie path (nil while running / on failure) — "Show in
     /// Finder" reveals it, or the frames directory when the encode failed.
     @Published var exportResultPath: String?
@@ -351,6 +347,15 @@ final class SimViewModel: ObservableObject, ViewInput {
     private var exportTotalFrames = 0
     private var exportStartDate = Date()
     private var exportProgressTimer: Timer?
+    /// The `playing` state before the export took the sim over — restored
+    /// when the export unwinds (done, stopped or failed).
+    private var exportWasPlaying = false
+    /// V2.9: a Reset clicked while an export runs cannot touch the sim (the
+    /// export is actively stepping/rendering its buffers on the same queue).
+    /// The flag stops the export FIRST and defers the reset to the export's
+    /// unwind (finishExport/failExport) — the user's intent is honoured
+    /// exactly once, race-free.
+    private var pendingResetAfterExport = false
     // --- M6 presets (Core/Presets.swift) ---
     @Published var presetName: String? {
         didSet {
@@ -422,6 +427,17 @@ final class SimViewModel: ObservableObject, ViewInput {
     }
 
     func reset() {
+        // V2.9: the export OWNS the sim while it runs (it steps + renders the
+        // live buffers on the live queue). A reset mid-export would race that
+        // GPU work — stop the export first and run the reset when the export
+        // unwinds (finishExport/failExport). Single-click semantics: the
+        // status line says what happens.
+        if exportRunning {
+            pendingResetAfterExport = true
+            stopExport()
+            statusMessage = "Export stopping — the reset applies when the video finishes…"
+            return
+        }
         // V2.4: a fresh ball must not stay frozen — clear the differentiation
         // phase (the flag is a SimParams field, not reset()-cleared state).
         differentiationPhase = false
@@ -634,39 +650,49 @@ final class SimViewModel: ObservableObject, ViewInput {
         renderer.resetChoreography()
     }
 
-    // MARK: - V2.7 video export (GUI, NON-BLOCKING on a cloned sim)
+    // MARK: - V2.9 video export (GUI, on the LIVE sim — one sim in memory)
 
     /// GUI "Export video…": pick a directory, then run the SAME
     /// deterministic offscreen export the CLI --anim uses
-    /// (HeadlessRunner.exportAnimation — factored, not duplicated) — but on
-    /// a CLONE of the live state (its own CellSim + its own MTLCommandQueue,
-    /// never the GUI's queue), while the GUI keeps stepping and rendering.
+    /// (HeadlessRunner.exportAnimation — factored, not duplicated) — on the
+    /// LIVE sim (V2.9: the V2.7 clone machinery is GONE — no second CellSim,
+    /// no second command queue, no capacity estimate).
     ///
-    /// V2.7 protocol (replaces the V2.6 blocking export, which paused the
-    /// display link and owned the live sim for its whole duration):
-    ///   1. main: playing = false — no further sim steps are encoded (the
-    ///      view keeps drawing; draw-only frames write NO sim buffers).
-    ///   2. main: +0.5 s drain — any frame already in flight when playing
-    ///      went false commits its command buffer within ~1–2 frames (a
-    ///      full GUI frame costs ≤ ~45 ms GPU at 2M cells, benchlog V2.5
-    ///      extrapolation); 0.5 s is ~10× that margin. After it the sim
-    ///      buffers are quiescent.
-    ///   3. background: build the export sim (CellSim init compiles the
-    ///      Metal library — one-time cost) + cloneState(from: live sim) —
-    ///      CPU memcpy of the live prefixes; the only concurrent traffic is
-    ///      draw-only frames READING the same buffers (read/read = safe).
-    ///   4. main: playing restored, exportRunning = true, window resized to
-    ///      the export aspect ratio; the frame loop runs on the background
-    ///      thread on the clone.
+    /// V2.9 protocol (the user's contract: "1 sim in memory … shown in the
+    /// main viewer … not interactive during rendering"):
+    ///   1. main: playing = false + metalView.isPaused = true — the display
+    ///      link STOPS; the GUI encodes no further frames and runs no further
+    ///      sim steps. The event loop keeps running (the panel, Stop, window
+    ///      controls all stay responsive) — the sim is simply owned by the
+    ///      export now.
+    ///   2. background: 0.5 s drain — the last GUI frame in flight when the
+    ///      display link paused commits within ~1–2 vsyncs (a full GUI frame
+    ///      costs ≤ ~45 ms GPU at 2M cells, benchlog V2.5 extrapolation);
+    ///      0.5 s is ~10× that margin. After it the sim buffers are
+    ///      quiescent. The sleep runs OFF the main thread — the UI never
+    ///      blocks (the V2.7 setup window is gone entirely: nothing is
+    ///      cloned, so nothing needs freezing beyond the pause itself).
+    ///   3. background: exportAnimation(queue: sim.queue, sim: sim) — steps
+    ///      + renders the live sim exactly like the CLI path does.
+    ///   4. main: finishExport — the preview clears, the display link
+    ///      resumes and the main viewer shows the LIVE sim, which is exactly
+    ///      the state the video ended on ("what you saw is what you have").
     ///   5. Stop sets exportStopRequested; it is checked between frames and
     ///      whatever rendered is still encoded (partial export — the user
     ///      always gets a video).
-    /// GPU contention between the GUI sim and the export's ray renderer
-    /// lowers the GUI fps for the export's duration — accepted (documented
-    /// milestone choice). The preview shows the export's OFFSCREEN frames,
-    /// not the GUI render.
+    /// Incidental-draw note: while paused (isPaused + enableSetNeedsDisplay
+    /// false) MTKView schedules no draws; a window resize may still force
+    /// ONE draw-only frame (playing = false → zero sim steps). It only READS
+    /// the sim buffers — worst case a single torn viewer frame while an
+    /// export command buffer writes them, never a state corruption.
+    /// Structural UI (Play/Pause, state save/load, preset switch) is
+    /// disabled while exportRunning; Reset stops the export first
+    /// (pendingResetAfterExport). Parameter sliders stay live: they write
+    /// SimParams coherently (the pre-existing GUI pattern — the display-link
+    /// thread has always stepped while the main thread synced params) and
+    /// simply bend the video from the next step on.
     func exportVideoPanel() {
-        guard !exportRunning, !exportSetupActive else { return }
+        guard !exportRunning else { return }
         let panel = NSOpenPanel()
         panel.title = "Export video (PNG frames + H.264 .mp4)"
         panel.canChooseFiles = false
@@ -677,82 +703,63 @@ final class SimViewModel: ObservableObject, ViewInput {
 
         let frames = max(1, Int(exportFrames))
         let steps = max(0, Int(exportStepsPerFrame))
-        let wasPlaying = playing
-        playing = false
-        exportSetupActive = true
-        statusMessage = "Cloning the live sim state for the export…"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self else { return }
-            // The export's OWN command queue — never the GUI sim's queue
-            // (two queues alongside each other are fine in Metal).
-            guard let exportQueue = self.device.makeCommandQueue() else {
-                self.failExport(NSError(domain: "export", code: 1,
-                                        userInfo: [NSLocalizedDescriptionKey: "could not create the export command queue"]))
-                return
-            }
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let self else { return }
-                do {
-                    // One-time clone cost: CellSim init (Metal library
-                    // compile) + the O(live) buffer-copy pass; timed for
-                    // the benchlog.
-                    let tClone = CFAbsoluteTimeGetCurrent()
-                    let exportSim = CellSim(device: self.device, queue: exportQueue,
-                                            maxCells: self.exportCapacityEstimate(frames: frames, stepsPerFrame: steps))
-                    exportSim.cloneState(from: self.sim)
-                    let cloneMs = (CFAbsoluteTimeGetCurrent() - tClone) * 1000
-                    print("video export: clone ready (\(exportSim.liveCount) live cells, maxCells \(exportSim.maxCells)) in \(String(format: "%.0f", cloneMs)) ms")
-                    // The clone holds the state — the GUI resumes NOW; the
-                    // export never touches the live sim again.
-                    DispatchQueue.main.async {
-                        self.playing = wasPlaying
-                        self.exportSetupActive = false
-                        self.exportRunning = true
-                        self.exportStopRequested = false
-                        self.exportFramesDir = dir
-                        self.exportResultPath = nil
-                        self.exportDoneFrames = 0
-                        self.exportTotalFrames = frames
-                        self.exportStartDate = Date()
-                        self.refreshExportProgress()
-                        self.startExportProgressTimer()
-                        self.resizeWindowForExport()
-                        self.statusMessage = "Exporting \(frames) frames × \(steps) steps on a clone — the sim keeps running; Stop finishes a partial video"
-                    }
+        exportWasPlaying = playing
+        playing = false                     // any in-flight/drain frame runs ZERO sim steps
+        metalView.isPaused = true           // V2.9: the display link stops — the export owns the sim
+        exportRunning = true
+        exportStopRequested = false
+        exportFramesDir = dir
+        exportResultPath = nil
+        exportDoneFrames = 0
+        exportTotalFrames = frames
+        exportStartDate = Date()
+        refreshExportProgress()
+        startExportProgressTimer()
+        resizeWindowForExport()
+        statusMessage = "Exporting \(frames) frames × \(steps) steps on the live sim — the viewer previews the export; Stop finishes a partial video"
 
-                    var cfg = HeadlessRunner.VideoExportConfig(
-                        dir: dir, frames: frames, stepsPerFrame: steps,
-                        settings: self.offlineExportSettings())
-                    cfg.followCentroid = self.renderer.followCentroid
-                    cfg.followSmoothing = self.renderer.followSmoothing
-                    cfg.orbitRate = self.renderer.orbiting ? self.renderer.orbitRate : 0
-                    // Progress signal (plain-var read, the codebase's relaxed
-                    // cross-thread pattern, same as the V2.6 onFrame hook).
-                    cfg.onFrame = { done, total in
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            // Drain (see protocol above) — background sleep, UI stays live.
+            Thread.sleep(forTimeInterval: 0.5)
+            do {
+                var cfg = HeadlessRunner.VideoExportConfig(
+                    dir: dir, frames: frames, stepsPerFrame: steps,
+                    settings: self.offlineExportSettings())
+                cfg.followCentroid = self.renderer.followCentroid
+                cfg.followSmoothing = self.renderer.followSmoothing
+                cfg.orbitRate = self.renderer.orbiting ? self.renderer.orbitRate : 0
+                // Progress signal (plain-var read, the codebase's relaxed
+                // cross-thread pattern, same as the V2.6 onFrame hook).
+                cfg.onFrame = { done, total in
+                    DispatchQueue.main.async {
+                        self.exportDoneFrames = done
+                        self.exportTotalFrames = total
+                        self.refreshExportProgress()
+                    }
+                }
+                // Live preview: decode OFF-main (pure CoreGraphics, full
+                // resolution — the frame shows in the MAIN viewer at window
+                // size, not in the small panel), the main thread only swaps
+                // the image.
+                cfg.onPreview = { path, done, total in
+                    if let img = Self.previewImage(fromPNG: path) {
                         DispatchQueue.main.async {
+                            self.exportPreviewImage = img
                             self.exportDoneFrames = done
                             self.exportTotalFrames = total
                             self.refreshExportProgress()
                         }
                     }
-                    // Live preview: decode + downscale OFF-main (pure
-                    // CoreGraphics), the main thread only swaps the image.
-                    cfg.onPreview = { path, done, total in
-                        if let img = Self.previewImage(fromPNG: path) {
-                            DispatchQueue.main.async {
-                                self.exportPreviewImage = img
-                                self.exportDoneFrames = done
-                                self.exportTotalFrames = total
-                                self.refreshExportProgress()
-                            }
-                        }
-                    }
-                    cfg.shouldStop = { self.exportStopRequested }
-                    let result = try HeadlessRunner.exportAnimation(queue: exportQueue, sim: exportSim, config: cfg)
-                    DispatchQueue.main.async { self.finishExport(result: result, requested: frames) }
-                } catch {
-                    DispatchQueue.main.async { self.failExport(error) }
                 }
+                cfg.shouldStop = { self.exportStopRequested }
+                // The LIVE sim and ITS OWN command queue — no clone, no
+                // second queue (the display link is paused; after the drain
+                // this thread is the only GPU client of the sim buffers).
+                let result = try HeadlessRunner.exportAnimation(queue: self.queue, sim: self.sim, config: cfg)
+                DispatchQueue.main.async { self.finishExport(result: result, requested: frames) }
+            } catch {
+                DispatchQueue.main.async { self.failExport(error) }
             }
         }
     }
@@ -767,10 +774,27 @@ final class SimViewModel: ObservableObject, ViewInput {
         statusMessage = "Stop requested — finishing the current frame, then encoding the partial video…"
     }
 
-    private func finishExport(result: HeadlessRunner.VideoExportResult, requested: Int) {
+    /// Common unwind of every export path (done / stopped / failed): give
+    /// the sim back to the viewer. The preview clears FIRST — the main
+    /// viewer returns to the live sim, which is exactly the state the video
+    /// ended on. The choreography smoothing resets so the resumed viewer
+    /// SNAPS to the final form instead of lerping from the stale pre-export
+    /// target. A Reset that was requested mid-export applies now (the sim is
+    /// ours again).
+    private func unwindExport() {
         exportRunning = false
-        exportSetupActive = false
         stopExportProgressTimer()
+        exportPreviewImage = nil
+        metalView.isPaused = false          // the display link resumes
+        playing = exportWasPlaying
+        renderer.resetChoreography()        // snap to the post-export state
+        if pendingResetAfterExport {
+            pendingResetAfterExport = false
+            reset()
+        }
+    }
+
+    private func finishExport(result: HeadlessRunner.VideoExportResult, requested: Int) {
         exportResultPath = result.moviePath
         if result.frames == 0 {
             statusMessage = "Export stopped before the first frame completed — nothing rendered, no video."
@@ -779,17 +803,16 @@ final class SimViewModel: ObservableObject, ViewInput {
                 ? "PARTIAL export (stopped at \(result.frames)/\(requested) frames): \(mp)"
                 : "Video exported: \(mp) (\(result.frames) frames)")
                 + (result.capacityCapped
-                   ? " — export sim hit its cell capacity (growth stalled from there on)" : "")
+                   ? " — the sim hit its cell capacity (maxCells \(sim.maxCells); growth stalled from there on)" : "")
         } else {
             statusMessage = "Export: \(result.frames) PNG frames in \(result.dir) — MP4 assembly FAILED (see console)"
         }
+        unwindExport()
     }
 
     private func failExport(_ error: Error) {
-        exportRunning = false
-        exportSetupActive = false
-        stopExportProgressTimer()
         statusMessage = "Video export FAILED: \(error.localizedDescription)"
+        unwindExport()
     }
 
     /// "Show in Finder": the finished movie, or the frames directory when
@@ -825,62 +848,17 @@ final class SimViewModel: ObservableObject, ViewInput {
                                     Int(e) / 60, Int(e) % 60)
     }
 
-    /// Decode + downscale a finished frame PNG for the panel preview (pure
+    /// Decode a finished frame PNG for the MAIN-viewer preview (pure
     /// CoreGraphics — thread-safe OFF-main; called on the export thread so
-    /// the 1600×1200 decode never touches the GUI run loop). Long side
-    /// bounded at 480 px (the panel shows it at ~266 pt — retina-sharp).
-    private static func previewImage(fromPNG path: String, maxPixels: CGFloat = 480) -> NSImage? {
+    /// the 1600×1200 decode never touches the GUI run loop). V2.9: NO
+    /// downscale — the frame is shown aspect-fit in the main viewer at
+    /// window size (the V2.7 480 px cap was sized for the small panel
+    /// preview, which the main viewer replaces). One ~7.7 MB bitmap lives at
+    /// a time; the previous frame's image releases on the swap.
+    private static func previewImage(fromPNG path: String) -> NSImage? {
         guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
               let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
-        let w = CGFloat(img.width), h = CGFloat(img.height)
-        let scale = min(maxPixels / w, maxPixels / h, 1)
-        let pw = max(1, Int(w * scale)), ph = max(1, Int(h * scale))
-        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
-              let ctx = CGContext(data: nil, width: pw, height: ph, bitsPerComponent: 8,
-                                  bytesPerRow: pw * 4, space: space,
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                                      | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
-        ctx.interpolationQuality = .medium
-        ctx.draw(img, in: CGRect(x: 0, y: 0, width: pw, height: ph))
-        guard let out = ctx.makeImage() else { return nil }
-        return NSImage(cgImage: out, size: NSSize(width: pw, height: ph))
-    }
-
-    /// V2.7: the export clone's buffer capacity. Allocating the GUI sim's
-    /// full 2M would cost a second ~400 MB buffer set per export; size it
-    /// from the EXPECTED growth instead. Per-step per-capita division rate
-    /// ≈ drive / (2 × splitThreshold): a cell's food ledger climbs by
-    /// drive·U[0,1) per step (mean drive/2 — uniform mode), so it re-crosses
-    /// the threshold every 2T/drive steps. Light/RDE modes fold their drive
-    /// into the same form (lightNutrient is the per-step MEAN — the
-    /// lightInterval march pulses it ×interval; RDE spots sit at v ≈ 0.4 —
-    /// the SimParams comment). Compounded over the export's total steps,
-    /// ×2 safety margin, clamped to [live + slack, the GUI sim's own
-    /// maxCells] — at the clamp the export behaves exactly like the GUI
-    /// would. If growth still overshoots, the export sim stalls at its
-    /// capacity (division is a device-side hard cap) and the status line
-    /// reports it (VideoExportResult.capacityCapped) — never a crash.
-    /// Footprint note: at the 2M clamp the clone costs ~400 MB of
-    /// storageModeShared buffers on top of the GUI sim's — fine on the
-    /// 16 GB target.
-    private func exportCapacityEstimate(frames: Int, stepsPerFrame: Int) -> Int {
-        let live = max(sim.liveCount, 1)
-        let totalSteps = max(frames * max(stepsPerFrame, 0), 1)
-        // No division (or frozen mid-differentiation): the clone only needs
-        // the live state (deaths never grow the allocation high-water mark).
-        guard sim.params.divisionEnabled != 0, sim.params.differentiationPhase == 0 else {
-            return live + 64
-        }
-        let drive: Float
-        switch GrowthMode(rawValue: Int(sim.params.growthMode)) ?? .uniform {
-        case .light:   drive = sim.params.lightBase + sim.params.lightNutrient
-        case .rde:     drive = sim.params.rdeBase + sim.params.rdeGain * 0.4
-        case .uniform: drive = sim.params.foodIncrement
-        }
-        let rate = Double(drive) / (2.0 * Double(max(sim.params.splitThreshold, 1e-6)))
-        let est = Double(live) * pow(1.0 + rate, Double(totalSteps)) * 2.0
-        let capped = est.isFinite ? Int(min(est, Double(sim.maxCells))) : sim.maxCells
-        return min(max(capped, live + 64), sim.maxCells)
+        return NSImage(cgImage: img, size: NSSize(width: img.width, height: img.height))
     }
 
     /// V2.7: grow the window to fit the export aspect ratio (1600×1200 =

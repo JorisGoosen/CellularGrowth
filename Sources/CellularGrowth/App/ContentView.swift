@@ -5,21 +5,54 @@ import SwiftUI
 
 struct ContentView: View {
     @ObservedObject var vm: SimViewModel
-    // V2.7: the sections this milestone touches are collapsible
-    // (DisclosureGroup) — the user's request. Only these two; the untouched
-    // groups keep their GroupBox styling.
+    // V2.9: EVERY panel section is collapsible (the user's request — "make
+    // sure everything in the panel is collapsible. cell differentiation isnt
+    // collapsible now for instance"). One shared `collapsible(_:isExpanded:)`
+    // helper (the V2.7/V2.8 DisclosureGroup pattern) for all of them.
+    // DEFAULTS: every section starts OPEN — the pre-V2.9 panel showed
+    // everything, so this is a zero-surprise change; collapsing is user
+    // opt-in (per-session @State, not persisted).
+    @State private var presetOpen = true
+    @State private var renderOpen = true
+    @State private var cameraOpen = true
+    @State private var stateOpen = true
     @State private var exportOpen = true
-    @State private var deathOpen = true
-    // V2.8: same collapsible pattern for the drive groups (growth drives,
-    // light, RDE). All start expanded — the pre-V2.8 panel showed everything.
     @State private var growthOpen = true
+    @State private var deathOpen = true
+    @State private var typeOpen = true
+    @State private var diffOpen = true
     @State private var lightOpen = true
     @State private var rdeOpen = true
+    @State private var repulsionOpen = true
+    @State private var forcesOpen = true
+    @State private var runOpen = true
 
     var body: some View {
         HStack(spacing: 0) {
-            MetalViewContainer(vm: vm)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // V2.9: while an export runs, the most recent completed export
+            // frame REPLACES the live viewer (one sim in memory — the export
+            // owns it; the display link is paused so the MetalView holds the
+            // export-start frame until the first export frame arrives).
+            // Aspect-fit on black: the window was grown to the export aspect
+            // ratio at export start, so the frame fills the view. When the
+            // export ends (done or stopped) the overlay disappears and the
+            // main viewer shows the live sim again — exactly the state the
+            // video ended on ("what you saw is what you have"). The
+            // MetalView stays mounted underneath (never torn from the
+            // hierarchy — an NSViewRepresentable swap would re-attach the
+            // MTKView and reset its drawable); the overlay simply covers it.
+            ZStack {
+                MetalViewContainer(vm: vm)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if vm.exportRunning, let img = vm.exportPreviewImage {
+                    Color.black
+                        .overlay(
+                            Image(nsImage: img)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                        )
+                }
+            }
 
             ScrollView {
                 controlPanel
@@ -32,63 +65,75 @@ struct ContentView: View {
 
     private var controlPanel: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Cellular Growth — V2.8")
+            Text("Cellular Growth — V2.9")
                 .font(.headline)
 
             HStack(spacing: 8) {
                 Button(vm.playing ? "Pause" : "Play") { vm.playing.toggle() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(vm.exportSetupActive)   // V2.7: mid-clone a step would race the clone's buffer reads
+                    // V2.9: the export owns the sim (display link paused,
+                    // playing restored at unwind) — Play/Pause is disabled
+                    // for the export's duration.
+                    .disabled(vm.exportRunning)
+                // V2.9: Reset stays ENABLED during an export — it stops the
+                // export first and defers the reset to the export's unwind
+                // (SimViewModel.reset guard).
                 Button("Reset") { vm.reset() }
-                    .disabled(vm.exportSetupActive)
             }
 
-            GroupBox("Preset") {
-                Picker("Preset", selection: $vm.presetName) {
-                    Text("—").tag(String?.none)
-                    ForEach(SimPreset.all, id: \.name) { p in
-                        Text(p.name).tag(String?.some(p.name))
+            collapsible("Preset", isExpanded: $presetOpen) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Picker("Preset", selection: $vm.presetName) {
+                        Text("—").tag(String?.none)
+                        ForEach(SimPreset.all, id: \.name) { p in
+                            Text(p.name).tag(String?.some(p.name))
+                        }
                     }
-                }
-                if let name = vm.presetName, let p = SimPreset.named(name) {
-                    Text(p.summary)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    // V2.9: a preset switch resets the sim — structural
+                    // change, blocked while the export owns the sim.
+                    .disabled(vm.exportRunning)
+                    if let name = vm.presetName, let p = SimPreset.named(name) {
+                        Text(p.summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
 
-            GroupBox("Render style") {
-                Picker("Style", selection: $vm.renderStyle) {
-                    Text("Solid").tag(Renderer.RenderStyle.solid)
-                    Text("X-ray").tag(Renderer.RenderStyle.xray)
-                    Text("Foam").tag(Renderer.RenderStyle.foam)
-                }
-                .pickerStyle(.segmented)
-                if vm.renderStyle == .xray {
-                    slider("X-ray gain", $vm.xrayGain, 0.05...2)
-                }
-                if vm.renderStyle == .foam {
-                    slider("Foam opacity", $vm.foamOpacity, 0.2...0.8)
-                    // V2.1b: the foam chambers only develop flat walls where
-                    // neighbouring spheres OVERLAP — radiusScale 0.5 (the
-                    // default) makes them degenerate to points.
-                    Text("Foam recommends Radius scale 0.7 (below ~0.55 the walls degenerate to points).")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                // V2.2 tint modes (feeds solid AND X-ray — the tint buffer is
-                // shared). "Default" = chemical colours in RDE mode, neutral
-                // otherwise (the pre-V2.2 behaviour).
-                Picker("Tint", selection: $vm.tintMode) {
-                    ForEach(SimViewModel.TintMode.allCases) { m in
-                        Text(m.label).tag(m)
+            collapsible("Render style", isExpanded: $renderOpen) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Picker("Style", selection: $vm.renderStyle) {
+                        Text("Solid").tag(Renderer.RenderStyle.solid)
+                        Text("X-ray").tag(Renderer.RenderStyle.xray)
+                        Text("Foam").tag(Renderer.RenderStyle.foam)
                     }
-                }
-                if vm.tintMode == .food {
-                    slider("Heat scale (0 = auto)", $vm.heatScale, 0...8)
-                }
-                if vm.tintMode == .pulse {
-                    slider("Pulse decay", $vm.pulseDecay, 0.8...0.999)
+                    .pickerStyle(.segmented)
+                    if vm.renderStyle == .xray {
+                        slider("X-ray gain", $vm.xrayGain, 0.05...2)
+                    }
+                    if vm.renderStyle == .foam {
+                        slider("Foam opacity", $vm.foamOpacity, 0.2...0.8)
+                        // V2.1b: the foam chambers only develop flat walls where
+                        // neighbouring spheres OVERLAP — radiusScale 0.5 (the
+                        // default) makes them degenerate to points.
+                        Text("Foam recommends Radius scale 0.7 (below ~0.55 the walls degenerate to points).")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    // V2.2 tint modes (feeds solid AND X-ray — the tint buffer is
+                    // shared). "Default" = chemical colours in RDE mode, neutral
+                    // otherwise (the pre-V2.2 behaviour).
+                    Picker("Tint", selection: $vm.tintMode) {
+                        ForEach(SimViewModel.TintMode.allCases) { m in
+                            Text(m.label).tag(m)
+                        }
+                    }
+                    if vm.tintMode == .food {
+                        slider("Heat scale (0 = auto)", $vm.heatScale, 0...8)
+                    }
+                    if vm.tintMode == .pulse {
+                        slider("Pulse decay", $vm.pulseDecay, 0.8...0.999)
+                    }
                 }
             }
 
@@ -96,30 +141,37 @@ struct ContentView: View {
             // centroid (exponentially smoothed, host-side); circle mode
             // advances the yaw at a fixed per-frame rate. Drag-orbit keeps
             // rotating yaw/pitch around the moving target by construction.
-            GroupBox("Camera (V2.6)") {
-                Toggle(isOn: $vm.followCentroid) { Text("Follow centroid") }
-                slider("Follow smoothing", $vm.followSmoothing, 0...0.9)
-                Toggle(isOn: $vm.orbitEnabled) { Text("Circle (orbit)") }
-                slider("Orbit speed (rad/frame)", $vm.orbitRate, 0...0.05, step: 0.001)
-                Text("Follow targets the live-cell centroid; drag orbits around the moving target.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            GroupBox("State") {
-                HStack(spacing: 8) {
-                    Button("Save State…") { vm.saveStatePanel() }
-                    Button("Load State…") { vm.loadStatePanel() }
+            collapsible("Camera (V2.6)", isExpanded: $cameraOpen) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle(isOn: $vm.followCentroid) { Text("Follow centroid") }
+                    slider("Follow smoothing", $vm.followSmoothing, 0...0.9)
+                    Toggle(isOn: $vm.orbitEnabled) { Text("Circle (orbit)") }
+                    slider("Orbit speed (rad/frame)", $vm.orbitRate, 0...0.05, step: 0.001)
+                    Text("Follow targets the live-cell centroid; drag orbits around the moving target.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                .disabled(vm.exportSetupActive)   // V2.7: a mid-clone state INSTALL would race the clone's reads
             }
 
-            // V2.7 video export: NON-BLOCKING — the export runs on a CLONE
-            // of the live state (own CellSim + own command queue) while the
-            // GUI keeps stepping/rendering; the most recent completed frame
-            // previews right here, progress shows frames + elapsed time,
-            // and Stop finishes a PARTIAL video of what rendered so far.
-            collapsible("Video export (V2.7)", isExpanded: $exportOpen) {
+            collapsible("State", isExpanded: $stateOpen) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 8) {
+                        Button("Save State…") { vm.saveStatePanel() }
+                        Button("Load State…") { vm.loadStatePanel() }
+                    }
+                    // V2.9: save reads the buffers, load swaps the state —
+                    // both race the export's GPU work on the same buffers.
+                    .disabled(vm.exportRunning)
+                }
+            }
+
+            // V2.9 video export: on the LIVE SIM — one sim in memory (the
+            // V2.7 clone machinery is gone). Export start pauses the display
+            // link (the export owns the sim; the app stays responsive); the
+            // most recent completed frame previews aspect-fit in the MAIN
+            // viewer; progress shows frames + elapsed time here; Stop
+            // finishes a PARTIAL video of what rendered so far.
+            collapsible("Video export (V2.9)", isExpanded: $exportOpen) {
                 VStack(alignment: .leading, spacing: 10) {
                     slider("Frames", $vm.exportFrames, 2...10000, step: 1, format: "%.0f")
                     slider("Steps / frame", $vm.exportStepsPerFrame, 0...2000, step: 10, format: "%.0f")
@@ -129,20 +181,6 @@ struct ContentView: View {
                     } else {
                         Button("Export video…") { vm.exportVideoPanel() }
                             .buttonStyle(.borderedProminent)
-                            .disabled(vm.exportSetupActive)   // V2.7: sub-second clone window
-                    }
-                    // V2.7 live preview: the most recent COMPLETED export
-                    // frame (the offscreen render), scaled to fit — no
-                    // file-manager hunting. Shows the export's frames, not
-                    // the GUI render.
-                    if let img = vm.exportPreviewImage {
-                        Image(nsImage: img)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .frame(maxWidth: .infinity)
-                            .clipShape(RoundedRectangle(cornerRadius: 6))
-                            .overlay(RoundedRectangle(cornerRadius: 6)
-                                .strokeBorder(Color.primary.opacity(0.15)))
                     }
                     if let progress = vm.exportProgressText {
                         Text(progress)
@@ -152,7 +190,7 @@ struct ContentView: View {
                     if vm.exportResultPath != nil || vm.exportFramesDir != nil {
                         Button("Show in Finder") { vm.revealExportResult() }
                     }
-                    Text("Offscreen 1600×1200, H.264 .mp4 (30 fps) + frame PNGs; style/tint/follow/orbit as shown. Runs on a cloned sim — the sim keeps running; Stop yields the partial video.")
+                    Text("Offscreen 1600×1200, H.264 .mp4 (30 fps) + frame PNGs; style/tint/follow/orbit as shown. Renders on the LIVE sim — the viewer pauses and previews the frames in the main screen; Stop yields the partial video.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -185,9 +223,8 @@ struct ContentView: View {
             // V2.7 death knobs (the V2.5 open issue: death parameters were
             // CLI/preset-side only). Placed directly under Growth — death is
             // division's inverse and its threshold rides the same food
-            // ledger. Collapsible like the export group. Preset/state loads
-            // sync these sliders (the panel shows what runs); explicit user
-            // input wins after a load.
+            // ledger. Preset/state loads sync these sliders (the panel shows
+            // what runs); explicit user input wins after a load.
             collapsible("Death (starvation)", isExpanded: $deathOpen) {
                 VStack(alignment: .leading, spacing: 10) {
                     Toggle(isOn: $vm.deathEnabled) { Text("Starvation death") }
@@ -201,40 +238,49 @@ struct ContentView: View {
 
             // V2.3 type layout: phase-0 polar typing (axis + stem/cap
             // thresholds; between them the lamel/dal band) and the two-phase
-            // growth switch. Dragging a knob re-types the LIVE cells; the
-            // button re-applies after a manual change.
-            GroupBox("Type layout (V2.3)") {
-                Toggle(isOn: $vm.typingEnabled) { Text("Polar typing (on reset + live)") }
-                slider("Axis X", $vm.typeAxisX, -1...1)
-                slider("Axis Y", $vm.typeAxisY, -1...1)
-                slider("Axis Z", $vm.typeAxisZ, -1...1)
-                slider("Stem threshold t1", $vm.typeT1, -1...1)
-                slider("Cap threshold t2", $vm.typeT2, -1...1)
-                Button("Re-type cells") { vm.retypeCells() }
-                slider("Phase switch X (divisions)", $vm.phaseX, 0...20000, step: 100)
-                slider("Lamel rate", $vm.lamelRate, 0...3)
-                slider("Dal rate", $vm.dalRate, 0...3)
+            // growth switch. Dragging a knob re-types the LIVE cells (a
+            // host-side rewrite of the type buffer + a waited tint refresh —
+            // GPU work: blocked while the export owns the sim); the button
+            // re-applies after a manual change.
+            collapsible("Type layout (V2.3)", isExpanded: $typeOpen) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Group {
+                        Toggle(isOn: $vm.typingEnabled) { Text("Polar typing (on reset + live)") }
+                        slider("Axis X", $vm.typeAxisX, -1...1)
+                        slider("Axis Y", $vm.typeAxisY, -1...1)
+                        slider("Axis Z", $vm.typeAxisZ, -1...1)
+                        slider("Stem threshold t1", $vm.typeT1, -1...1)
+                        slider("Cap threshold t2", $vm.typeT2, -1...1)
+                        Button("Re-type cells") { vm.retypeCells() }
+                    }
+                    .disabled(vm.exportRunning)   // V2.9: re-types the LIVE cell buffer — GPU work
+                    slider("Phase switch X (divisions)", $vm.phaseX, 0...20000, step: 100)
+                    slider("Lamel rate", $vm.lamelRate, 0...3)
+                    slider("Dal rate", $vm.dalRate, 0...3)
+                }
             }
 
             // V2.4 differentiation phase: freeze division, let the RDE type
             // the undifferentiated cells (v >= cap threshold -> cap, v <= stem
             // threshold -> stem; typed cells then ignore the RDE — type-memory
             // hysteresis). The button takes effect from the next frame.
-            GroupBox("Differentiation (V2.4)") {
-                Button(vm.differentiationPhase ? "Resume growth" : "Differentiate now") {
-                    vm.toggleDifferentiation()
-                }
-                .buttonStyle(.borderedProminent)
-                if vm.differentiationPhase {
-                    Text("Division frozen — RDE typing active (mode: \(vm.typingEnabled ? "band" : "region")).")
+            collapsible("Differentiation (V2.4)", isExpanded: $diffOpen) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Button(vm.differentiationPhase ? "Resume growth" : "Differentiate now") {
+                        vm.toggleDifferentiation()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    if vm.differentiationPhase {
+                        Text("Division frozen — RDE typing active (mode: \(vm.typingEnabled ? "band" : "region")).")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    slider("Cap threshold v ≥", $vm.typeCapV, 0...1)
+                    slider("Stem threshold v ≤", $vm.typeStemV, 0...1)
+                    Text("Works in RDE growth mode; with polar typing on the band matrix stays in charge.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                slider("Cap threshold v ≥", $vm.typeCapV, 0...1)
-                slider("Stem threshold v ≤", $vm.typeStemV, 0...1)
-                Text("Works in RDE growth mode; with polar typing on the band matrix stays in charge.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
 
             // V2.8: the light DRIVE strength at the top of its parameter
@@ -288,22 +334,28 @@ struct ContentView: View {
                 }
             }
 
-            GroupBox("Repulsion") {
-                slider("Radius of influence", $vm.roi, 0.5...4)
-                slider("Strength", $vm.repulsionStrength, 0...0.5)
+            collapsible("Repulsion", isExpanded: $repulsionOpen) {
+                VStack(alignment: .leading, spacing: 10) {
+                    slider("Radius of influence", $vm.roi, 0.5...4)
+                    slider("Strength", $vm.repulsionStrength, 0...0.5)
+                }
             }
 
-            GroupBox("Forces") {
-                slider("Spring", $vm.springFactor, 0...1)
-                slider("Planar", $vm.planarFactor, 0...1)
-                slider("Bulge", $vm.bulgeFactor, 0...1)
-                slider("Radius scale", $vm.radiusScale, 0.25...0.8)
+            collapsible("Forces", isExpanded: $forcesOpen) {
+                VStack(alignment: .leading, spacing: 10) {
+                    slider("Spring", $vm.springFactor, 0...1)
+                    slider("Planar", $vm.planarFactor, 0...1)
+                    slider("Bulge", $vm.bulgeFactor, 0...1)
+                    slider("Radius scale", $vm.radiusScale, 0.25...0.8)
+                }
             }
 
-            GroupBox("Run") {
-                slider("Steps / frame", $vm.stepsPerFrame, 1...64, step: 1)
-                slider("Jitter (on reset)", $vm.jitter, 0...0.5)
-                slider("Subdiv (on reset)", $vm.subdivision, 2...5, step: 1)
+            collapsible("Run", isExpanded: $runOpen) {
+                VStack(alignment: .leading, spacing: 10) {
+                    slider("Steps / frame", $vm.stepsPerFrame, 1...64, step: 1)
+                    slider("Jitter (on reset)", $vm.jitter, 0...0.5)
+                    slider("Subdiv (on reset)", $vm.subdivision, 2...5, step: 1)
+                }
             }
 
             Divider()
@@ -346,11 +398,10 @@ struct ContentView: View {
         }
     }
 
-    /// V2.7: collapsible panel section (the user's request) — a
-    /// DisclosureGroup with a headline label, replacing the GroupBox for the
-    /// sections this milestone touches (export, death). V2.8 uses the same
-    /// helper for the drive groups (growth drives, light, RDE) — one shared
-    /// pattern for every collapsible section.
+    /// V2.7: collapsible panel section — a DisclosureGroup with a headline
+    /// label, replacing the GroupBox. V2.8 reused it for the drive groups;
+    /// V2.9 makes it THE section pattern for the WHOLE panel (every section
+    /// is collapsible now — the user's request).
     private func collapsible<Content: View>(_ title: String,
                                             isExpanded: Binding<Bool>,
                                             @ViewBuilder content: @escaping () -> Content) -> some View {

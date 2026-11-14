@@ -8,7 +8,7 @@ including the `bulgeDist` typo analysis) lives in
 [`docs/reference/lomas_cellular_forms_extraction.md`](docs/reference/lomas_cellular_forms_extraction.md),
 with page screenshots in `docs/reference/pages/`.
 
-## Status — V2.8 complete: composable growth drives
+## Status — V2.9 complete: video export on the live sim
 
 **M1–M6 base** (details in git history / docs/benchlog.md): over-damped
 spring/planar/bulge forces (paper §4, Fig. 3); food + cell division with
@@ -225,6 +225,10 @@ all 14 goldens byte-PASS unchanged):
   sim's maxCells) — a second full 40M buffer set (~8.4 GB) is only paid when
   the growth estimate demands it. Overshoot stalls division (the
   device-side hard cap) and is reported in the status — never a crash.
+  (REMOVED in V2.9: the estimate saturated at the full 40M cap under
+  GUI-default growth settings — reserving a second ~8.4 GB buffer set per
+  export — and the whole clone architecture went with it; the export now
+  runs on the live sim and the watchdog rides its own maxCells, see V2.9.)
 - **The .mp4 extension is forced** (`assembleMovie` normalizes the output
   URL and returns the actual written path): AVAssetWriter writes EXACTLY
   the URL it is given — the V2.6 ".m4v" report has no write path in this
@@ -309,6 +313,57 @@ chooses BETWEEN the paper's food methods but combines them):
   growing runs remain macroscopically deterministic but byte-chaotic via the
   pre-existing daughter-slot/bin-order effects, see benchlog V2.5 §2),
   interleaved per-drive A/B bench + full sweep (benchlog V2.8).
+
+V2.9 additions — **video export on the LIVE sim + a fully collapsible
+panel** (GUI-only: no shader, no SimParams field, no buffer, no step-routine
+change; all goldens byte-PASS unchanged; `CellSim.cloneState` and the export
+capacity estimate DELETED):
+- **One sim in memory** (the user's contract: "I want there to be 1 sim in
+  memory. I want it to be shown in the main viewer. It doesnt need to be
+  'interactive' during rendering for export."): "Export video…" takes over
+  the LIVE sim — export start pauses the display link (`isPaused = true`,
+  `playing = false`) so the GUI encodes no further frames or steps, then the
+  export thread (after the documented 0.5 s drain, off-main — the event loop
+  stays responsive) runs the SAME `HeadlessRunner.exportAnimation` core the
+  CLI `--anim` uses, on the live sim and ITS OWN command queue. No second
+  `CellSim`, no second command queue, no clone memcpy, no
+  export-capacity-estimate (the V2.7 machinery is deleted — at GUI-default
+  growth settings its estimate saturated at the full 40M cap, reserving a
+  second ~8.4 GB buffer set per export). The V2.7 clone probe rationale
+  (stepIndex vs CGST v3) is moot: the live sim IS the exported state.
+- **The output shows in the MAIN viewer**: the most recent completed export
+  frame is decoded OFF-main at full resolution and shown aspect-fit on
+  black, covering the (paused) MetalView — the window was grown to the
+  export aspect at start, so the frame fills it. The MetalView stays
+  mounted under the overlay (a representable swap would re-attach the
+  MTKView and reset its drawable). When the export unwinds (done, stopped,
+  failed) the preview clears, the display link resumes and the main viewer
+  shows the live sim — exactly the state the video ended on ("what you saw
+  is what you have"); the choreography smoothing resets so the viewer SNAPS
+  to that state. The small V2.7 panel preview is gone (the main viewer
+  replaces it).
+- **Export-era UI contract**: Play/Pause, state save/load and the preset
+  picker are disabled while an export runs (they save/race/swap the sim
+  state the export is actively stepping and rendering). Reset stays
+  ENABLED: it stops the export first (the between-frames stop flag) and
+  DEFERS the reset to the export's unwind — single click, race-free, the
+  reset applies to the post-export state. Parameter sliders stay live
+  (coherent SimParams writes — the pre-existing GUI pattern; they bend the
+  video from the next step on). The typing knobs are disabled while
+  exporting (re-typing rewrites the live cell-type buffer + a waited tint
+  refresh — GPU work). Stop / progress (frames + elapsed, in the panel) /
+  "Show in Finder" / forced `.mp4` / grow-only window resize / the
+  capacity watchdog (now riding the live sim's own maxCells) all carry over
+  from V2.7 unchanged.
+- **Validation**: `swift build` (debug+release), `--selftest` 7 phases PASS,
+  `--lockstep` PASS, 14/14 goldens byte-PASS, CLI
+  `--anim` regression (4 frames → valid H.264 .mp4, ffprobe-verified),
+  memory footprint during an export measured (`ps` RSS sampling, benchlog
+  V2.9: one sim + ~tens of MB export-transient vs the V2.7 clone's second
+  full buffer set), sim-step bench unchanged by construction (no
+  step-routine/shader/buffer edit; single-level proof benchlog V2.9), GUI
+  launch check. The export button is NOT click-tested (agent context —
+  open point, as in V2.6/V2.7).
 
 V2.6 additions — **camera choreography + video export** (host-side viewer
 state only — no sim buffer, shader or SimParams change; all 14 goldens
@@ -561,21 +616,25 @@ swift run -c release CellularGrowth --render xray.png --style xray \
 
 ## Controls
 
-Drag to orbit, scroll/pinch to zoom. Panel: preset dropdown (ball / brain /
-plant / coral / degenerate-demo / paddenstoel / prune-demo), Solid/X-ray/Foam
-render-style switch (+ X-ray gain, foam opacity + the foam radius-scale
-hint), tint picker
+Drag to orbit, scroll/pinch to zoom. EVERY panel section is collapsible
+(V2.9 — DisclosureGroups throughout, all open by default): preset dropdown
+(ball / brain / plant / coral / degenerate-demo / paddenstoel / prune-demo),
+Solid/X-ray/Foam render-style switch (+ X-ray gain, foam opacity + the foam
+radius-scale hint), tint picker
 (Default/None/Chemical/Food heat/Mitosis pulse/Type/Type + pulse/Starving),
 the V2.6 Camera group (Follow centroid toggle — ON by default, smoothing
-slider, Circle toggle + orbit-speed slider) and the collapsible V2.7 Video
-export group (frames slider to 10000 + steps/frame slider, "Export video…"
-runs NON-BLOCKING on a byte-exact clone of the live state with its own
-command queue — the sim keeps running/rendering; the most recent completed
-frame previews in the panel with a frames + elapsed progress line; Stop
-finishes the PARTIAL video; "Show in Finder" reveals the movie; grow-only
-window resize to the export aspect at start; same deterministic offscreen
-path as `--anim`, panel style/tint + current camera choreography), Save
-State…/Load State…, the V2.8 collapsible Growth & drives group (mode picker
+slider, Circle toggle + orbit-speed slider), State (Save/Load), the V2.9
+Video export group (frames slider to 10000 + steps/frame slider, "Export
+video…" runs ON THE LIVE SIM — one sim in memory: the display link pauses
+for the export's duration, the most recent completed frame previews
+aspect-fit in the MAIN viewer, and when the export ends the viewer returns
+to the live sim exactly at the video's final state; progress line (frames +
+elapsed) and Stop (finishes the PARTIAL video) in the panel; "Show in
+Finder" reveals the movie; grow-only window resize to the export aspect at
+start; Play/Pause, State save/load and the preset picker are disabled while
+an export runs — Reset stops the export first and applies afterwards; same
+deterministic offscreen path as `--anim`, panel style/tint + current camera
+choreography), the V2.8 collapsible Growth & drives group (mode picker
 Uniform/Light/RDE — the drive PRESET-setter — plus the Uniform drive U
 slider, division toggle, food increment + split threshold; the drive sliders
 combine freely — U next to the food knobs, Light drive L at the top of the
@@ -584,11 +643,12 @@ group; a drive at 0 disables its group's parameters — dormant, with the
 light DIRECTION left live because it also shades the render), the V2.7
 collapsible Death group directly under Growth (starvation-death toggle +
 threshold + window sliders — live SimParams; preset/state loads sync them,
-explicit user input wins afterwards), the V2.3
-Type layout group (polar typing toggle + axis/threshold sliders — dragging a
-knob re-types the LIVE cells, Re-type button, phase switch X, lamel/dal
-rates), repulsion, forces, run controls. Jitter and subdivision apply on
-Reset.
+explicit user input wins afterwards), the V2.3 Type layout group (polar
+typing toggle + axis/threshold sliders — dragging a knob re-types the LIVE
+cells, Re-type button, phase switch X, lamel/dal rates), the V2.4
+Differentiation group (Differentiate now / Resume growth button + the
+typeTransition threshold sliders), repulsion, forces, run controls. Jitter
+and subdivision apply on Reset.
 
 ## Roadmap
 
@@ -609,3 +669,4 @@ Reset.
 | V2.6 ✅ | camera choreography + video export: follow-centroid (orbit-camera target tracks the LIVE cells' smoothed geometric centroid — uniform cell mass, dead slots skipped; host-side two-pass read, no GPU pass, no buffers touched; GUI default ON with toggle + smoothing slider, headless `--follow-centroid`/`--follow-smooth` opt-in), circle mode (`--orbit-rate F` rad per rendered frame around the moving target; GUI toggle + speed slider), drag-orbit rotates around the moving target by construction; video export as MP4 (M6 `.mov` REPLACED by `.mp4`, H.264/30 fps unchanged; M6 anim routine factored into `HeadlessRunner.exportAnimation` shared by CLI `--anim` and the GUI "Export video…" button — live state, panel style/tint, current choreography, display link paused during export) | `swift build` (debug+release), `--selftest` 7 phases PASS, `--lockstep` PASS, 14/14 goldens byte-PASS (headless camera legacy by default; choreography only on the video paths), follow+orbit anim exports visually inspected (form centered while growing 642→9 161 cells + azimuth rotates; light-grown drift centered with follow ON vs off-frame legacy), sim-step bench unchanged (12.77 vs 12.83 ms/step at 655k — no step-routine edit), export costs: ~0.37 s/frame GPU at 1600×1200 (~186k cells), ~38 ms/frame encode, choreography 0.11 ms/frame (benchlog V2.6) |
 | V2.7 ✅ | interactive video export + death sliders (GUI-only: no shader/SimParams/buffer/step-routine edit): NON-BLOCKING export on a byte-exact cloned sim (`CellSim.cloneState` copies ALL live state incl. both double-buffer sides, chemicals, RNG, pulse, types + division counter, death state, swap flags and the stepIndex march clock — CGST v3 round-trip rejected: it drops stepIndex; own `CellSim` + own command queue, GUI keeps stepping/rendering, GPU contention accepted), live frame preview + frames/elapsed progress + "Show in Finder" in the panel, Stop = partial-but-complete video (flag polled between frames, encode-after-loop truncates the frame list), export-sim capacity ESTIMATED from expected growth (overshoot stalls division device-side and is reported, never crashes), .mp4 extension forced (AVAssetWriter writes exactly the given URL — the V2.6 ".m4v" report has no write path in this code), death sliders (V2.5 follow-up: toggle + threshold + window, preset/state-synced, explicit input wins), frames slider to 10000 + steps/frame 600→2000, collapsible export/death sections, grow-only window resize to the export aspect | `swift build` (debug+release), `--selftest` 7 phases PASS, `--lockstep` PASS, 14/14 goldens byte-PASS, CLI `--anim` regression (4 frames → valid H.264 .mp4, ffprobe: h264/30 fps), clone probes: at-N state byte-identical, +400-step continuation integer-state byte-identical vs control AND fresh-run baseline (float Δ = the sim's own scheduling chaos, equal magnitude in both pairs), dividing-run form tracking ≤1.4% + invariants PASS, abort probe (4/10 frames → partial movie), capacity-watchdog probe (stall at maxCells + warning), GUI launch check; export button NOT click-tested (agent context — open point, benchlog V2.7) |
 | V2.8 ✅ | composable growth drives: the M5 `--growth` enum becomes a PRESET-setter for three additive drive strengths (SimParams 204 → 216 B, appended Swift+MSL) — uniform U (flat income), light L (the light→nutrient coupling), RDE R (the RDE coupling, LIGHT-GATED × per-cell litFraction: RDE chemistry feeds food only where light falls — with L=0, R>0 the pattern grows ONLY in the light); one food ledger, division logic unchanged; per-term guards keep every legacy configuration bit-exact (the pure `--growth rde` enum keeps the pre-V2.8 UNGATED coupling; the selftest phases C/D/F/G ride the legacy paths); illumination march scheduled when L>0 OR the gated RDE is active; CLI `--growth-uniform/--growth-light/--growth-rde` (explicit flag overrides the enum component) + `--drive-probe` (per-hemisphere per-capita growth probe, gating + stagnation gates); CGST v3 loader takes the 216-B block and maps pre-V2.8 blocks' drives from the file's growth mode; GUI: drive sliders live WITH their parameters (U in Growth & drives, L atop Light, R atop RDE), drive-off disables its group's params (light direction stays live — it shades the render), growth/light/RDE sections collapsible (V2.7 DisclosureGroup pattern) | `swift build` (debug+release), `--selftest` 7 phases PASS, `--lockstep` PASS, 14/14 goldens PASS, legacy bit-exactness: uniform/light/rde starved-division state files BYTE-IDENTICAL to the pre-V2.8 binary except the 12 appended drive bytes, `--drive-probe` gating proof (R-only: lit ×29.48 vs shade ×1.47) + all-zero stagnation PASS, all-three run (U 0.3/L 1/R 0.5: 642→185 861 cells, no NaN, centroid drift along the light) + screenshots inspected (pattern + light gradient + growth co-visible; gated-RDE visual: growth concentrated on the lit hemisphere), determinism: identical seeded combination runs → byte-identical state files (zero-division instrument), interleaved per-drive A/B + full sweep (benchlog V2.8) |
+| V2.9 ✅ | video export on the LIVE sim (one sim in memory — the user's contract: "1 sim in memory … shown in the main viewer … not interactive during rendering") + a fully collapsible panel (GUI-only: no shader/SimParams/buffer/step-routine edit, `CellSim.cloneState` + `exportCapacityEstimate` DELETED): export start pauses the display link (`isPaused`, `playing=false`) and the background export thread (after the 0.5 s drain, off-main — event loop stays responsive) runs the shared `exportAnimation` core on the live sim and its own queue; the most recent completed frame previews FULL-RESOLUTION aspect-fit on black in the MAIN viewer (MetalView stays mounted underneath; the small V2.7 panel preview removed), and at unwind the preview clears + the viewer snaps back to the live sim at exactly the video's final state (choreography reset = snap); export-era UI: Play/Pause, state save/load + preset picker disabled, typing knobs disabled (GPU work), Reset ENABLED = stops the export first and defers the reset to the unwind, parameter sliders live (coherent SimParams writes — the pre-existing GUI pattern); Stop/progress/"Show in Finder"/forced `.mp4`/grow-only window resize/capacity watchdog (now the live sim's own maxCells) carried over from V2.7; EVERY panel section collapsible (preset/render/camera/state/type/differentiation/repulsion/forces/run join the V2.7/V2.8 DisclosureGroups, all open by default) | `swift build` (debug+release), `--selftest` 7 phases PASS, `--lockstep` PASS, 14/14 goldens byte-PASS, CLI `--anim` regression (4 frames → valid H.264 .mp4 1600×1200/30fps, ffprobe-verified), export-footprint measurement (RSS 0.5 s-sampling during a 20-frame export at maxCells 40M: steady 0.69–0.76 GB = the sim's own pages + ~20 MB export transient; the V2.7 clone's per-export ~8.4 GB reservation + live-prefix copy is gone — benchlog V2.9), sim-step sweep equal-or-faster at every level ≥ 40k (benchlog V2.9), GUI launch check (direct launch: process alive, display link running); export button NOT click-tested (agent context — open point, as V2.6/V2.7) |

@@ -1919,8 +1919,10 @@ enum HeadlessRunner {
         var stopped: Bool = false
         /// V2.7: true when the export sim hit its maxCells capacity mid-run
         /// (division is a device-side hard cap; growth stalls from that
-        /// frame on — the capacity estimate under-sized; see
-        /// SimViewModel.exportCapacityEstimate).
+        /// frame on — the caller under-sized the capacity). V2.9: the GUI
+        /// exports the LIVE sim, so the watchdog rides the live sim's own
+        /// maxCells; the CLI --anim path rides the caller's --max-cells —
+        /// both get the same honest warning.
         var capacityCapped: Bool = false
     }
 
@@ -1970,12 +1972,12 @@ enum HeadlessRunner {
                 if let e = cb.error { print("export frame \(f) prep CB ERROR: \(e)") }
             }
             sim.syncCellCountFromDevice()
-            // V2.7 capacity watchdog: the export sim's maxCells is an
-            // ESTIMATE (SimViewModel.exportCapacityEstimate). Division is a
-            // device-side hard cap, so hitting it stalls growth (no crash);
-            // warn once so the status line can say the export is capacity-
-            // limited. The CLI --anim path runs on the caller's sim (its own
-            // --max-cells choice) and gets the same honest warning.
+            // V2.7 capacity watchdog: division is a device-side hard cap, so
+            // hitting maxCells stalls growth (no crash); warn once so the
+            // status line can say the export is capacity-limited. V2.9: the
+            // GUI exports the LIVE sim, so this rides the live sim's own
+            // maxCells; the CLI --anim path rides the caller's --max-cells
+            // choice — the same honest warning in both.
             if !capacityCapped && sim.cellCount >= sim.maxCells {
                 capacityCapped = true
                 print("video export WARNING: export sim reached its maxCells capacity (\(sim.maxCells)) — growth stalls from here")

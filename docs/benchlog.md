@@ -870,3 +870,83 @@ V2.5-V2.7 — no new buffers):
    grid T=524288: binCounts 2097152B + binStarts 2097156B + particleIndices 655368B + collisionOffsets 2621472B = 7471148B
    grid T=2097152: binCounts 8388608B + binStarts 8388612B + particleIndices 2621448B + collisionOffsets 10485792B = 29884460B
 ```
+
+## V2.9 export on the live sim — 2026-11-14 — Apple M1 Pro
+
+GUI-only milestone: no shader, no SimParams field, no buffer, no step-routine
+change. The only Core/CellSim.swift edit is the DELETED V2.7
+`cloneState(from:)` block (a one-off host-side memcpy helper, never encoded
+in any step); HeadlessRunner.swift changed in two comments only; App/* is UI
+plumbing. Headless behaviour byte-unchanged (14/14 goldens PASS).
+
+### 1. Sim-step unchanged by construction — single sweep for the record
+
+Standard sweep (prescribed config, division off, uniform preset):
+
+| cells | ms/step cpu | ms/step gpu | steps/s |
+|---|---|---|---|
+| 2 562 | 0.427 | 0.368 | 2340 |
+| 10 242 | 0.496 | 0.439 | 2017 |
+| 40 962 | 0.855 | 0.807 | 1169 |
+| 163 842 | 2.641 | 2.584 | 379 |
+| 655 362 | 10.094 | 10.040 | 99 |
+
+vs the V2.8 sweep: every level ≥ 40k equal or FASTER (655k GPU 10.04 vs
+10.87 ms/step); the 10 242 level reads +0.14 ms GPU — sub-millisecond
+launch-latency-bound noise (bench protocol: the absolute floor drifts with
+system load; no per-level step-code change exists to explain a regression).
+No step regression.
+
+grid memory rows (T_max = 2^22 preallocated; identical to V2.5–V2.8 — no
+new buffers):
+
+```
+   grid T=8192: binCounts 32768B + binStarts 32772B + particleIndices 10248B + collisionOffsets 40992B = 116780B
+   grid T=32768: binCounts 131072B + binStarts 131076B + particleIndices 40968B + collisionOffsets 163872B = 466988B
+   grid T=131072: binCounts 524288B + binStarts 524292B + particleIndices 163848B + collisionOffsets 655392B = 1867820B
+   grid T=524288: binCounts 2097152B + binStarts 2097156B + particleIndices 655368B + collisionOffsets 2621472B = 7471148B
+   grid T=2097152: binCounts 8388608B + binStarts 8388612B + particleIndices 2621448B + collisionOffsets 10485792B = 29884460B
+```
+
+### 2. Export memory footprint — why this milestone exists
+
+BEFORE (V2.7/V2.8 clone architecture): export start built a SECOND CellSim
+sized by `SimViewModel.exportCapacityEstimate`. At the GUI-default export
+(60 frames × 100 steps, uniform drive 1.0, split threshold 1.0 → per-capita
+rate 0.005/step) the compounded estimate `live·1.005^6000·2` saturates at
+the 40M cap for ANY state ⇒ a second ~8.4 GB buffer-object set reserved per
+export (README V2.7's own number) + the ~30 MB grid clone. Metal shared
+buffers page lazily (measured below), so the reservation's HARD cost was
+the clone's full live-prefix memcpy — a second resident copy of every live
+byte (GB-scale at the multi-million-cell states the GUI reaches) — plus the
+8.4 GB VM region + Metal allocation accounting sitting on top.
+
+AFTER (V2.9, MEASURED): the export runs on the live sim — no second sim, no
+second command queue, nothing cloned. RSS sampled every 0.5 s during a CLI
+`--anim` export (the SAME `exportAnimation` core the GUI calls; ONE sim,
+maxCells 40M = the GUI default): `--anim-frames 20 --anim-steps 50
+--subdiv 3`, growth 642 → 154 693 cells, 8.7 s wall:
+
+```
++0.0s      8 MB   (exec)
++0.5s   1715 MB   (one-time MSL compilation transient)
++1.0s    717 MB   (export begins; steady state)
++1..+9s  691-705 MB (frames 0-19)
++9.4s    757 MB   (final state: ~32 MB of touched live-prefix pages at 155k cells)
+```
+
+Steady 0.69–0.76 GB for the whole export = the sim's own live prefix +
+the preallocated ~30 MB grid + runtime overhead. The rise tracks the GROWN
+STATE's touched pages, not the export. The export's own additive transient:
+RayRenderer (tile texture 4 MB + params/big-cell buffers < 1 MB) + one
+1600×1200 frame byte buffer (7.7 MB) + the main-viewer preview bitmap
+(7.7 MB) ≈ 20 MB, released per frame. Peak export footprint = the live
+sim's own footprint + ~20 MB. The double allocation is gone by construction
+(there is nothing to clone); the capacity watchdog now rides the live sim's
+own maxCells.
+
+### 3. Export cost (sanity, unchanged core)
+
+Same 20-frame export: render GPU 4.81 s (0.24 s/frame at ~100k cells,
+1600×1200), movie encode 0.85 s, choreography 0.06 ms/frame — identical to
+the V2.7 numbers at matched counts (the core is untouched).
