@@ -748,3 +748,43 @@ GUI launch check: app runs (12 s alive, no crash) with the new Camera +
 Video export groups; the button itself was not click-tested (no screen
 recording permission in the agent context) — it calls the same
 `exportAnimation` core the CLI runs validated above.
+
+## V2.7 interactive video export + death sliders — 2026-11-14 — Apple M1 Pro
+
+GUI-only milestone: NO step-routine, shader, SimParams or buffer change —
+the sim step is unchanged by construction. Confirmation sweep, prescribed
+config (50 steps/level, jitter 0, division off, repulsion roi 1.6 / 0.1,
+growth uniform food 0.01 / threshold 1.0, death off), `CG_BENCH_BATCHES=1`.
+System load ~6.9 at sweep time (multi-user machine) but the batches are
+tight (min ≈ median at every level) — clean exclusive-GPU numbers, matching
+the fast-mode floor from the V2.5 bimodality investigation (655k: 9.72 here
+vs 9.65–10.86 there; the V2.6 12.77 sweep ran inside the loaded window):
+
+| cells | ms/step cpu | ms/step gpu | steps/s |
+|---|---|---|---|
+| 2 562 | 0.359 | 0.315 | 2787 |
+| 10 242 | 0.361 | 0.327 | 2767 |
+| 40 962 | 0.798 | 0.755 | 1254 |
+| 163 842 | 2.513 | 2.462 | 398 |
+| 655 362 | 9.774 | 9.720 | 102 |
+
+Per-batch gpu windows at 655 362: 9.753 9.727 9.736 9.698 9.687 | median
+9.727 min 9.687. Grid memory rows identical to V2.5/V2.6 (no new buffers).
+
+V2.7-specific costs (probes by the milestone agent):
+- `CellSim.cloneState` (the byte-exact export clone): **8–10 ms at ~200k
+  live cells** — one-off per export, not per frame/step.
+- Export frame/encode costs are the V2.6 numbers (shared `exportAnimation`
+  core, unchanged): ~0.37 s/frame render at 1600×1200 offline solid,
+  ~38 ms/frame AVFoundation encode; the GUI adds preview scaling only.
+- Export-sim capacity estimate keeps the clone's maxCells at expected
+  growth — a second full 2M buffer set (~400 MB) is only paid when the
+  estimate demands it.
+
+Validation (agent + independent orchestrator re-run): build debug+release,
+`--selftest` 7 phases PASS, `--lockstep` PASS (mean |ΔP| 1.1e-6),
+14/14 goldens byte-PASS, CLI `--anim` regression → valid H.264 .mp4
+(ffprobe), abort probe → valid partial movie, capacity-watchdog probe,
+clone/continuation byte-exactness probes, GUI launch check. Open point:
+the GUI export button itself was not click-tested (no screen-recording
+permission in the agent context).

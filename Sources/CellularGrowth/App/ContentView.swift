@@ -5,6 +5,11 @@ import SwiftUI
 
 struct ContentView: View {
     @ObservedObject var vm: SimViewModel
+    // V2.7: the sections this milestone touches are collapsible
+    // (DisclosureGroup) — the user's request. Only these two; the untouched
+    // groups keep their GroupBox styling.
+    @State private var exportOpen = true
+    @State private var deathOpen = true
 
     var body: some View {
         HStack(spacing: 0) {
@@ -22,13 +27,15 @@ struct ContentView: View {
 
     private var controlPanel: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Cellular Growth — V2.6")
+            Text("Cellular Growth — V2.7")
                 .font(.headline)
 
             HStack(spacing: 8) {
                 Button(vm.playing ? "Pause" : "Play") { vm.playing.toggle() }
                     .buttonStyle(.borderedProminent)
+                    .disabled(vm.exportSetupActive)   // V2.7: mid-clone a step would race the clone's buffer reads
                 Button("Reset") { vm.reset() }
+                    .disabled(vm.exportSetupActive)
             }
 
             GroupBox("Preset") {
@@ -99,19 +106,51 @@ struct ContentView: View {
                     Button("Save State…") { vm.saveStatePanel() }
                     Button("Load State…") { vm.loadStatePanel() }
                 }
+                .disabled(vm.exportSetupActive)   // V2.7: a mid-clone state INSTALL would race the clone's reads
             }
 
-            // V2.6 video export: the CLI --anim offscreen path (ray tracer,
-            // deterministic) growing on from the CURRENT state, with the
-            // panel's style/tint and the current camera choreography.
-            GroupBox("Video export (V2.6)") {
-                slider("Frames", $vm.exportFrames, 2...300, step: 1)
-                slider("Steps / frame", $vm.exportStepsPerFrame, 0...600, step: 10)
-                Button("Export video…") { vm.exportVideoPanel() }
-                    .buttonStyle(.borderedProminent)
-                Text("Offscreen 1600×1200, H.264 .mp4 (30 fps) + frame PNGs; style/tint/follow/orbit as shown.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            // V2.7 video export: NON-BLOCKING — the export runs on a CLONE
+            // of the live state (own CellSim + own command queue) while the
+            // GUI keeps stepping/rendering; the most recent completed frame
+            // previews right here, progress shows frames + elapsed time,
+            // and Stop finishes a PARTIAL video of what rendered so far.
+            collapsible("Video export (V2.7)", isExpanded: $exportOpen) {
+                VStack(alignment: .leading, spacing: 10) {
+                    slider("Frames", $vm.exportFrames, 2...10000, step: 1, format: "%.0f")
+                    slider("Steps / frame", $vm.exportStepsPerFrame, 0...2000, step: 10, format: "%.0f")
+                    if vm.exportRunning {
+                        Button("Stop export") { vm.stopExport() }
+                            .buttonStyle(.borderedProminent)
+                    } else {
+                        Button("Export video…") { vm.exportVideoPanel() }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(vm.exportSetupActive)   // V2.7: sub-second clone window
+                    }
+                    // V2.7 live preview: the most recent COMPLETED export
+                    // frame (the offscreen render), scaled to fit — no
+                    // file-manager hunting. Shows the export's frames, not
+                    // the GUI render.
+                    if let img = vm.exportPreviewImage {
+                        Image(nsImage: img)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(maxWidth: .infinity)
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                            .overlay(RoundedRectangle(cornerRadius: 6)
+                                .strokeBorder(Color.primary.opacity(0.15)))
+                    }
+                    if let progress = vm.exportProgressText {
+                        Text(progress)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    if vm.exportResultPath != nil || vm.exportFramesDir != nil {
+                        Button("Show in Finder") { vm.revealExportResult() }
+                    }
+                    Text("Offscreen 1600×1200, H.264 .mp4 (30 fps) + frame PNGs; style/tint/follow/orbit as shown. Runs on a cloned sim — the sim keeps running; Stop yields the partial video.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             GroupBox("Growth") {
@@ -124,6 +163,23 @@ struct ContentView: View {
                 Toggle(isOn: $vm.divisionEnabled) { Text("Cell division") }
                 slider("Food increment", $vm.foodIncrement, 0...0.05)
                 slider("Split threshold", $vm.splitThreshold, 0.2...3)
+            }
+
+            // V2.7 death knobs (the V2.5 open issue: death parameters were
+            // CLI/preset-side only). Placed directly under Growth — death is
+            // division's inverse and its threshold rides the same food
+            // ledger. Collapsible like the export group. Preset/state loads
+            // sync these sliders (the panel shows what runs); explicit user
+            // input wins after a load.
+            collapsible("Death (starvation)", isExpanded: $deathOpen) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle(isOn: $vm.deathEnabled) { Text("Starvation death") }
+                    slider("Death threshold", $vm.deathThreshold, 0...3)
+                    slider("Death window (steps)", $vm.deathSteps, 0...2000, step: 10, format: "%.0f")
+                    Text("A cell whose food ledger stays below the threshold for the window's steps dies (ring splice closes the hole). Window 0 = never. Threshold defaults to the split threshold.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             // V2.3 type layout: phase-0 polar typing (axis + stem/cap
@@ -224,12 +280,12 @@ struct ContentView: View {
         }
     }
 
-    private func slider(_ label: String, _ value: Binding<Double>, _ range: ClosedRange<Double>, step: Double? = nil) -> some View {
+    private func slider(_ label: String, _ value: Binding<Double>, _ range: ClosedRange<Double>, step: Double? = nil, format: String = "%.2f") -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
                 Text(label).font(.callout)
                 Spacer()
-                Text(String(format: "%.2f", value.wrappedValue))
+                Text(String(format: format, value.wrappedValue))
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
@@ -238,6 +294,19 @@ struct ContentView: View {
             } else {
                 Slider(value: value, in: range)
             }
+        }
+    }
+
+    /// V2.7: collapsible panel section (the user's request) — a
+    /// DisclosureGroup with a headline label, replacing the GroupBox for the
+    /// sections this milestone touches (export, death).
+    private func collapsible<Content: View>(_ title: String,
+                                            isExpanded: Binding<Bool>,
+                                            @ViewBuilder content: @escaping () -> Content) -> some View {
+        DisclosureGroup(isExpanded: isExpanded) {
+            content()
+        } label: {
+            Text(title).font(.headline)
         }
     }
 }

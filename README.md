@@ -8,7 +8,7 @@ including the `bulgeDist` typo analysis) lives in
 [`docs/reference/lomas_cellular_forms_extraction.md`](docs/reference/lomas_cellular_forms_extraction.md),
 with page screenshots in `docs/reference/pages/`.
 
-## Status — V2.6 complete: camera choreography + video export
+## Status — V2.7 complete: interactive video export + death sliders
 
 **M1–M6 base** (details in git history / docs/benchlog.md): over-damped
 spring/planar/bulge forces (paper §4, Fig. 3); food + cell division with
@@ -188,6 +188,72 @@ RULE below is a documented design where the paper is silent):
   compares byte-identical (death path deterministic), prune-demo
   before/after screenshots inspected (coral-crown pruning from below),
   death-block bench +0.5 ms/step ≈ +3.7% at 655k cells (benchlog V2.5).
+
+V2.7 additions — **interactive video export + death sliders** (GUI-only
+milestone: no shader, no SimParams field, no buffer, no step-routine change;
+all 14 goldens byte-PASS unchanged):
+- **Non-blocking export on a cloned sim**: "Export video…" no longer pauses
+  the display link or owns the live sim. The GUI freezes the sim for a
+  one-off `CellSim.cloneState(from:)` — a byte-exact copy of ALL live state
+  (positions double buffer, links, food, RNG, nutrient/chemicals both sides,
+  tint, pulse, cell types + division counter, death state, counters, swap
+  flags AND `stepIndex`, the light-march scheduler clock) onto a PRIVATE
+  sim + PRIVATE MTLCommandQueue — then resumes: the sim keeps
+  stepping/rendering while the export renders offscreen on a background
+  thread. GPU contention may lower the GUI fps (accepted). Why not the CGST
+  v3 snapshot machinery: v3 does not persist `stepIndex`, so a v3
+  round-trip would phase-shift the lightInterval march relative to the live
+  sim; direct buffer copies are exact (validated: the clone-at-N state is
+  byte-identical, and after +400 steps every integer/frozen state block is
+  byte-identical to the control's continuation — the float deviations equal
+  the sim's own run-to-run scheduling chaos, see benchlog V2.7). Play /
+  Reset / state-load are disabled for the sub-second clone window (a
+  mid-clone step would race the clone's buffer reads).
+- **Live preview + progress**: the most recent COMPLETED export frame is
+  decoded + downscaled OFF-main (pure CoreGraphics) and shown in the panel,
+  with a "frame N/M — elapsed m:ss" line (frame cadence + a 0.5 s timer).
+  "Show in Finder" reveals the movie (or the frames directory when the
+  encode failed).
+- **Stoppable**: a Stop button sets a flag polled BETWEEN frames; whatever
+  rendered is still assembled into the movie — encode-after-the-loop keeps
+  ONE writer path (a stop just truncates the frame list). The status marks
+  it a partial export ("stopped at N/M frames"); a stop before the first
+  frame completes yields no video (nothing rendered, no movie).
+- **Export-sim capacity**: the clone's `maxCells` is ESTIMATED from the
+  expected growth (per-capita division rate ≈ drive / (2 × splitThreshold),
+  compounded over frames × steps/frame, ×2 margin, clamped to the live
+  sim's maxCells) — a second full 2M buffer set (~400 MB) is only paid when
+  the growth estimate demands it. Overshoot stalls division (the
+  device-side hard cap) and is reported in the status — never a crash.
+- **The .mp4 extension is forced** (`assembleMovie` normalizes the output
+  URL and returns the actual written path): AVAssetWriter writes EXACTLY
+  the URL it is given — the V2.6 ".m4v" report has no write path in this
+  code (probe: a .m4v URL with fileType .mp4 is accepted silently and
+  written verbatim, ISO-media/MP4 inside; most plausibly the user saw
+  QuickTime's MPEG-4 video document type or saved through QuickTime, which
+  defaults to .m4v). The on-disk name now always matches the documented
+  container.
+- **Death sliders (V2.5 follow-up)**: a collapsible Death group directly
+  under Growth — starvation-death toggle + threshold + window sliders, live
+  SimParams like every knob. Preset/state loads sync the sliders (the
+  panel-shows-what-runs contract; `prune-demo` carries death on); explicit
+  user input wins after a load. Frames slider now goes to 10000
+  (stoppability + the preview make long exports workable — no other limits
+  added); steps/frame cap raised 600 → 2000 (sized for the blocking-export
+  era before V2.7). The sections this milestone touches (export, death) are
+  collapsible `DisclosureGroup`s.
+- **Window resize**: export start GROWS the window (never shrinks) to the
+  export aspect ratio (4:3 + the 290 pt panel column) at ~80% of the screen
+  height.
+- **Validation**: `swift build` (debug+release), `--selftest` 7 phases PASS,
+  `--lockstep` PASS, 14/14 goldens byte-PASS, CLI `--anim` regression (4
+  frames → valid H.264 .mp4, ffprobe-verified), clone probes (at-N state
+  byte-identical; +400-step continuation integer-state byte-identical vs
+  control AND a fresh-run baseline; dividing-run form tracking within 1.4%
+  + invariants PASS), abort + capacity-watchdog probes PASS, export-cost
+  timings (benchlog V2.7). The export button itself was NOT click-tested
+  (no screen-recording permission in the agent context — the same open
+  point as V2.6).
 
 V2.6 additions — **camera choreography + video export** (host-side viewer
 state only — no sim buffer, shader or SimParams change; all 14 goldens
@@ -446,17 +512,22 @@ render-style switch (+ X-ray gain, foam opacity + the foam radius-scale
 hint), tint picker
 (Default/None/Chemical/Food heat/Mitosis pulse/Type/Type + pulse/Starving),
 the V2.6 Camera group (Follow centroid toggle — ON by default, smoothing
-slider, Circle toggle + orbit-speed slider) and the Video export group
-(frames + steps/frame sliders, "Export video…" writes PNG frames + an
-H.264 .mp4 via the same deterministic offscreen path as `--anim`, growing
-on from the live state with the panel's style/tint and the current camera
-choreography), Save State…/Load State…, growth mode + light/RDE parameter
-groups, the V2.3
+slider, Circle toggle + orbit-speed slider) and the collapsible V2.7 Video
+export group (frames slider to 10000 + steps/frame slider, "Export video…"
+runs NON-BLOCKING on a byte-exact clone of the live state with its own
+command queue — the sim keeps running/rendering; the most recent completed
+frame previews in the panel with a frames + elapsed progress line; Stop
+finishes the PARTIAL video; "Show in Finder" reveals the movie; grow-only
+window resize to the export aspect at start; same deterministic offscreen
+path as `--anim`, panel style/tint + current camera choreography), Save
+State…/Load State…, growth mode + light/RDE parameter groups, the V2.7
+collapsible Death group directly under Growth (starvation-death toggle +
+threshold + window sliders — live SimParams; preset/state loads sync them,
+explicit user input wins afterwards), the V2.3
 Type layout group (polar typing toggle + axis/threshold sliders — dragging a
 knob re-types the LIVE cells, Re-type button, phase switch X, lamel/dal
 rates), repulsion, forces, run controls. Jitter and subdivision apply on
-Reset. (Death parameters are CLI/preset-side: pick the `prune-demo` preset or
-pass `--death`; the GUI exposes the Starving tint but no death sliders yet.)
+Reset.
 
 ## Roadmap
 
@@ -475,3 +546,4 @@ pass `--death`; the GUI exposes the Starving tint but no death sliders yet.)
 | V2.4 ✅ | the differentiation phase: division frozen (`--differentiate-at N [--differentiate-until M]`, GUI "Differentiate now"), RDE keeps stepping, new `typeTransition` kernel (division-block slot, race-free) types undifferentiated cells from the chemical field (`--type-cap-v` 0.30 → cap, `--type-stem-v` 0.10 → stem, dead band stays 0); hysteresis = type memory (typed cells ignore the RDE: rdeStep freezes their u/v — no reaction participation, patterns cannot flicker, a cell's type changes at most once); rule-matrix MODE `--type-mode band\|region` (region: every type divides uniformly in its region — patterned growth via the frozen-v food coupling; band: the V2.3 matrix; type-0 contract both modes); differentiationPhase persists in CGST v3 raw params (mid-phase states resume in the phase); GUI button + threshold sliders | `--selftest` 6 phases (new phase F: static RDE settle → differentiation with division enabled-but-frozen (cells/divisions constant) → 0/V → mixed partition, flip stream settles ≈ 0 (gate ≤ 0.5% V/window), type memory (only 0→1/0→4 ever), regional growth resumes: cap per-capita ×94.9 vs stem ×6.14) PASS, `--diff-probe` PASS (pattern R² 0.68, stem 32.5%/cap 27.6%, flips 1439-burst → 0–4/window tail, type map PNG), `--lockstep` PASS, 14/14 goldens byte-PASS (typing off by default), mid-diff state round-trip resumes DIFFERENTIATING, differentiation-pass bench ~2–3% at 655k cells / regional-vs-uniform growth bench count-confounded as designed (benchlog V2.4) |
 | V2.5 ✅ | starvation death — the inverse of division (paper §8): a cell below `--death-threshold` for `--death-steps` consecutive steps dies (food-LEDGER signal; the window is a growth-rate detector — the pruning front sits at the shade iso-line); Euler-exact ring splice (dV−1, dE−3, dF−2) via balanced ear-clipping under valence caps + chord checks (the fan design deadlocked on valence-hoarding pivots — documented); claims = the division independent-set rule (order-irrelevant, verified byte-identical); dead slots stay allocated (`liveCount = cellCount − deathCount`), every consumer skips them; CGST v3 persists the death state; `--tint starve` death front; preset `prune-demo` (coral-crown self-pruning); HOT/SPLICE split (guards+queue vs narrow-width splice) after the bench bimodality investigation | `--selftest` 7 phases (new phase G: grown run with death — V rises then falls, 168k deaths, invariants on the LIVE surface) PASS, `--lockstep` PASS, 14/14 goldens PASS, CGST v3 death round-trip byte-identical, seeded two-run state compares byte-identical, prune-demo before/after screenshots inspected, death-block bench +0.5 ms/step ≈ +3.7% at 655k cells, headless jitter seeding bug fixed (benchlog V2.5) |
 | V2.6 ✅ | camera choreography + video export: follow-centroid (orbit-camera target tracks the LIVE cells' smoothed geometric centroid — uniform cell mass, dead slots skipped; host-side two-pass read, no GPU pass, no buffers touched; GUI default ON with toggle + smoothing slider, headless `--follow-centroid`/`--follow-smooth` opt-in), circle mode (`--orbit-rate F` rad per rendered frame around the moving target; GUI toggle + speed slider), drag-orbit rotates around the moving target by construction; video export as MP4 (M6 `.mov` REPLACED by `.mp4`, H.264/30 fps unchanged; M6 anim routine factored into `HeadlessRunner.exportAnimation` shared by CLI `--anim` and the GUI "Export video…" button — live state, panel style/tint, current choreography, display link paused during export) | `swift build` (debug+release), `--selftest` 7 phases PASS, `--lockstep` PASS, 14/14 goldens byte-PASS (headless camera legacy by default; choreography only on the video paths), follow+orbit anim exports visually inspected (form centered while growing 642→9 161 cells + azimuth rotates; light-grown drift centered with follow ON vs off-frame legacy), sim-step bench unchanged (12.77 vs 12.83 ms/step at 655k — no step-routine edit), export costs: ~0.37 s/frame GPU at 1600×1200 (~186k cells), ~38 ms/frame encode, choreography 0.11 ms/frame (benchlog V2.6) |
+| V2.7 ✅ | interactive video export + death sliders (GUI-only: no shader/SimParams/buffer/step-routine edit): NON-BLOCKING export on a byte-exact cloned sim (`CellSim.cloneState` copies ALL live state incl. both double-buffer sides, chemicals, RNG, pulse, types + division counter, death state, swap flags and the stepIndex march clock — CGST v3 round-trip rejected: it drops stepIndex; own `CellSim` + own command queue, GUI keeps stepping/rendering, GPU contention accepted), live frame preview + frames/elapsed progress + "Show in Finder" in the panel, Stop = partial-but-complete video (flag polled between frames, encode-after-loop truncates the frame list), export-sim capacity ESTIMATED from expected growth (overshoot stalls division device-side and is reported, never crashes), .mp4 extension forced (AVAssetWriter writes exactly the given URL — the V2.6 ".m4v" report has no write path in this code), death sliders (V2.5 follow-up: toggle + threshold + window, preset/state-synced, explicit input wins), frames slider to 10000 + steps/frame 600→2000, collapsible export/death sections, grow-only window resize to the export aspect | `swift build` (debug+release), `--selftest` 7 phases PASS, `--lockstep` PASS, 14/14 goldens byte-PASS, CLI `--anim` regression (4 frames → valid H.264 .mp4, ffprobe: h264/30 fps), clone probes: at-N state byte-identical, +400-step continuation integer-state byte-identical vs control AND fresh-run baseline (float Δ = the sim's own scheduling chaos, equal magnitude in both pairs), dividing-run form tracking ≤1.4% + invariants PASS, abort probe (4/10 frames → partial movie), capacity-watchdog probe (stall at maxCells + warning), GUI launch check; export button NOT click-tested (agent context — open point, benchlog V2.7) |

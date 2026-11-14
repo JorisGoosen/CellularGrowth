@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.center()
         window.makeKeyAndOrderFront(nil)
         self.window = window
+        vm.owningWindow = window   // V2.7: the export resizes the window to the export aspect ratio
 
         NSApp.activate(ignoringOtherApps: true)
     }

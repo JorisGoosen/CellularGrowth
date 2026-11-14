@@ -1782,6 +1782,20 @@ enum HeadlessRunner {
         var orbitRate: Float = 0
         /// GUI progress hook (frames done, total). Nil = CLI printing only.
         var onFrame: ((Int, Int) -> Void)? = nil
+        /// V2.7: polled at the TOP of every frame iteration — true ends the
+        /// frame loop early; whatever frames completed are still assembled
+        /// into the movie afterwards (a stopped export ALWAYS yields a video
+        /// of what it rendered). Nil = never abort (the CLI --anim path).
+        /// Read on the export thread, written from the GUI's Stop button —
+        /// the codebase's plain-var cross-thread pattern (same as the
+        /// Renderer's isPlaying/stepsPerFrame); the worst case is one extra
+        /// rendered frame.
+        var shouldStop: (() -> Bool)? = nil
+        /// V2.7 GUI live preview: called after each frame PNG lands (on the
+        /// export thread) with the PNG path + (done, total). The GUI decodes
+        /// + downscales OFF-main and shows the latest frame in the panel —
+        /// no file-manager hunting. Nil = CLI printing only.
+        var onPreview: ((_ pngPath: String, _ done: Int, _ total: Int) -> Void)? = nil
     }
 
     struct VideoExportResult {
@@ -1794,6 +1808,15 @@ enum HeadlessRunner {
         var choreographyMsPerFrame: Double
         /// Wall time spent in the AVFoundation encode (movie only).
         var movieEncodeWall: Double
+        /// V2.7: true when shouldStop ended the loop before the requested
+        /// frame count — the movie covers `frames` frames only (partial
+        /// export; the GUI says so in the status line).
+        var stopped: Bool = false
+        /// V2.7: true when the export sim hit its maxCells capacity mid-run
+        /// (division is a device-side hard cap; growth stalls from that
+        /// frame on — the capacity estimate under-sized; see
+        /// SimViewModel.exportCapacityEstimate).
+        var capacityCapped: Bool = false
     }
 
     /// The shared frame loop. Throws on PNG/prep failures; a failed movie
@@ -1814,8 +1837,18 @@ enum HeadlessRunner {
         var choreoSeconds = 0.0
         let totalWall = CFAbsoluteTimeGetCurrent()
         let pngPaths = (0..<frames).map { "\(cfg.dir)/frame_\(String(format: "%04d", $0)).png" }
+        var rendered = 0
+        var stopped = false
+        var capacityCapped = false
 
         for f in 0..<frames {
+            // V2.7: the stop flag is checked BETWEEN frames — a frame in
+            // flight always completes (and lands in the video).
+            if let stop = cfg.shouldStop, stop() {
+                stopped = true
+                print("video export: stop requested — finishing with the \(rendered) frames rendered so far")
+                break
+            }
             if f > 0 && stepsPerFrame > 0 {
                 runSteps(queue: queue, sim: sim, count: stepsPerFrame)
             }
@@ -1832,6 +1865,16 @@ enum HeadlessRunner {
                 if let e = cb.error { print("export frame \(f) prep CB ERROR: \(e)") }
             }
             sim.syncCellCountFromDevice()
+            // V2.7 capacity watchdog: the export sim's maxCells is an
+            // ESTIMATE (SimViewModel.exportCapacityEstimate). Division is a
+            // device-side hard cap, so hitting it stalls growth (no crash);
+            // warn once so the status line can say the export is capacity-
+            // limited. The CLI --anim path runs on the caller's sim (its own
+            // --max-cells choice) and gets the same honest warning.
+            if !capacityCapped && sim.cellCount >= sim.maxCells {
+                capacityCapped = true
+                print("video export WARNING: export sim reached its maxCells capacity (\(sim.maxCells)) — growth stalls from here")
+            }
 
             // Camera: legacy framing or the V2.6 choreography — both are
             // pure functions of the frame index (deterministic exports).
@@ -1872,31 +1915,43 @@ enum HeadlessRunner {
                 throw NSError(domain: "anim", code: 10,
                               userInfo: [NSLocalizedDescriptionKey: "frame \(f) PNG: \(error)"])
             }
-            cfg.onFrame?(f + 1, frames)
+            rendered = f + 1
+            cfg.onPreview?(pngPaths[f], rendered, frames)
+            cfg.onFrame?(rendered, frames)
             print("frame \(f)/\(frames - 1) t=\(f * stepsPerFrame) cells=\(sim.cellCount)  wall \(String(format: "%.2f", wall))s  gpu \(String(format: "%.2f", result.gpuSeconds))s")
         }
 
         // Assemble the H.264 movie (default 30 fps; frames at equally spaced
         // step intervals = the paper's "equally spaced time intervals").
+        // V2.7: assemble from the frames ACTUALLY rendered — an aborted
+        // export still yields a complete video of its prefix (encode AFTER
+        // the frame loop: a stop then only truncates the frame list, the
+        // writer lifecycle stays single-path).
         let movPath = "\(cfg.dir)/animation.mp4"
         var moviePath: String? = nil
         var encodeWall = 0.0
-        do {
-            let tEnc = CFAbsoluteTimeGetCurrent()
-            try assembleMovie(frames: pngPaths, width: settings.width, height: settings.height,
-                              fps: cfg.fps, to: movPath)
-            encodeWall = CFAbsoluteTimeGetCurrent() - tEnc
-            moviePath = movPath
-        } catch {
-            // Honest fallback: the PNG sequence is complete; say what failed.
-            print("MP4 assembly FAILED (\(error)) — the PNG sequence in \(cfg.dir) is complete; assemble manually e.g.:\n  ffmpeg -framerate \(cfg.fps) -i \(cfg.dir)/frame_%04d.png -c:v libx264 -pix_fmt yuv420p \(cfg.dir)/animation.mp4")
+        if rendered > 0 {
+            do {
+                let tEnc = CFAbsoluteTimeGetCurrent()
+                let url = try assembleMovie(frames: Array(pngPaths[0..<rendered]),
+                                            width: settings.width, height: settings.height,
+                                            fps: cfg.fps, to: movPath)
+                encodeWall = CFAbsoluteTimeGetCurrent() - tEnc
+                moviePath = url.path
+            } catch {
+                // Honest fallback: the PNG sequence is complete; say what failed.
+                print("MP4 assembly FAILED (\(error)) — the PNG sequence in \(cfg.dir) is complete; assemble manually e.g.:\n  ffmpeg -framerate \(cfg.fps) -i \(cfg.dir)/frame_%04d.png -c:v libx264 -pix_fmt yuv420p \(cfg.dir)/animation.mp4")
+            }
+        } else {
+            print("video export: no frames rendered — no movie assembled")
         }
         let total = CFAbsoluteTimeGetCurrent() - totalWall
-        print("video export done: \(frames) frames\(moviePath != nil ? " + \(movPath)" : "")  total wall \(String(format: "%.2f", total))s  render gpu \(String(format: "%.2f", totalGpu))s  choreography \(String(format: "%.2f", choreoSeconds * 1000 / Double(frames))) ms/frame  movie encode \(String(format: "%.2f", encodeWall))s")
-        return VideoExportResult(dir: cfg.dir, frames: frames, moviePath: moviePath,
+        print("video export done: \(rendered)/\(frames) frames\(moviePath != nil ? " + \(moviePath!)" : "")  total wall \(String(format: "%.2f", total))s  render gpu \(String(format: "%.2f", totalGpu))s  choreography \(rendered > 0 ? String(format: "%.2f", choreoSeconds * 1000 / Double(rendered)) : "n/a") ms/frame  movie encode \(String(format: "%.2f", encodeWall))s")
+        return VideoExportResult(dir: cfg.dir, frames: rendered, moviePath: moviePath,
                                  totalWall: total, totalGpu: totalGpu,
-                                 choreographyMsPerFrame: choreoSeconds * 1000 / Double(frames),
-                                 movieEncodeWall: encodeWall)
+                                 choreographyMsPerFrame: rendered > 0 ? choreoSeconds * 1000 / Double(rendered) : 0,
+                                 movieEncodeWall: encodeWall,
+                                 stopped: stopped, capacityCapped: capacityCapped)
     }
 
     /// --anim DIR --anim-steps N --anim-frames M [--follow-centroid]
@@ -1987,9 +2042,24 @@ enum HeadlessRunner {
     /// headless — no GUI/app bundle required. V2.6: the container is .mp4
     /// (the M6 .mov was REPLACED — universal playback, one code path; the
     /// H.264 codec and the frame cadence are unchanged).
+    /// V2.7: the output extension is FORCED to .mp4 and the actual written
+    /// URL is returned — the writer's fileType and the on-disk name must
+    /// agree, and the V2.6 user report of a ".m4v" showed the name/path
+    /// plumbing deserves a hard guarantee. (Investigation: no .m4v write
+    /// path exists anywhere in this code — grep across history — the writer
+    /// writes exactly the URL it is given with fileType .mp4; most plausibly
+    /// the .m4v the user saw was QuickTime's MPEG-4 video document type
+    /// (same container family, public.mpeg-4 UTI) shown for the .mp4 file,
+    /// or a save/export through QuickTime, which defaults to .m4v. Forcing
+    /// the extension here means the on-disk name ALWAYS matches the
+    /// documented .mp4 container no matter the caller.)
+    @discardableResult
     private static func assembleMovie(frames: [String], width: Int, height: Int,
-                                      fps: Int32, to path: String) throws {
-        let url = URL(fileURLWithPath: path)
+                                      fps: Int32, to path: String) throws -> URL {
+        var url = URL(fileURLWithPath: path)
+        if url.pathExtension.lowercased() != "mp4" {
+            url = url.deletingPathExtension().appendingPathExtension("mp4")
+        }
         try? FileManager.default.removeItem(at: url)   // overwrite a previous run
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
         let settings: [String: Any] = [
@@ -2063,6 +2133,7 @@ enum HeadlessRunner {
             throw writer.error ?? NSError(domain: "anim", code: 7,
                                           userInfo: [NSLocalizedDescriptionKey: "writer status \(writer.status.rawValue)"])
         }
+        return url
     }
 
     // MARK: - Bench
