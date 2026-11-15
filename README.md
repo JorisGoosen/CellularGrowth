@@ -3,6 +3,8 @@
 Reimplementation of Andy Lomas' **"Cellular Forms: an Artistic Exploration of
 Morphogenesis"** (AISB50) on Metal / Apple Silicon.
 
+[YT video](https://www.youtube.com/watch?v=cCuBBcSH6jQ)
+
 The exact paper extraction (formulas verified against hi-res page renders,
 including the `bulgeDist` typo analysis) lives in
 [`docs/reference/lomas_cellular_forms_extraction.md`](docs/reference/lomas_cellular_forms_extraction.md),
